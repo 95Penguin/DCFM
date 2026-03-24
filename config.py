@@ -1,0 +1,243 @@
+"""
+GridCFN Configuration
+=====================
+所有超参数统一在这里修改，不需要动其他文件。
+
+使用方法：
+  1. 修改下面对应的参数值
+  2. 直接运行 python main.py
+
+切换数据集示例：
+  - 合成数据（无需下载，快速验证）: DATASET = "synthetic"
+  - Solar-Energy:                   DATASET = "solar",  DATA_PATH = "./data/solar_AL.txt"
+  - Electricity (UCI):              DATASET = "electricity", DATA_PATH = "./data/electricity.txt"
+  - Weather2k:                      DATASET = "weather", DATA_PATH = "./data/weather2k.npy"
+"""
+
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+
+# ===========================================================================
+# 数据集配置
+# ===========================================================================
+@dataclass
+class DataConfig:
+    # 数据集名称: "synthetic" | "solar" | "electricity" | "weather"
+    dataset: str = "synthetic"
+
+    # 真实数据集的文件路径（synthetic 时不需要）
+    data_path: Optional[str] = None
+
+    # 输入窗口长度（论文: 168；合成测试用 12）
+    T_in: int = 12
+
+    # 预测步长（论文: 1）
+    T_out: int = 1
+
+    # 构建邻接矩阵时的相关性阈值
+    adj_threshold: float = 0.7
+
+    # DataLoader batch size（论文: 32）
+    batch_size: int = 32
+
+    # 合成数据专用参数（dataset="synthetic" 时生效）
+    synthetic_T: int = 2000      # 总时间步数
+    synthetic_N: int = 20        # 节点数
+    synthetic_F: int = 1         # 特征数（需和 model.in_dim 一致）
+
+
+# ===========================================================================
+# 模型结构配置
+# ===========================================================================
+@dataclass
+class ModelConfig:
+    # 输入特征维度 F（需和 DataConfig.synthetic_F 一致）
+    in_dim: int = 1
+
+    # GCN 隐藏层维度
+    gcn_hidden: int = 64
+
+    # GCN 层数
+    gcn_layers: int = 2
+
+    # TCN 输出维度 D（即论文中的 d_hidden=64）
+    tcn_hidden: int = 64
+
+    # TCN 层数（对应膨胀系数 1,2,4,...,2^(tcn_layers-1)）
+    tcn_layers: int = 4
+
+    # 环境上下文维度 De
+    env_dim: int = 32
+
+    # 随机实体维度 Ds
+    stoch_dim: int = 32
+
+    # 多尺度上下文输出维度 De'
+    ms_out_dim: int = 32
+
+    # SCG-MP 层数 L_SCG（论文: 3）
+    n_scg_layers: int = 3
+
+    # 输出变量数 Fout（单步单变量预测为 1）
+    out_dim: int = 1
+
+    # MI 正则化权重 λ（论文: 0.5）
+    lambda_mi: float = 0.5
+
+
+# ===========================================================================
+# 训练配置
+# ===========================================================================
+@dataclass
+class TrainConfig:
+    # 初始学习率（论文: 0.001）
+    lr: float = 1e-3
+
+    # 最大训练轮数（论文: 200）
+    max_epochs: int = 200
+
+    # 早停耐心值（验证集 CRPS 不再提升的容忍轮数）
+    patience: int = 20
+
+    # 学习率衰减因子（ReduceLROnPlateau）
+    lr_decay_factor: float = 0.5
+
+    # 学习率衰减耐心值
+    lr_decay_patience: int = 10
+
+    # 梯度裁剪阈值
+    grad_clip: float = 5.0
+
+    # 权重衰减（L2 正则）
+    weight_decay: float = 1e-5
+
+    # 最佳模型保存路径
+    save_path: str = "best_model.pt"
+
+    # 随机种子
+    seed: int = 42
+
+
+# ===========================================================================
+# 顶层配置（聚合三个子配置）
+# ===========================================================================
+@dataclass
+class Config:
+    data:  DataConfig  = field(default_factory=DataConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+
+    def summary(self) -> str:
+        """打印当前配置摘要。"""
+        lines = ["=" * 52, "GridCFN Configuration", "=" * 52]
+        for section_name, section in [("Data", self.data),
+                                       ("Model", self.model),
+                                       ("Train", self.train)]:
+            lines.append(f"\n[{section_name}]")
+            for k, v in asdict(section).items():
+                lines.append(f"  {k:<22} = {v}")
+        lines.append("=" * 52)
+        return "\n".join(lines)
+
+
+# ===========================================================================
+# 预设配置（直接切换实验场景）
+# ===========================================================================
+
+def get_config(preset: str = "default") -> Config:
+    """
+    快速获取预设配置。
+
+    preset 可选值：
+      "default"     – 合成数据，快速验证
+      "solar"       – Solar-Energy 数据集（论文设置）
+      "electricity" – Electricity 数据集（论文设置）
+      "weather"     – Weather2k 数据集（论文设置）
+      "debug"       – 极小规模，用于调试
+    """
+    if preset == "default":
+        return Config()
+
+    elif preset == "solar":
+        return Config(
+            data=DataConfig(
+                dataset="solar",
+                data_path="./data/solar_AL.txt",
+                T_in=168, T_out=1,
+                adj_threshold=0.7,
+                batch_size=32,
+            ),
+            model=ModelConfig(
+                in_dim=1, gcn_hidden=64, gcn_layers=2,
+                tcn_hidden=64, tcn_layers=4,
+                env_dim=32, stoch_dim=32, ms_out_dim=32,
+                n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+            ),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=200, patience=20, seed=42,
+            ),
+        )
+
+    elif preset == "electricity":
+        return Config(
+            data=DataConfig(
+                dataset="electricity",
+                data_path="./data/electricity.txt",
+                T_in=168, T_out=1,
+                adj_threshold=0.7,
+                batch_size=32,
+            ),
+            model=ModelConfig(
+                in_dim=1, gcn_hidden=64, gcn_layers=2,
+                tcn_hidden=64, tcn_layers=4,
+                env_dim=32, stoch_dim=32, ms_out_dim=32,
+                n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+            ),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=200, patience=20, seed=42,
+            ),
+        )
+
+    elif preset == "weather":
+        return Config(
+            data=DataConfig(
+                dataset="weather",
+                data_path="./data/weather2k.npy",
+                T_in=168, T_out=1,
+                adj_threshold=0.6,
+                batch_size=32,
+            ),
+            model=ModelConfig(
+                in_dim=1, gcn_hidden=64, gcn_layers=2,
+                tcn_hidden=64, tcn_layers=4,
+                env_dim=32, stoch_dim=32, ms_out_dim=32,
+                n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+            ),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=200, patience=20, seed=42,
+            ),
+        )
+
+    elif preset == "debug":
+        return Config(
+            data=DataConfig(
+                dataset="synthetic",
+                T_in=12, T_out=1,
+                batch_size=8,
+                synthetic_T=300, synthetic_N=5, synthetic_F=1,
+            ),
+            model=ModelConfig(
+                in_dim=1, gcn_hidden=16, gcn_layers=2,
+                tcn_hidden=16, tcn_layers=2,
+                env_dim=8, stoch_dim=8, ms_out_dim=8,
+                n_scg_layers=2, out_dim=1, lambda_mi=0.5,
+            ),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=5, patience=5, seed=0,
+            ),
+        )
+
+    else:
+        raise ValueError(f"Unknown preset: '{preset}'. "
+                         f"Choose from: default, solar, electricity, weather, debug")
