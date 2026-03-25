@@ -120,6 +120,9 @@ class Backbone(nn.Module):
     """
     Produces H ∈ R^{T×N×D} fusing spatial topology and temporal dynamics.
     Paper eq. (2): H = TCN(GCN(X, A))
+
+    Fix: 把所有 T 时间步合并为一次 batched matmul，
+    避免原来 T=168 步的 Python for 循环（每步一次 GPU kernel，极慢）。
     """
     def __init__(self, in_dim: int, gcn_hidden: int, tcn_hidden: int,
                  gcn_layers: int = 2, tcn_layers: int = 4):
@@ -131,18 +134,17 @@ class Backbone(nn.Module):
         """
         x        : [B, T, N, F]
         adj_norm : [N, N]
-        returns H: [B, T, N, D]  (we keep T dim for disentangler)
+        returns H: [B, T, N, D]
         """
         B, T, N, F = x.shape
-        # Apply GCN at each time step
-        x_gcn = []
-        for t in range(T):
-            x_gcn.append(self.gcn(x[:, t], adj_norm))   # [B, N, gcn_hidden]
-        x_gcn = torch.stack(x_gcn, dim=1)               # [B, T, N, gcn_hidden]
+        # 合并 B 和 T，一次性对所有时间步做 GCN，无需 Python 循环
+        x_flat  = x.reshape(B * T, N, F)          # [B*T, N, F]
+        gcn_out = self.gcn(x_flat, adj_norm)       # [B*T, N, gcn_hidden]
+        x_gcn   = gcn_out.reshape(B, T, N, -1)    # [B, T, N, gcn_hidden]
 
-        # Apply TCN across time
-        H = self.tcn(x_gcn.permute(0, 2, 1, 3))        # [B, N, T, tcn_hidden]
-        H = H.permute(0, 2, 1, 3)                       # [B, T, N, tcn_hidden]
+        # TCN 沿时间轴处理
+        H = self.tcn(x_gcn.permute(0, 2, 1, 3))   # [B, N, T, tcn_hidden]
+        H = H.permute(0, 2, 1, 3)                  # [B, T, N, tcn_hidden]
         return H
 
 
@@ -161,11 +163,13 @@ class CausalDisentangler(nn.Module):
         super().__init__()
         self.env_proj   = nn.Sequential(
             nn.Linear(in_dim, in_dim), nn.ReLU(),
-            nn.Linear(in_dim, env_dim)
+            nn.Linear(in_dim, env_dim),
+            nn.Tanh()# 增加 Tanh 确保解耦后的特征在 [-1, 1] 之间，防止 MINE 梯度爆炸
         )
         self.stoch_proj = nn.Sequential(
             nn.Linear(in_dim, in_dim), nn.ReLU(),
-            nn.Linear(in_dim, stoch_dim)
+            nn.Linear(in_dim, stoch_dim),
+            nn.Tanh()
         )
 
     def forward(self, H: torch.Tensor):
@@ -189,8 +193,12 @@ class MINEEstimator(nn.Module):
     """
     Estimates I(He, Hs) via the MINE lower bound:
         I >= E[T(x,y)] - log(E[e^{T(x,y')}])
-    where y' is sampled from the marginal (i.e., shuffled batch).
-    Returns the MI estimate as a scalar loss term (to be minimised).
+
+    Fix: 原来直接用 t_marginal.exp().mean() 会在 t_marginal 较大时
+    上溢到 inf，导致 log(inf) = nan，污染整个训练。
+    改用 log-sum-exp trick：
+        log(E[exp(t)]) = c + log(mean(exp(t - c)))，c = max(t)
+    数值上等价但不会溢出。
     """
     def __init__(self, env_dim: int, stoch_dim: int, hidden_dim: int = 64):
         super().__init__()
@@ -203,22 +211,28 @@ class MINEEstimator(nn.Module):
     def forward(self, He: torch.Tensor, Hs: torch.Tensor) -> torch.Tensor:
         """
         He, Hs : [B, N, dim]
-        returns: scalar MI estimate
+        returns: scalar MI estimate（越大表示 MI 越大；训练中 minimize 负 MI）
         """
         B, N, _ = He.shape
-        He_flat = He.view(B * N, -1)
-        Hs_flat = Hs.view(B * N, -1)
+        He_flat = He.reshape(B * N, -1)
+        Hs_flat = Hs.reshape(B * N, -1)
 
-        # Joint score
-        t_joint = self.net(torch.cat([He_flat, Hs_flat], dim=-1))
+        # Joint: T(He_i, Hs_i)
+        t_joint = self.net(torch.cat([He_flat, Hs_flat], dim=-1))  # [B*N, 1]
 
-        # Marginal score: shuffle Hs along batch dimension
-        idx = torch.randperm(B * N, device=He.device)
+        # Marginal: T(He_i, Hs_j)  j 是 i 的随机置换
+        idx         = torch.randperm(B * N, device=He.device)
         Hs_shuffled = Hs_flat[idx]
-        t_marginal = self.net(torch.cat([He_flat, Hs_shuffled], dim=-1))
+        t_marginal  = self.net(
+            torch.cat([He_flat, Hs_shuffled], dim=-1)
+        ).squeeze(-1)                                               # [B*N]
 
-        # MINE bound: E[T_joint] - log(E[exp(T_marginal)])
-        mi_estimate = t_joint.mean() - torch.log(t_marginal.exp().mean() + 1e-8)
+        # log-sum-exp trick: log(E[exp(t)]) = c + log(mean(exp(t-c)))
+        # 完全避免 exp 上溢导致的 NaN
+        c           = t_marginal.detach().max()
+        log_mean_et = c + torch.log(torch.exp(t_marginal - c).mean() + 1e-8)
+
+        mi_estimate = t_joint.mean() - log_mean_et
         return mi_estimate   # minimise this → minimise MI
 
 
@@ -319,6 +333,13 @@ class SCGMessagePassingLayer(nn.Module):
         agg.scatter_add_(1,
                          dst.unsqueeze(0).unsqueeze(-1).expand(B, -1, Ds),
                          m_causal)
+        
+        # 【修改点】根据邻居数量做平均（或缩放）
+        # 计算每个节点的度（邻居数）
+        deg = torch.zeros(N, device=Hs.device)
+        deg.scatter_add_(0, dst, torch.ones_like(dst).float())
+        deg = deg.view(1, -1, 1).clamp(min=1.0)
+        agg = agg / deg  # 均值聚合比求和聚合在密集的图中稳定得多
 
         # Residual update
         Hs_new = self.agg_transform(Hs + agg)
@@ -353,6 +374,7 @@ class ProbabilisticPredictor(nn.Module):
     """
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 128):
         super().__init__()
+        self.norm = nn.LayerNorm(in_dim) # 稳住输入
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
@@ -365,9 +387,11 @@ class ProbabilisticPredictor(nn.Module):
         H_final : [B, N, De'+Ds']
         returns : mu [B, N, out_dim], sigma [B, N, out_dim]
         """
+        H_final = self.norm(H_final)
         h = self.net(H_final)
         mu    = self.mu_head(h)
-        sigma = F.softplus(self.sigma_head(h)) + 1e-6   # ensure > 0
+        # softplus + offset: sigma 最小为 0.05，防止 log(sigma) → -inf
+        sigma = F.softplus(self.sigma_head(h)) + 0.05
         return mu, sigma
 
 
@@ -379,9 +403,12 @@ def nll_gaussian_loss(mu: torch.Tensor, sigma: torch.Tensor,
     """
     Negative Log-Likelihood for Gaussian  (paper eq. 13).
     L_NLL = mean[ (y - mu)^2 / (2*sigma^2) + log(sigma) ]
+
+    eps=1e-2 确保方差下界，防止模型通过压缩 sigma→0 使 log(sigma)→-inf
+    从而把 loss 推向负无穷。
     """
-    loss = ((y - mu) ** 2) / (2 * sigma ** 2) + torch.log(sigma)
-    return loss.mean()
+    var = sigma ** 2
+    return F.gaussian_nll_loss(mu, y, var, eps=1e-2, reduction='mean')
 
 
 def crps_gaussian(mu: torch.Tensor, sigma: torch.Tensor,

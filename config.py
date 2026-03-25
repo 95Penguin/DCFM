@@ -8,10 +8,20 @@ GridCFN Configuration
   2. 直接运行 python main.py
 
 切换数据集示例：
-  - 合成数据（无需下载，快速验证）: DATASET = "synthetic"
-  - Solar-Energy:                   DATASET = "solar",  DATA_PATH = "./data/solar_AL.txt"
-  - Electricity (UCI):              DATASET = "electricity", DATA_PATH = "./data/electricity.txt"
-  - Weather2k:                      DATASET = "weather", DATA_PATH = "./data/weather2k.npy"
+  - 合成数据（无需下载，快速验证）: dataset = "synthetic"
+  - Solar-Energy:    dataset = "solar",       data_path = "./data/solar_AL.txt"
+  - Electricity:     dataset = "electricity", data_path = "./data/electricity.txt"
+  - Weather2k:       dataset = "weather",     data_path = "./data/weather2k.npy"
+
+GPU 使用：
+  - 有 GPU 时自动使用，无需改代码
+  - 多卡时在 TrainConfig.gpu_id 指定卡号（0/1/2/...）
+  - gpu_id = -1 表示自动选择
+
+日志：
+  - 训练日志自动保存到 logs/ 目录下，文件名含时间戳
+  - log_dir = None 则不保存文件，只打印到控制台
+  - log_to_console = False 则只写文件不打印
 """
 
 from dataclasses import dataclass, field, asdict
@@ -118,6 +128,22 @@ class TrainConfig:
     # 随机种子
     seed: int = 42
 
+    # -----------------------------------------------------------------------
+    # GPU 配置
+    # -----------------------------------------------------------------------
+    # 指定 GPU 卡号：0 / 1 / 2 ...
+    # -1 = 自动选择（有 GPU 就用，没有就用 CPU）
+    gpu_id: int = -1
+
+    # -----------------------------------------------------------------------
+    # 日志配置
+    # -----------------------------------------------------------------------
+    # 日志保存目录；None 表示不写文件，只打印到控制台
+    log_dir: Optional[str] = "logs"
+
+    # True = 控制台 + 文件同时输出；False = 只写文件不打印到控制台
+    log_to_console: bool = True
+
 
 # ===========================================================================
 # 顶层配置（聚合三个子配置）
@@ -129,7 +155,6 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def summary(self) -> str:
-        """打印当前配置摘要。"""
         lines = ["=" * 52, "GridCFN Configuration", "=" * 52]
         for section_name, section in [("Data", self.data),
                                        ("Model", self.model),
@@ -142,19 +167,13 @@ class Config:
 
 
 # ===========================================================================
-# 预设配置（直接切换实验场景）
+# 预设配置
 # ===========================================================================
 
 def get_config(preset: str = "default") -> Config:
     """
     快速获取预设配置。
-
-    preset 可选值：
-      "default"     – 合成数据，快速验证
-      "solar"       – Solar-Energy 数据集（论文设置）
-      "electricity" – Electricity 数据集（论文设置）
-      "weather"     – Weather2k 数据集（论文设置）
-      "debug"       – 极小规模，用于调试
+    preset: "default" | "solar" | "electricity" | "weather" | "debug"
     """
     if preset == "default":
         return Config()
@@ -162,11 +181,8 @@ def get_config(preset: str = "default") -> Config:
     elif preset == "solar":
         return Config(
             data=DataConfig(
-                dataset="solar",
-                data_path="./data/solar_AL.txt",
-                T_in=168, T_out=1,
-                adj_threshold=0.7,
-                batch_size=32,
+                dataset="solar", data_path="./data/solar_AL.txt",
+                T_in=168, T_out=1, adj_threshold=0.95, batch_size=32,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -174,19 +190,14 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(
-                lr=1e-3, max_epochs=200, patience=20, seed=42,
-            ),
+            train=TrainConfig(lr=5e-4, max_epochs=200, patience=20, seed=42, grad_clip=1.0),  # 强力裁剪梯度，从 5.0 降到 1.0
         )
 
     elif preset == "electricity":
         return Config(
             data=DataConfig(
-                dataset="electricity",
-                data_path="./data/electricity.txt",
-                T_in=168, T_out=1,
-                adj_threshold=0.7,
-                batch_size=32,
+                dataset="electricity", data_path="./data/electricity.txt",
+                T_in=168, T_out=1, adj_threshold=0.7, batch_size=32,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -194,19 +205,14 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(
-                lr=1e-3, max_epochs=200, patience=20, seed=42,
-            ),
+            train=TrainConfig(lr=1e-3, max_epochs=200, patience=20, seed=42),
         )
 
     elif preset == "weather":
         return Config(
             data=DataConfig(
-                dataset="weather",
-                data_path="./data/weather2k.npy",
-                T_in=168, T_out=1,
-                adj_threshold=0.6,
-                batch_size=32,
+                dataset="weather", data_path="./data/weather2k.npy",
+                T_in=168, T_out=1, adj_threshold=0.6, batch_size=32,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -214,18 +220,14 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(
-                lr=1e-3, max_epochs=200, patience=20, seed=42,
-            ),
+            train=TrainConfig(lr=1e-3, max_epochs=200, patience=20, seed=42),
         )
 
     elif preset == "debug":
         return Config(
             data=DataConfig(
-                dataset="synthetic",
-                T_in=12, T_out=1,
-                batch_size=8,
-                synthetic_T=300, synthetic_N=5, synthetic_F=1,
+                dataset="synthetic", T_in=12, T_out=1,
+                batch_size=8, synthetic_T=300, synthetic_N=5, synthetic_F=1,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=16, gcn_layers=2,
@@ -233,11 +235,11 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=8, stoch_dim=8, ms_out_dim=8,
                 n_scg_layers=2, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(
-                lr=1e-3, max_epochs=5, patience=5, seed=0,
-            ),
+            train=TrainConfig(lr=1e-3, max_epochs=5, patience=5, seed=0),
         )
 
     else:
-        raise ValueError(f"Unknown preset: '{preset}'. "
-                         f"Choose from: default, solar, electricity, weather, debug")
+        raise ValueError(
+            f"Unknown preset: '{preset}'. "
+            "Choose from: default, solar, electricity, weather, debug"
+        )

@@ -115,7 +115,8 @@ def load_solar_energy(data_path: str, T_in: int = 168, T_out: int = 1,
     Expected file: solar_AL.txt  (space-separated, [T, N])
     Download: LSTNet repo  https://github.com/laiguokun/multivariate-time-series-data
     """
-    raw = np.loadtxt(data_path)          # [T, N=137]
+    # raw = np.loadtxt(data_path)          # [T, N=137]
+    raw = np.loadtxt(data_path, delimiter=',')
     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Solar')
 
 
