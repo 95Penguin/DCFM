@@ -1,6 +1,13 @@
 """
 GridCFN 单元测试
 运行: python test_model.py
+
+修复说明：
+  - test_disentangler：验证新的返回值 (He, Hs, He_seq)，He_seq=[B,T,N,De]
+  - test_scgmp：env_dim 改为 ms_out_dim（Bug-5 修复，传 He_prime）
+  - test_full_model：compute_loss 新增 lambda_mi 参数（Bug-4）
+  - test_backward：拆分主网络 / MINE 两步 backward（Bug-1）
+  - test_config：验证 warmup_epochs 字段存在（Bug-4）
 """
 
 import torch
@@ -57,9 +64,12 @@ def test_disentangler():
     print("Testing CausalDisentangler...")
     B, T, N, D = 2, 12, 10, 64
     H = torch.randn(B, T, N, D)
-    He, Hs, H_seq = CausalDisentangler(D, 32, 32)(H)
-    assert He.shape == (B, N, 32) and Hs.shape == (B, N, 32)
-    print(f"  OK: He={He.shape}, Hs={Hs.shape}")
+    # [Bug-2 修复] 现在返回 (He, Hs, He_seq)
+    He, Hs, He_seq = CausalDisentangler(D, 32, 32)(H)
+    assert He.shape == (B, N, 32), f"He shape: {He.shape}"
+    assert Hs.shape == (B, N, 32), f"Hs shape: {Hs.shape}"
+    assert He_seq.shape == (B, T, N, 32), f"He_seq shape: {He_seq.shape}"
+    print(f"  OK: He={He.shape}, Hs={Hs.shape}, He_seq={He_seq.shape}")
 
 
 def test_mine():
@@ -82,11 +92,12 @@ def test_ms_context():
 
 def test_scgmp():
     print("Testing SCGMP...")
-    B, N, Ds, De = 2, 10, 32, 32
-    Hs = torch.randn(B, N, Ds)
-    He = torch.randn(B, N, De)
+    B, N, Ds = 2, 10, 32
+    ms_out_dim = 32  # [Bug-5 修复] env_dim = ms_out_dim，传 He_prime
+    Hs       = torch.randn(B, N, Ds)
+    He_prime = torch.randn(B, N, ms_out_dim)
     edge_index = GridCFN.adj_to_edge_index(make_adj(N))
-    out = SCGMP(Ds, De, n_layers=3)(Hs, He, edge_index)
+    out = SCGMP(Ds, ms_out_dim, n_layers=3)(Hs, He_prime, edge_index)
     assert out.shape == (B, N, Ds)
     print(f"  OK: {out.shape}")
 
@@ -115,13 +126,14 @@ def test_full_model():
     mu, sigma, mi_loss = model(x, adj)
     assert mu.shape == (B, N, 1)
     y = torch.randn(B, N, 1)
-    loss, l_nll, l_mi = model.compute_loss(mu, sigma, y, mi_loss)
+    # [Bug-4 修复] 传入动态 lambda_mi
+    loss, l_nll, l_mi = model.compute_loss(mu, sigma, y, mi_loss, lambda_mi=0.5)
     assert not torch.isnan(loss)
     print(f"  OK: loss={loss.item():.4f}, nll={l_nll.item():.4f}, mi={l_mi.item():.4f}")
 
 
 def test_backward():
-    print("Testing backward pass...")
+    print("Testing backward pass (MINE minimax)...")
     cfg = get_config("debug")
     m   = cfg.model
     B, T, N = 2, cfg.data.T_in, cfg.data.synthetic_N
@@ -134,12 +146,25 @@ def test_backward():
                     stoch_dim=m.stoch_dim, ms_out_dim=m.ms_out_dim,
                     n_scg_layers=m.n_scg_layers, out_dim=m.out_dim,
                     lambda_mi=m.lambda_mi)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    opt.zero_grad()
+
+    # [Bug-1 修复] MINE 独立 optimizer，主网络独立 optimizer
+    from train import _forward_for_mine
+    mine_opt = torch.optim.Adam(model.mine_parameters(), lr=2e-3)
+    main_opt = torch.optim.Adam(model.main_parameters(), lr=1e-3)
+
+    # Step1: MINE 梯度上升
+    mine_opt.zero_grad()
+    mi_est = _forward_for_mine(model, x, adj)
+    (-mi_est).backward()
+    mine_opt.step()
+
+    # Step2: 主网络梯度下降
+    main_opt.zero_grad()
     mu, sigma, mi_loss = model(x, adj)
-    loss, _, _ = model.compute_loss(mu, sigma, y, mi_loss)
+    loss, _, _ = model.compute_loss(mu, sigma, y, mi_loss, lambda_mi=0.5)
     loss.backward()
-    opt.step()
+    main_opt.step()
+
     for name, p in model.named_parameters():
         if p.grad is not None:
             assert not torch.isnan(p.grad).any(), f"NaN grad in {name}"
@@ -177,12 +202,13 @@ def test_config():
         cfg = get_config(preset)
         assert cfg.data.dataset is not None
         assert cfg.model.lambda_mi > 0
+        assert hasattr(cfg.train, 'warmup_epochs'), "warmup_epochs missing"
     print("  OK: all presets load correctly")
 
 
 def run_mini_training():
-    """端到端 mini 训练（5 epoch）。"""
-    print("\nRunning mini end-to-end training (debug preset, 5 epochs)...")
+    """端到端 mini 训练（debug preset）。"""
+    print("\nRunning mini end-to-end training (debug preset)...")
     from train import train
 
     cfg    = get_config("debug")

@@ -3,6 +3,9 @@ GridCFN Configuration
 =====================
 所有超参数统一在这里修改，不需要动其他文件。
 
+修复说明：
+  [Bug-4 修复] 新增 warmup_epochs 字段（默认 5），用于 train.py 的热身逻辑。
+
 使用方法：
   1. 修改下面对应的参数值
   2. 直接运行 python main.py
@@ -34,7 +37,8 @@ from typing import Optional
 @dataclass
 class DataConfig:
     # 数据集名称: "synthetic" | "solar" | "electricity" | "weather"
-    dataset: str = "synthetic"
+    # dataset: str = "synthetic"
+    dataset: str = "solar"
 
     # 真实数据集的文件路径（synthetic 时不需要）
     data_path: Optional[str] = None
@@ -116,8 +120,8 @@ class TrainConfig:
     # 学习率衰减耐心值
     lr_decay_patience: int = 10
 
-    # 梯度裁剪阈值
-    grad_clip: float = 5.0
+    # 梯度裁剪阈值（对主网络参数）
+    grad_clip: float = 1.0
 
     # 权重衰减（L2 正则）
     weight_decay: float = 1e-5
@@ -128,20 +132,19 @@ class TrainConfig:
     # 随机种子
     seed: int = 42
 
+    # [Bug-4 修复] 热身 epoch 数：前 warmup_epochs 个 epoch 不引入 MI 正则化
+    # 确保 MINE 有足够时间收敛到合理的 MI 估计后，再让主网络依赖它优化
+    warmup_epochs: int = 5
+
     # -----------------------------------------------------------------------
     # GPU 配置
     # -----------------------------------------------------------------------
-    # 指定 GPU 卡号：0 / 1 / 2 ...
-    # -1 = 自动选择（有 GPU 就用，没有就用 CPU）
     gpu_id: int = -1
 
     # -----------------------------------------------------------------------
     # 日志配置
     # -----------------------------------------------------------------------
-    # 日志保存目录；None 表示不写文件，只打印到控制台
     log_dir: Optional[str] = "logs"
-
-    # True = 控制台 + 文件同时输出；False = 只写文件不打印到控制台
     log_to_console: bool = True
 
 
@@ -190,7 +193,10 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(lr=5e-4, max_epochs=200, patience=20, seed=42, grad_clip=1.0),  # 强力裁剪梯度，从 5.0 降到 1.0
+            train=TrainConfig(
+                lr=5e-4, max_epochs=200, patience=20, seed=42,
+                grad_clip=1.0, warmup_epochs=5,
+            ),
         )
 
     elif preset == "electricity":
@@ -205,7 +211,10 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(lr=1e-3, max_epochs=200, patience=20, seed=42),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=200, patience=20, seed=42,
+                warmup_epochs=5,
+            ),
         )
 
     elif preset == "weather":
@@ -220,7 +229,10 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(lr=1e-3, max_epochs=200, patience=20, seed=42),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=200, patience=20, seed=42,
+                warmup_epochs=5,
+            ),
         )
 
     elif preset == "debug":
@@ -235,7 +247,10 @@ def get_config(preset: str = "default") -> Config:
                 env_dim=8, stoch_dim=8, ms_out_dim=8,
                 n_scg_layers=2, out_dim=1, lambda_mi=0.5,
             ),
-            train=TrainConfig(lr=1e-3, max_epochs=5, patience=5, seed=0),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=5, patience=5, seed=0,
+                warmup_epochs=2,
+            ),
         )
 
     else:
