@@ -31,6 +31,29 @@ import torch.nn.functional as F
 
 
 # ===========================================================================
+# 梯度反转层（GRL）—— 用于 MI 正则
+# ===========================================================================
+
+class GradReverse(torch.autograd.Function):
+    """
+    前向：恒等变换
+    反向：梯度乘以 -alpha（反转方向）
+
+    用于 MI 对抗正则：
+      对分类器参数：正向 CE 梯度 → 让分类器变强（能识别环境类别）
+      对编码器参数：经 GRL 反转 → 让 Hi 更难被分类（最小化 MI）
+    """
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.alpha * grad_output, None
+
+
+# ===========================================================================
 # 1-3. Backbone（保持原版完全不变）
 # ===========================================================================
 
@@ -226,7 +249,14 @@ class CaSTEnvDisentangler(nn.Module):
         self.vq = VectorQuantizerEMA(
             n_codes=n_codes, code_dim=env_dim, decay=vq_decay)
 
-        # ── MI 正则：对抗分类器 ──────────────────────────────────────────
+        # ── 独立逐帧投影（供 MultiScaleContext 使用，与 avg_proj 分离）──
+        # 修复警告1：He_seq 不再复用 avg_proj，避免时序信息退化为单层 Linear
+        self.frame_proj = nn.Linear(in_dim, env_dim)
+
+        # ── MI 正则：对抗分类器（GRL 版）───────────────────────────────
+        # 修复严重1/2：改用梯度反转层替代手动 detach+熵正则方案
+        #   分类器参数：正向 CE 梯度（变强）
+        #   编码器参数：GRL 反转后梯度（Hi 变难分类 = MI 减小）
         self.mi_classifier = nn.Sequential(
             nn.Linear(stoch_dim, stoch_dim), nn.ReLU(),
             nn.Linear(stoch_dim, n_codes))
@@ -253,8 +283,9 @@ class CaSTEnvDisentangler(nn.Module):
         He = self.env_norm(
             attn_out.reshape(B, N, self.env_dim) + avg_feat)
 
-        # 完整时序 He_seq（对每帧 avg_proj，供 MultiScaleContext）
-        He_seq = self.avg_proj(
+        # 完整时序 He_seq（逐帧独立投影，供 MultiScaleContext）
+        # 修复警告1：使用独立的 frame_proj，与 avg_proj 解耦
+        He_seq = self.frame_proj(
             H.reshape(B * T * N, D)).reshape(B, T, N, self.env_dim)
 
         return He, He_seq
@@ -285,21 +316,29 @@ class CaSTEnvDisentangler(nn.Module):
             He.reshape(B * N, self.env_dim))
         He_q = He_q_flat.reshape(B, N, self.env_dim)   # [B, N, env_dim]
 
-        # MI 正则：用 Hi 预测环境类别，目标是让预测分布趋近均匀（熵最大化）
-        # env_idx: [B*N]，VQ 量化索引即环境类别标签
-        logits   = self.mi_classifier(
-            Hi.reshape(B * N, self.stoch_dim))          # [B*N, n_codes]
-        # 训练分类器预测 env_idx（让 CE loss 可反传）
-        mi_cls_loss = F.cross_entropy(logits, env_idx.detach())
-        # MI 正则 = 对主网络施加对抗项（负 CE）= 让 Hi 无法区分环境
-        # 实现：对 Hi 编码器传 -CE 的梯度，即 mi_loss = -mi_cls_loss
-        # 分类器参数正常被 mi_cls_loss 更新（朝"分类准确"方向）
-        # Hi/He 编码器被 -mi_cls_loss 更新（朝"分类失败"方向）
-        # 单 optimizer 全参数联合优化时，用梯度反转层思路：
-        # 将 mi_loss 设为 -mi_cls_loss，放入总 loss 中
-        mi_loss = -mi_cls_loss
+        # MI 正则（GRL 版，修复严重1/2）
+        # ─────────────────────────────────────────────────────────────────
+        # 原方案问题：
+        #   Step-A 用 Hi.detach() 训练分类器，Step-B 用 no_grad 取权重
+        #   手动矩阵乘，导致编码器侧梯度量级约 1e-5，被 NLL 完全压制；
+        #   同时 mi_cls_loss 加入 l_total 与 mi_loss 梯度方向互相干扰。
+        #
+        # GRL 方案：
+        #   一次前向，GRL 在 backward 时将梯度反转：
+        #     → 对 mi_classifier 参数：正向 CE（分类器变强）
+        #     → 对 Hi 编码器参数  ：反转 CE（Hi 更难被分类 = MI 减小）
+        #   梯度量级与 CE loss 同量级，不被 NLL 压制。
+        #   alpha=0.1 控制反转强度，与 beta_mi 共同调节正则力度。
+        # ─────────────────────────────────────────────────────────────────
+        Hi_flat     = Hi.reshape(B * N, self.stoch_dim)
+        Hi_grl      = GradReverse.apply(Hi_flat, 0.1)
+        logits_grl  = self.mi_classifier(Hi_grl)
+        mi_loss     = F.cross_entropy(logits_grl, env_idx.detach())
 
-        return He_q, Hi, He_seq, commit_loss, mi_loss
+        # 保留接口兼容性，mi_cls_loss 不再单独计入 l_total
+        mi_cls_loss = torch.zeros(1, device=Hi_flat.device)
+
+        return He_q, Hi, He_seq, commit_loss, mi_loss, mi_cls_loss
 
 
 # ===========================================================================
@@ -407,9 +446,11 @@ class GMMPredictor(nn.Module):
         B, N, _ = H_final.shape
         K, Fo   = self.K, self.out_dim
 
-        # GRIN 实例归一化
-        inst_mean = H_final.mean(-1, keepdim=True)
-        inst_std  = H_final.std(-1,  keepdim=True) + 1e-6
+        # GRIN 实例归一化（修复严重3：沿节点维 N 归一化，消除节点间量纲差异）
+        # 原版对特征维 D 做均值等同于 LayerNorm，无法消除不同节点的量纲差异。
+        # 正确做法：对 N 维统计，使每个特征维在节点间均值为0、方差为1。
+        inst_mean = H_final.mean(1, keepdim=True)   # [B, 1, D]  沿节点维
+        inst_std  = H_final.std(1,  keepdim=True) + 1e-6
         H = (H_final - inst_mean) / inst_std
         H = H * self.grin_scale + self.grin_shift
         h = self.net(self.norm(H))                             # [B, N, hidden]
@@ -420,11 +461,12 @@ class GMMPredictor(nn.Module):
         sigma  = F.softplus(
             self.sigma_head(h).view(B, N, Fo, K)) + 1e-3
 
-        # GRIN 反归一化
-        me = inst_mean.unsqueeze(-1).expand_as(mu_raw)
-        se = inst_std.unsqueeze(-1).expand_as(sigma)
+        # GRIN 反归一化：inst_mean/std 形状 [B,1,D]，需扩展到 [B,N,Fo,K]
+        me = inst_mean[:, :, :Fo].unsqueeze(-1).expand_as(mu_raw)   # [B,N,Fo,K]
+        se = inst_std[:, :, :Fo].unsqueeze(-1).expand_as(sigma)
         mu    = mu_raw * se + me
-        sigma = sigma  * se
+        # sigma 上限 clamp：防止量纲极大节点初期 sigma 爆炸导致 NLL 溢出
+        sigma = (sigma * se).clamp(min=1e-3, max=1e4)
 
         return alpha, mu, sigma
 
@@ -551,7 +593,7 @@ class GridCFN(nn.Module):
         H = self.backbone(x, adj_norm)
 
         # CaST 完整后门调整解耦
-        He_q, Hi, He_seq, commit_loss, mi_loss = self.disentangler(H)
+        He_q, Hi, He_seq, commit_loss, mi_loss, mi_cls_loss = self.disentangler(H)
 
         # 多尺度上下文
         He_prime = self.ms_context(He_seq)
@@ -563,26 +605,26 @@ class GridCFN(nn.Module):
         H_final = torch.cat([He_prime, Hi_prime], dim=-1)
         alpha, mu, sigma = self.predictor(H_final)
 
-        return alpha, mu, sigma, commit_loss, mi_loss
+        return alpha, mu, sigma, commit_loss, mi_loss, mi_cls_loss
 
     def compute_loss(self, alpha, mu, sigma, y,
-                     commit_loss, mi_loss,
+                     commit_loss, mi_loss, mi_cls_loss,
                      beta_vq=None, beta_mi=None):
         """
         L_total = L_NLL(GMM) + beta_vq * L_commit + beta_mi * L_mi
 
-        mi_loss 已在 forward 中取负（-CE），
-        加入总 loss 后对 Hi 编码器产生"阻止分类"的梯度方向。
-        mi_classifier 参数同时被正常 CE 梯度更新（朝"分类准确"方向），
-        形成对抗解耦。
+        修复严重2：去掉 mi_cls_loss 项。
+          GRL 方案中 mi_loss 本身已同时驱动分类器（正向）和编码器（反转），
+          mi_cls_loss 已置为 zero tensor，无需加入 l_total。
+          保留 mi_cls_loss 参数是为了兼容 train.py 的调用接口。
         """
         if beta_vq is None:
             beta_vq = self.beta_vq
         if beta_mi is None:
             beta_mi = self.beta_mi
 
-        y_tgt   = y[..., :self.predictor.out_dim]
-        l_nll   = nll_gmm_loss(alpha, mu, sigma, y_tgt)
+        y_tgt  = y[..., :self.predictor.out_dim]
+        l_nll  = nll_gmm_loss(alpha, mu, sigma, y_tgt)
         l_total = l_nll + beta_vq * commit_loss + beta_mi * mi_loss
         return l_total, l_nll, commit_loss, mi_loss
 
@@ -592,3 +634,4 @@ class GridCFN(nn.Module):
     def mine_parameters(self):
         """兼容旧接口。"""
         return []
+    

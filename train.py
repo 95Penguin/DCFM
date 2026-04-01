@@ -65,7 +65,7 @@ def evaluate_all(mu_all, sigma_all, y_all):
 def train_one_epoch(model, loader, optimizer, adj, device,
                     grad_clip=1.0):
     model.train()
-    total_nll = total_commit = total_mi = total_loss = 0.0
+    total_nll = total_commit = total_mi = total_mi_cls = total_loss = 0.0
     n_batches = 0
 
     for x, y in loader:
@@ -75,27 +75,29 @@ def train_one_epoch(model, loader, optimizer, adj, device,
 
         optimizer.zero_grad()
 
-        alpha, mu, sigma, commit_loss, mi_loss = model(x, adj_)
+        alpha, mu, sigma, commit_loss, mi_loss, mi_cls_loss = model(x, adj_)
 
         y_target = y[..., :model.predictor.out_dim]
         l_total, l_nll, l_commit, l_mi = model.compute_loss(
-            alpha, mu, sigma, y_target, commit_loss, mi_loss)
+            alpha, mu, sigma, y_target, commit_loss, mi_loss, mi_cls_loss)
 
         l_total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
 
-        total_nll    += l_nll.item()
-        total_commit += l_commit.item()
-        total_mi     += l_mi.item()
-        total_loss   += l_total.item()
-        n_batches    += 1
+        total_nll     += l_nll.item()
+        total_commit  += l_commit.item()
+        total_mi      += l_mi.item()
+        total_mi_cls  += mi_cls_loss.item()
+        total_loss    += l_total.item()
+        n_batches     += 1
 
     return {
-        "loss":   total_loss   / n_batches,
-        "nll":    total_nll    / n_batches,
-        "commit": total_commit / n_batches,
-        "mi":     total_mi     / n_batches,
+        "loss":    total_loss    / n_batches,
+        "nll":     total_nll     / n_batches,
+        "commit":  total_commit  / n_batches,
+        "mi":      total_mi      / n_batches,
+        "mi_cls":  total_mi_cls  / n_batches,
     }
 
 
@@ -109,7 +111,7 @@ def evaluate(model, loader, adj, device, scaler=None):
     mu_list, sigma_list, y_list = [], [], []
 
     for x, y in loader:
-        alpha, mu, sigma, _, _ = model(x.to(device), adj.to(device))
+        alpha, mu, sigma, _, _, _ = model(x.to(device), adj.to(device))
         mu_list.append(gmm_mean(alpha, mu).cpu().numpy())
         sigma_list.append(gmm_variance(alpha, mu, sigma).cpu().numpy())
         y_list.append(y.numpy())
@@ -157,7 +159,7 @@ def train(model, train_loader, val_loader, test_loader,
     history           = {"train_loss": [], "val_crps": [], "val_mae": []}
 
     header = (f"{'Epoch':>6} | {'NLL':>8} | {'Commit':>7} | {'MI':>7} | "
-              f"{'Val MAE':>8} | {'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
+              f"{'MI_cls':>7} | {'Val MAE':>8} | {'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
     logger.info(header)
     logger.info("-" * len(header))
 
@@ -179,7 +181,7 @@ def train(model, train_loader, val_loader, test_loader,
 
         logger.info(
             f"{epoch:>6} | {train_m['nll']:>8.4f} | {train_m['commit']:>7.4f} | "
-            f"{train_m['mi']:>7.4f} | "
+            f"{train_m['mi']:>7.4f} | {train_m['mi_cls']:>7.4f} | "
             f"{val_m['MAE']:>8.4f} | {val_m['CRPS']:>9.4f} | "
             f"{cur_lr:>8.2e} | {elapsed:>5.1f}s")
 
