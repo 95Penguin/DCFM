@@ -3,28 +3,13 @@ GridCFN Configuration
 =====================
 所有超参数统一在这里修改，不需要动其他文件。
 
-修复说明：
-  [Bug-4 修复] 新增 warmup_epochs 字段（默认 5），用于 train.py 的热身逻辑。
-
 使用方法：
-  1. 修改下面对应的参数值
-  2. 直接运行 python main.py
+  python main.py --preset solar
+  python main.py --preset electricity
+  python main.py --preset weather
 
-切换数据集示例：
-  - 合成数据（无需下载，快速验证）: dataset = "synthetic"
-  - Solar-Energy:    dataset = "solar",       data_path = "./data/solar_AL.txt"
-  - Electricity:     dataset = "electricity", data_path = "./data/electricity.txt"
-  - Weather2k:       dataset = "weather",     data_path = "./data/weather2k.npy"
-
-GPU 使用：
-  - 有 GPU 时自动使用，无需改代码
-  - 多卡时在 TrainConfig.gpu_id 指定卡号（0/1/2/...）
-  - gpu_id = -1 表示自动选择
-
-日志：
-  - 训练日志自动保存到 logs/ 目录下，文件名含时间戳
-  - log_dir = None 则不保存文件，只打印到控制台
-  - log_to_console = False 则只写文件不打印
+切换数据集只需修改 DataConfig.dataset 和 data_path，
+或直接使用 --preset 命令行参数。
 """
 
 from dataclasses import dataclass, field, asdict
@@ -36,29 +21,23 @@ from typing import Optional
 # ===========================================================================
 @dataclass
 class DataConfig:
-    # 数据集名称: "synthetic" | "solar" | "electricity" | "weather"
-    # dataset: str = "synthetic"
+    # 数据集名称: "solar" | "electricity" | "weather"
     dataset: str = "solar"
 
-    # 真实数据集的文件路径（synthetic 时不需要）
-    data_path: Optional[str] = None
+    # 真实数据集的文件路径
+    data_path: Optional[str] = "./data/solar_AL.txt"
 
-    # 输入窗口长度（论文: 168；合成测试用 12）
-    T_in: int = 12
+    # 输入窗口长度（论文: 168）
+    T_in: int = 168   
 
     # 预测步长（论文: 1）
     T_out: int = 1
 
     # 构建邻接矩阵时的相关性阈值
-    adj_threshold: float = 0.7
+    adj_threshold: float = 0.95
 
     # DataLoader batch size（论文: 32）
     batch_size: int = 32
-
-    # 合成数据专用参数（dataset="synthetic" 时生效）
-    synthetic_T: int = 2000      # 总时间步数
-    synthetic_N: int = 20        # 节点数
-    synthetic_F: int = 1         # 特征数（需和 model.in_dim 一致）
 
 
 # ===========================================================================
@@ -66,7 +45,7 @@ class DataConfig:
 # ===========================================================================
 @dataclass
 class ModelConfig:
-    # 输入特征维度 F（需和 DataConfig.synthetic_F 一致）
+    # 输入特征维度 F
     in_dim: int = 1
 
     # GCN 隐藏层维度
@@ -75,10 +54,10 @@ class ModelConfig:
     # GCN 层数
     gcn_layers: int = 2
 
-    # TCN 输出维度 D（即论文中的 d_hidden=64）
+    # TCN 输出维度 D（论文 d_hidden=64）
     tcn_hidden: int = 64
 
-    # TCN 层数（对应膨胀系数 1,2,4,...,2^(tcn_layers-1)）
+    # TCN 层数（膨胀系数 1,2,4,...,2^(tcn_layers-1)）
     tcn_layers: int = 4
 
     # 环境上下文维度 De
@@ -120,7 +99,7 @@ class TrainConfig:
     # 学习率衰减耐心值
     lr_decay_patience: int = 10
 
-    # 梯度裁剪阈值（对主网络参数）
+    # 梯度裁剪阈值
     grad_clip: float = 1.0
 
     # 权重衰减（L2 正则）
@@ -132,24 +111,19 @@ class TrainConfig:
     # 随机种子
     seed: int = 42
 
-    # [Bug-4 修复] 热身 epoch 数：前 warmup_epochs 个 epoch 不引入 MI 正则化
-    # 确保 MINE 有足够时间收敛到合理的 MI 估计后，再让主网络依赖它优化
+    # 热身 epoch 数：前 warmup_epochs 个 epoch MI 正则权重为 0
     warmup_epochs: int = 5
 
-    # -----------------------------------------------------------------------
-    # GPU 配置
-    # -----------------------------------------------------------------------
+    # GPU 配置（-1 自动选择，>=0 指定卡号）
     gpu_id: int = -1
 
-    # -----------------------------------------------------------------------
     # 日志配置
-    # -----------------------------------------------------------------------
     log_dir: Optional[str] = "logs"
     log_to_console: bool = True
 
 
 # ===========================================================================
-# 顶层配置（聚合三个子配置）
+# 顶层配置
 # ===========================================================================
 @dataclass
 class Config:
@@ -159,7 +133,7 @@ class Config:
 
     def summary(self) -> str:
         lines = ["=" * 52, "GridCFN Configuration", "=" * 52]
-        for section_name, section in [("Data", self.data),
+        for section_name, section in [("Data",  self.data),
                                        ("Model", self.model),
                                        ("Train", self.train)]:
             lines.append(f"\n[{section_name}]")
@@ -173,19 +147,19 @@ class Config:
 # 预设配置
 # ===========================================================================
 
-def get_config(preset: str = "default") -> Config:
+def get_config(preset: str = "solar") -> Config:
     """
     快速获取预设配置。
-    preset: "default" | "solar" | "electricity" | "weather" | "debug"
+    preset: "solar" | "electricity" | "weather"
     """
-    if preset == "default":
-        return Config()
-
-    elif preset == "solar":
+    if preset == "solar":
         return Config(
             data=DataConfig(
-                dataset="solar", data_path="./data/solar_AL.txt",
-                T_in=168, T_out=1, adj_threshold=0.95, batch_size=32,
+                dataset="solar",
+                data_path="./data/solar_AL.txt",
+                T_in=12, T_out=1,
+                adj_threshold=0.95,
+                batch_size=32,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -194,16 +168,19 @@ def get_config(preset: str = "default") -> Config:
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
             train=TrainConfig(
-                lr=5e-4, max_epochs=200, patience=20, seed=42,
-                grad_clip=1.0, warmup_epochs=5,
+                lr=5e-4, max_epochs=200, patience=20,
+                seed=42, grad_clip=1.0, warmup_epochs=5,
             ),
         )
 
     elif preset == "electricity":
         return Config(
             data=DataConfig(
-                dataset="electricity", data_path="./data/electricity.txt",
-                T_in=168, T_out=1, adj_threshold=0.7, batch_size=32,
+                dataset="electricity",
+                data_path="./data/electricity.txt",
+                T_in=168, T_out=1,
+                adj_threshold=0.7,
+                batch_size=32,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -212,16 +189,19 @@ def get_config(preset: str = "default") -> Config:
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
             train=TrainConfig(
-                lr=1e-3, max_epochs=200, patience=20, seed=42,
-                warmup_epochs=5,
+                lr=1e-3, max_epochs=200, patience=20,
+                seed=42, grad_clip=1.0, warmup_epochs=5,
             ),
         )
 
     elif preset == "weather":
         return Config(
             data=DataConfig(
-                dataset="weather", data_path="./data/weather2k.npy",
-                T_in=168, T_out=1, adj_threshold=0.6, batch_size=32,
+                dataset="weather",
+                data_path="./data/weather2k.npy",
+                T_in=168, T_out=1,
+                adj_threshold=0.6,
+                batch_size=32,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -230,31 +210,13 @@ def get_config(preset: str = "default") -> Config:
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
             ),
             train=TrainConfig(
-                lr=1e-3, max_epochs=200, patience=20, seed=42,
-                warmup_epochs=5,
-            ),
-        )
-
-    elif preset == "debug":
-        return Config(
-            data=DataConfig(
-                dataset="synthetic", T_in=12, T_out=1,
-                batch_size=8, synthetic_T=300, synthetic_N=5, synthetic_F=1,
-            ),
-            model=ModelConfig(
-                in_dim=1, gcn_hidden=16, gcn_layers=2,
-                tcn_hidden=16, tcn_layers=2,
-                env_dim=8, stoch_dim=8, ms_out_dim=8,
-                n_scg_layers=2, out_dim=1, lambda_mi=0.5,
-            ),
-            train=TrainConfig(
-                lr=1e-3, max_epochs=5, patience=5, seed=0,
-                warmup_epochs=2,
+                lr=1e-3, max_epochs=200, patience=20,
+                seed=42, grad_clip=1.0, warmup_epochs=5,
             ),
         )
 
     else:
         raise ValueError(
             f"Unknown preset: '{preset}'. "
-            "Choose from: default, solar, electricity, weather, debug"
+            "Choose from: solar, electricity, weather"
         )
