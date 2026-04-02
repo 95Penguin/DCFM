@@ -127,7 +127,7 @@ def load_electricity(data_path: str, T_in: int = 168, T_out: int = 1,
     Expected file: electricity.txt  (space-separated, [T, N])
     Download: same LSTNet repo
     """
-    raw = np.loadtxt(data_path)          # [T, N=321]
+    raw = np.loadtxt(data_path, delimiter=',')          # [T, N=321]
     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Electricity')
 
 
