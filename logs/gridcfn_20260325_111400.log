@@ -1,0 +1,50 @@
+2026-03-25 11:14:01 | ====================================================
+GridCFN Configuration
+====================================================
+
+[Data]
+  dataset                = solar
+  data_path              = ./data/solar_AL.txt
+  T_in                   = 168
+  T_out                  = 1
+  adj_threshold          = 0.95
+  batch_size             = 32
+  synthetic_T            = 2000
+  synthetic_N            = 20
+  synthetic_F            = 1
+
+[Model]
+  in_dim                 = 1
+  gcn_hidden             = 64
+  gcn_layers             = 2
+  tcn_hidden             = 64
+  tcn_layers             = 4
+  env_dim                = 32
+  stoch_dim              = 32
+  ms_out_dim             = 32
+  n_scg_layers           = 3
+  out_dim                = 1
+  lambda_mi              = 0.5
+
+[Train]
+  lr                     = 0.0005
+  max_epochs             = 200
+  patience               = 20
+  lr_decay_factor        = 0.5
+  lr_decay_patience      = 10
+  grad_clip              = 1.0
+  weight_decay           = 1e-05
+  save_path              = best_model.pt
+  seed                   = 42
+  gpu_id                 = -1
+  log_dir                = logs
+  log_to_console         = True
+====================================================
+2026-03-25 11:14:01 | Device : GPU 0: NVIDIA GeForce RTX 3090  (23.6 GB)
+2026-03-25 11:14:02 | Parameters : 201,990
+
+2026-03-25 11:14:02 |  Epoch | Train Loss |  Val MAE |  Val RMSE |  Val CRPS |       LR |   Time
+2026-03-25 11:14:02 | --------------------------------------------------------------------------
+2026-03-25 11:17:24 |      1 |  -522.7598 |   8.0785 |   10.1459 |    5.4586 | 5.00e-04 | 202.1s
+2026-03-25 11:20:49 |      2 | -17160.8255 |   8.0961 |   10.1768 |    5.4753 | 5.00e-04 | 205.3s
+2026-03-25 11:24:15 |      3 | -75058.3037 |   8.1061 |   10.1975 |    5.4849 | 5.00e-04 | 205.7s
