@@ -34,7 +34,7 @@ Architecture:
     forward() 直接接收 adj_norm [N,N] 和 edge_index [2,E]。
 """
 
-import torch
+import torch 
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -342,7 +342,7 @@ class SCGMessagePassingLayer(nn.Module):
                 edge_index: torch.Tensor) -> torch.Tensor:
         """
         Hs         : [B, N, stoch_dim]
-        He         : [B, N, env_dim]   传入 He_prime（经 MultiScaleContext 精炼）
+        He         : [B, N, env_dim]   原始解耦结果（论文框架图直接从 Disentangler 连过来）
         edge_index : [2, E]  row0=src(j), row1=dst(i)
         returns    : [B, N, stoch_dim]
         """
@@ -470,8 +470,9 @@ class GridCFN(nn.Module):
         self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
         self.mine         = MINEEstimator(env_dim, stoch_dim)
         self.ms_context   = MultiScaleContext(env_dim, ms_out_dim)
-        # SCG-MP 使用 He_prime（ms_out_dim）作为环境维度
-        self.scgmp        = SCGMP(stoch_dim, ms_out_dim, n_scg_layers)
+        # SCG-MP 门控使用原始 He（env_dim），与论文框架图一致
+        self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers)
+        # Predictor 融合 H'e（ms_out_dim）和 H's（stoch_dim）
         self.predictor    = ProbabilisticPredictor(ms_out_dim + stoch_dim, out_dim)
 
     @staticmethod
@@ -517,8 +518,8 @@ class GridCFN(nn.Module):
         He_prime = self.ms_context(He_seq)                # [B, N, ms_out_dim]
 
         # ── Spatial Causal Gated MP ─────────────────────────────────────────
-        # 传入 He_prime 而非原始 He，提供更精炼的因果判别信号
-        Hs_prime = self.scgmp(Hs, He_prime, edge_index)  # [B, N, Ds]
+        # 门控单元使用原始 He（论文框架图：箭头直接从 Disentangler → Causal Gating Unit）
+        Hs_prime = self.scgmp(Hs, He, edge_index)        # [B, N, Ds]
 
         # ── Feature Fusion + Probabilistic Prediction ───────────────────────
         H_final   = torch.cat([He_prime, Hs_prime], dim=-1)  # [B, N, ms+Ds]

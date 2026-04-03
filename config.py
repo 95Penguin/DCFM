@@ -27,8 +27,8 @@ class DataConfig:
     # 真实数据集的文件路径
     data_path: Optional[str] = "./data/solar_AL.txt"
 
-    # 输入窗口长度（论文: 168）
-    T_in: int = 168   
+    # 输入窗口长度（论文 Table I: 168）
+    T_in: int = 168
 
     # 预测步长（论文: 1）
     T_out: int = 1
@@ -157,7 +157,7 @@ def get_config(preset: str = "solar") -> Config:
             data=DataConfig(
                 dataset="solar",
                 data_path="./data/solar_AL.txt",
-                T_in=12, T_out=1,
+                T_in=168, T_out=1,
                 adj_threshold=0.95,
                 batch_size=32,
             ),
