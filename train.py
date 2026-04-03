@@ -173,6 +173,10 @@ def evaluate(model: GridCFN,
              edge_index: torch.Tensor,
              device:     torch.device,
              scaler=None) -> Dict[str, float]:
+    """
+    在归一化尺度下计算所有指标，与论文 Table II 的报告口径一致。
+    scaler 参数保留供外部调用方使用，evaluate 内部不做反归一化。
+    """
     model.eval()
     mu_list, sigma_list, y_list = [], [], []
 
@@ -189,11 +193,7 @@ def evaluate(model: GridCFN,
     sigma_all = np.concatenate(sigma_list, axis=0)
     y_all     = np.concatenate(y_list,     axis=0)[..., :mu_all.shape[-1]]
 
-    if scaler is not None:
-        mu_all    = scaler.inverse_transform(mu_all)
-        sigma_all = sigma_all * scaler.std
-        y_all     = scaler.inverse_transform(y_all)
-
+    # 在归一化尺度下计算，与论文 Table II 报告口径一致
     return evaluate_all(mu_all, sigma_all, y_all)
 
 
