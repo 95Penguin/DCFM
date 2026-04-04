@@ -1,10 +1,10 @@
 # 数据文件夹（你要忽略的核心）
 data/
-# 模型权重
-*.pt
-*.pth
-*.pkl
-*.h5
+# # 模型权重
+# *.pt
+# *.pth
+# *.pkl
+# *.h5
 # Python 缓存
 __pycache__/
 *.pyc
