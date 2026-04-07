@@ -417,7 +417,8 @@ class ProbabilisticPredictor(nn.Module):
         """
         h     = self.net(self.norm(H_final))
         mu    = self.mu_head(h)
-        sigma = F.softplus(self.sigma_head(h)) + 1e-3
+        # sigma = F.softplus(self.sigma_head(h)) + 1e-3
+        sigma = F.softplus(self.sigma_head(h)) + 0.05
         return mu, sigma
 
 

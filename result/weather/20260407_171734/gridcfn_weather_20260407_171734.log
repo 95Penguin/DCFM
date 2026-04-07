@@ -1,0 +1,48 @@
+2026-04-07 17:17:34 | ====================================================
+GridCFN Configuration
+====================================================
+
+[Data]
+  dataset                = weather
+  data_path              = ./data/weather2k.npy
+  T_in                   = 168
+  T_out                  = 1
+  adj_threshold          = 0.8
+  batch_size             = 8
+
+[Model]
+  in_dim                 = 1
+  gcn_hidden             = 64
+  gcn_layers             = 2
+  tcn_hidden             = 64
+  tcn_layers             = 4
+  env_dim                = 32
+  stoch_dim              = 32
+  ms_out_dim             = 32
+  n_scg_layers           = 3
+  out_dim                = 1
+  lambda_mi              = 0.5
+
+[Train]
+  lr                     = 0.001
+  max_epochs             = 200
+  patience               = 20
+  lr_decay_factor        = 0.5
+  lr_decay_patience      = 10
+  grad_clip              = 1.0
+  weight_decay           = 1e-05
+  save_path              = result/weather/20260407_171734/gridcfn_weather_20260407_171734.pt
+  seed                   = 42
+  warmup_epochs          = 5
+  gpu_id                 = -1
+  log_dir                = logs
+  log_to_console         = True
+====================================================
+2026-04-07 17:17:34 | Device     : GPU 0: NVIDIA GeForce RTX 3090  (23.6 GB)
+2026-04-07 17:17:34 | Result dir : result/weather/20260407_171734
+2026-04-07 17:17:36 | in_dim     : 1（数据集实际特征维度，已自动覆盖 config）
+2026-04-07 17:17:36 | Graph      : 1866 nodes, 1377794 edges
+2026-04-07 17:17:36 | Parameters : 202,182
+
+2026-04-07 17:17:37 |  Epoch |     Loss |      NLL |      MI |  Val MAE |  Val RMSE |  Val CRPS |       LR |   Time
+2026-04-07 17:17:37 | ---------------------------------------------------------------------------------------------

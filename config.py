@@ -200,8 +200,8 @@ def get_config(preset: str = "solar") -> Config:
                 dataset="weather",
                 data_path="./data/weather2k.npy",
                 T_in=168, T_out=1,
-                adj_threshold=0.6,
-                batch_size=32,
+                adj_threshold=0.8,   # 从 0.6 → 0.80
+                batch_size=4,      # ← DataConfig 里的 batch_size 从32 → 8
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,

@@ -172,10 +172,14 @@ def evaluate(model: GridCFN,
              adj_norm:   torch.Tensor,
              edge_index: torch.Tensor,
              device:     torch.device,
-             scaler=None) -> Dict[str, float]:
+             scaler=None,
+             return_preds: bool = False):
     """
     在归一化尺度下计算所有指标，与论文 Table II 的报告口径一致。
     scaler 参数保留供外部调用方使用，evaluate 内部不做反归一化。
+
+    return_preds=True 时额外返回 (metrics, mu_all, sigma_all, y_all)，
+    供画图使用（预测区间、校准图、误差分布）。
     """
     model.eval()
     mu_list, sigma_list, y_list = [], [], []
@@ -193,8 +197,11 @@ def evaluate(model: GridCFN,
     sigma_all = np.concatenate(sigma_list, axis=0)
     y_all     = np.concatenate(y_list,     axis=0)[..., :mu_all.shape[-1]]
 
-    # 在归一化尺度下计算，与论文 Table II 报告口径一致
-    return evaluate_all(mu_all, sigma_all, y_all)
+    metrics = evaluate_all(mu_all, sigma_all, y_all)
+
+    if return_preds:
+        return metrics, mu_all, sigma_all, y_all
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -246,7 +253,10 @@ def train(model:        GridCFN,
 
     best_val_crps     = float("inf")
     epochs_no_improve = 0
-    history           = {"train_loss": [], "val_crps": [], "val_mae": []}
+    history           = {
+        "train_loss": [], "train_nll": [], "train_mi": [],
+        "val_crps": [], "val_mae": [], "val_rmse": [],
+    }
     warmup_epochs     = getattr(cfg_train, "warmup_epochs", 5)
 
     header = (f"{'Epoch':>6} | {'Loss':>8} | {'NLL':>8} | {'MI':>7} | "
@@ -270,8 +280,11 @@ def train(model:        GridCFN,
         elapsed = time.time() - t0
 
         history["train_loss"].append(train_m["loss"])
+        history["train_nll"].append(train_m["nll"])
+        history["train_mi"].append(train_m["mi"])
         history["val_crps"].append(val_m["CRPS"])
         history["val_mae"].append(val_m["MAE"])
+        history["val_rmse"].append(val_m["RMSE"])
 
         warmup_tag = " [warmup]" if epoch <= warmup_epochs else ""
         logger.info(
@@ -293,11 +306,14 @@ def train(model:        GridCFN,
                 )
                 break
 
-    # 加载最优权重并测试
+    # 加载最优权重并在测试集上推理
     model.load_state_dict(
         torch.load(cfg_train.save_path, map_location=device, weights_only=True)
     )
-    test_m = evaluate(model, test_loader, adj_norm, edge_index, device, scaler)
+    test_m, mu_all, sigma_all, y_all = evaluate(
+        model, test_loader, adj_norm, edge_index, device, scaler,
+        return_preds=True,
+    )
 
     sep = "=" * 52
     logger.info(f"\n{sep}")
@@ -308,4 +324,10 @@ def train(model:        GridCFN,
     logger.info(sep)
 
     history["test_metrics"] = test_m
+    # 保存预测数组（flatten 为列表供 JSON 序列化和画图使用）
+    history["test_mu"]    = mu_all.flatten().tolist()
+    history["test_sigma"] = sigma_all.flatten().tolist()
+    history["test_y"]     = y_all.flatten().tolist()
+    # 保存形状信息，画图时用于 reshape
+    history["test_shape"] = list(mu_all.shape)
     return history
