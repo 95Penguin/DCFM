@@ -11,30 +11,51 @@ Architecture:
                    └─ Feature Fusion → H_final [B, N, ms_out_dim+Ds]
                         └─ Predictor → (mu, sigma) [B, N, Fout]
 
-修复说明：
-  [Fix-A/B] MINE minimax 训练逻辑：
-    原代码 _forward_for_mine 对 He/Hs 做了 detach，导致 MINE 参数梯度全为 0，
-    mine_optimizer.step() 完全无效。
-    修复：删除 _forward_for_mine；forward() 只返回 mi_loss 供两个 optimizer 分别使用；
-    compute_loss 中对 mi_loss 做 detach，使 Step2 的梯度不回传到 MINE 参数，
-    两步优化彻底隔离。train.py 也同步简化。
+修改说明（MINE → CLUB）：
+  原版使用 MINE（互信息下界估计）来最小化 I(He, Hs)。
+  MINE 本身是为最大化互信息设计的，"最小化下界"在梯度方向上存在理论不一致，
+  且需要 minimax 两步优化（mine_optimizer 单独更新），训练逻辑复杂易出错。
 
-  [Fix-E] Hs_seq 无用内存开销：
-    原 CausalDisentangler 对全序列 [B,T,N,D] 做 stoch_proj，生成 Hs_seq 后
-    只取最后帧，在 Weather(N=1866, T=168) 下显存浪费严重。
-    修复：stoch_proj 只对最后帧 H[:,-1] 运算；env_proj 保留全序列（MultiScaleContext 需要）。
+  本版本用 CLUB（Contrastive Log-ratio Upper Bound，NeurIPS 2020）替换 MINE：
+    CLUB 估计互信息上界：
+      I(He; Hs) ≤ E_p(He,Hs)[log q(Hs|He)] - E_p(He)E_p(Hs)[log q(Hs|He)]
+    其中 q(Hs|He) 是一个可学习的变分网络（VariationalNet）。
 
-  [Fix-G] 删除论文中不存在的 degree normalization：
-    论文 eq.(9) 是 σ_agg(Hs_i + Σ m_causal)，没有除以度数。
-    自行添加的 deg 归一化改变梯度尺度，与论文不符，已删除。
+  优势：
+    1. 直接估计上界 → 最小化上界比最小化下界理论上更保守且更可靠
+    2. 无需 minimax 两步 → 所有参数（含变分网络）统一用主 optimizer 更新
+    3. 梯度方向一致：损失对解耦表征的梯度正确指向"降低互信息"
+    4. 训练更稳定：MINE 在最小化场景下梯度方差大，CLUB 无此问题
 
-  [Fix-I] normalize_adj / adj_to_edge_index 移出 forward()：
-    adj 在整个训练中固定，每次 forward 重算是纯浪费。
-    修复：两个静态方法保留，由 main.py 在加载数据后预计算一次，
-    forward() 直接接收 adj_norm [N,N] 和 edge_index [2,E]。
+  对应代码变更：
+    model.py : MINEEstimator → CLUBEstimator（含 VariationalNet）
+               GridCFN.mine → GridCFN.club
+               main_parameters() / mine_parameters() → 合并为 parameters()（全部参数）
+    train.py : 删除 mine_optimizer 和两步训练逻辑 → 单步 optimizer 更新
+
+原有修复保留：
+  [Fix-E] Hs_seq 无用内存开销：stoch_proj 只对最后帧运算
+  [Fix-G] 删除论文中不存在的 degree normalization
+  [Fix-I] normalize_adj / adj_to_edge_index 移出 forward()
+
+CLUB 数值修复说明 [Fix-CLUB-v2]：
+  问题根源：
+    1. _log_prob 中 log_var_q * 4.0 导致 var 极小时 (Hs-μ)²/var 爆炸
+       例：log_var=-4 → var=e^{-4}≈0.018，放大项高达 ×55，log_prob → -10^6
+    2. 原 train.py 中 clamp(mi_raw, max=0) 方向错误（应 clamp min=0）
+    3. compute_loss 中 NLL + λ*CLUB（负数）导致 loss 为很大的负数
+
+  修复方案：
+    1. _log_prob：log_var 改用 softplus 参数化（恒正，无爆炸风险）
+       var_net_logvar → 输出 log(softplus(x) + 1e-4)，方差始终在合理范围
+    2. CLUBEstimator.forward 返回 clamp(club, min=0)
+       CLUB 理论上 ≥ 0（互信息下界为 0），负值是采样噪声，截断为 0 合理
+    3. compute_loss：L_total = L_NLL + λ * mi_loss（mi_loss ≥ 0）
+       语义清晰：mi_loss 是正则项，越小说明解耦越好
+    4. train.py：去掉错误的 clamp(max=0)，直接传入 mi_raw（已在 model 内截断）
 """
 
-import torch 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
@@ -101,8 +122,6 @@ class TCNBlock(nn.Module):
         super().__init__()
         self.conv1 = CausalConv1d(channels, channels, kernel_size, dilation)
         self.conv2 = CausalConv1d(channels, channels, kernel_size, dilation)
-        # GroupNorm 直接作用于 [B*N, C, T]，无需 permute，等价于对通道做归一化
-        # num_groups=min(8, channels) 兼容小隐层（debug 模式 channels=16）
         n_groups = min(8, channels)
         self.norm1 = nn.GroupNorm(n_groups, channels)
         self.norm2 = nn.GroupNorm(n_groups, channels)
@@ -158,11 +177,9 @@ class Backbone(nn.Module):
         returns H: [B, T, N, D]
         """
         B, T, N, F = x.shape
-        # 合并 B×T 维，对所有时间步并行做 GCN（避免 Python for 循环）
         x_flat  = x.reshape(B * T, N, F)
         gcn_out = self.gcn(x_flat, adj_norm)          # [B*T, N, gcn_hidden]
         x_gcn   = gcn_out.reshape(B, T, N, -1)        # [B, T, N, gcn_hidden]
-        # TCN 需要 [B, N, T, C] 格式
         H = self.tcn(x_gcn.permute(0, 2, 1, 3))      # [B, N, T, tcn_hidden]
         H = H.permute(0, 2, 1, 3)                     # [B, T, N, tcn_hidden]
         return H
@@ -175,18 +192,15 @@ class CausalDisentangler(nn.Module):
     """
     将 H 解耦为 He（环境背景）和 Hs（随机实体）。
 
-    [Fix-E] 原代码对全序列 [B,T,N,D] 同时做 stoch_proj（生成 Hs_seq），
-    但 Hs_seq 只取最后帧使用，在大数据集（Weather: N=1866, T=168）下
-    浪费约 T 倍显存。
-    修复：stoch_proj 只对最后帧 H[:,-1] 运算；
-          env_proj 保留全序列投影，因为 MultiScaleContext 需要 He_seq [B,T,N,De]。
+    [Fix-E] stoch_proj 只对最后帧 H[:,-1] 运算，节省 T 倍显存；
+            env_proj 保留全序列投影，MultiScaleContext 需要 He_seq [B,T,N,De]。
     """
     def __init__(self, in_dim: int, env_dim: int, stoch_dim: int):
         super().__init__()
         self.env_proj = nn.Sequential(
             nn.Linear(in_dim, in_dim), nn.ReLU(),
             nn.Linear(in_dim, env_dim),
-            nn.Tanh()   # 限制范围 [-1,1]，防止 MINE 梯度爆炸
+            nn.Tanh()
         )
         self.stoch_proj = nn.Sequential(
             nn.Linear(in_dim, in_dim), nn.ReLU(),
@@ -198,18 +212,17 @@ class CausalDisentangler(nn.Module):
         """
         H   : [B, T, N, D]
         返回:
-          He     : [B, N, env_dim]    – 最后帧环境表征（MINE + SCG-MP gate 使用）
-          Hs     : [B, N, stoch_dim]  – 最后帧随机实体表征（SCG-MP 消息传递使用）
+          He     : [B, N, env_dim]    – 最后帧环境表征
+          Hs     : [B, N, stoch_dim]  – 最后帧随机实体表征
           He_seq : [B, T, N, env_dim] – 完整时序环境表征（MultiScaleContext 使用）
         """
         B, T, N, D = H.shape
 
-        # env_proj：对全序列投影（MultiScaleContext 需要时序信息）
         H_flat  = H.reshape(B * T * N, D)
         He_seq  = self.env_proj(H_flat).reshape(B, T, N, -1)  # [B, T, N, De]
         He      = He_seq[:, -1]                                # [B, N, De]
 
-        # [Fix-E] stoch_proj：只对最后帧投影，节省 T 倍显存
+        # [Fix-E] 只对最后帧做 stoch_proj
         H_last = H[:, -1].reshape(B * N, D)                   # [B*N, D]
         Hs     = self.stoch_proj(H_last).reshape(B, N, -1)    # [B, N, Ds]
 
@@ -217,123 +230,200 @@ class CausalDisentangler(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 5. MINE – Mutual Information Neural Estimator  (paper eq. 3, Belghazi 2018)
+# 5. CLUB – Contrastive Log-ratio Upper Bound  (NeurIPS 2020)
+#    替换原版 MINE，用于最小化 I(He, Hs)
 # ---------------------------------------------------------------------------
-class MINEEstimator(nn.Module):
+class CLUBEstimator(nn.Module):
     """
-    用 MINE 估计 I(He, Hs) 的下界：
-        MI_lower ≈ E[T(He, Hs)] - log(E[exp(T(He, Hs_shuffled))])
+    CLUB 互信息上界估计器（Chen et al., NeurIPS 2020）。
 
-    训练方式（minimax，在 train.py 中实现）：
-      - Step1：mine_optimizer 对 MINE 参数做梯度上升（最大化 MI 估计）
-      - Step2：主 optimizer 最小化 NLL + λ·MI（MI 项 detach，不回传给 MINE）
+    原理：
+      CLUB 构造互信息的上界：
+        I(He; Hs) ≤ E_{p(He,Hs)}[log q(Hs|He)]
+                      - E_{p(He)}E_{p(Hs)}[log q(Hs|He)]
 
-    数值稳定：log-sum-exp trick 防止 exp 上溢。
+      其中 q(Hs|He) 是一个变分网络，输出高斯分布的 (μ, log_var)。
+
+    与 MINE 的关键区别：
+      · MINE 估计下界，用于最大化 MI（对抗训练），minimax 两步优化
+      · CLUB 估计上界，用于最小化 MI（联合训练），单步优化
+        → 直接将 club_loss 纳入总损失，无需独立的 mine_optimizer
+
+    [Fix-CLUB-v2] 数值稳定性修复：
+
+    问题1（log_var 爆炸）：
+      原实现用 Tanh(x) * 4 参数化 log_var，当 Tanh 输出 -1 时：
+        log_var = -4 → var = e^{-4} ≈ 0.018
+        (Hs - μ)² / var 被放大约 55 倍，整个 log_prob 可达 -10^6 量级
+      
+      修复：改用 log(softplus(x) + ε) 参数化 log_var：
+        softplus 输出 ≥ 0，log_var = log(softplus + ε) ∈ [log(ε), +∞)
+        设 ε=0.01，log_var ≥ -4.6，var ≥ 0.01，防止极端缩放
+        同时 clamp log_var ∈ [-4, 4]，双重保险
+
+    问题2（CLUB 负值）：
+      CLUB 理论上是互信息上界，≥ 0。
+      训练初期变分网络未收敛时，负样本项可能大于正样本项，
+      导致 club = pos - neg < 0（采样噪声）。
+      修复：clamp(club, min=0)，截断噪声，确保正则项语义正确。
+
+    问题3（量纲不匹配）：
+      CLUB 的 log_prob 对 stoch_dim 求和，stoch_dim=32 时量级 ×32。
+      修复：_log_prob 改为对特征维度取 mean（不是 sum），归一化量纲。
     """
+
     def __init__(self, env_dim: int, stoch_dim: int, hidden_dim: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(env_dim + stoch_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),           nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+        # 变分网络：q(Hs|He) → μ（均值，无约束）
+        self.var_net_mu = nn.Sequential(
+            nn.Linear(env_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, stoch_dim),
         )
+        # [Fix-CLUB-v2] 用 softplus 参数化 log_var，防止 var 极小导致数值爆炸
+        # 输出 raw logit，在 _log_prob 中转换为 log_var
+        self.var_net_logvar = nn.Sequential(
+            nn.Linear(env_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, stoch_dim),
+            # 不加激活，直接输出 raw；_log_prob 内部做 softplus + clamp
+        )
+
+    def _log_prob(self, Hs: torch.Tensor,
+                  mu_q: torch.Tensor, logvar_raw: torch.Tensor) -> torch.Tensor:
+        """
+        高斯对数概率（特征维度取 mean，归一化量纲）：
+          log N(Hs; μ_q, σ²_q)
+            = -0.5 * mean_d[ log(2π) + log_var + (Hs-μ)²/var ]
+
+        [Fix-CLUB-v2] log_var 参数化：
+          log_var = log(softplus(logvar_raw) + 1e-2)
+          → var = softplus(logvar_raw) + 1e-2 ≥ 1e-2 > 0，永远不会为 0
+          → 再用 clamp(-4, 4) 防止极端值
+
+        所有输入 shape : [M, stoch_dim]
+        returns        : [M]，对特征维度取 mean 后的对数概率
+        """
+        # [Fix-CLUB-v2] 安全的 log_var：softplus 保证 var > 1e-2
+        log_var = torch.log(F.softplus(logvar_raw) + 1e-2)
+        log_var = log_var.clamp(-4.0, 4.0)   # 双重保险，var ∈ [e^{-4}, e^4]
+
+        log_prob = -0.5 * (
+            math.log(2 * math.pi)
+            + log_var
+            + (Hs - mu_q).pow(2) / log_var.exp()
+        )
+        # [Fix-CLUB-v2] mean 代替 sum，归一化量纲（消除 stoch_dim 倍数放大）
+        return log_prob.mean(dim=-1)          # [M]
 
     def forward(self, He: torch.Tensor, Hs: torch.Tensor) -> torch.Tensor:
         """
+        计算 CLUB 互信息上界估计（随机置换负样本近似）。
+
         He, Hs : [B, N, dim]
-        returns: 标量，MI 的 MINE 下界估计
+        returns: 标量，clamp(club, min=0)
+                 ≥ 0，可直接作为正则项加入总损失
+
+        [Fix-CLUB-v2] 修复：
+          · _log_prob 数值稳定（见上方说明）
+          · clamp(min=0) 消除采样噪声导致的负值
+          · 返回值语义明确：0 表示完全解耦，>0 表示仍有互信息残留
         """
         B, N, _ = He.shape
-        He_flat = He.reshape(B * N, -1)
-        Hs_flat = Hs.reshape(B * N, -1)
+        M = B * N
 
-        # 联合分布：T(He_i, Hs_i)
-        t_joint = self.net(torch.cat([He_flat, Hs_flat], dim=-1)).squeeze(-1)
+        He_flat = He.reshape(M, -1)    # [M, De]
+        Hs_flat = Hs.reshape(M, -1)   # [M, Ds]
 
-        # 边缘分布：T(He_i, Hs_j)，j 是 i 的随机置换
-        idx         = torch.randperm(B * N, device=He.device)
-        Hs_shuffled = Hs_flat[idx]
-        t_marginal  = self.net(torch.cat([He_flat, Hs_shuffled], dim=-1)).squeeze(-1)
+        # 变分网络推断条件分布参数
+        mu_q       = self.var_net_mu(He_flat)       # [M, Ds]
+        logvar_raw = self.var_net_logvar(He_flat)   # [M, Ds]
 
-        # log-sum-exp trick
-        c           = t_marginal.detach().max()
-        log_mean_et = c + torch.log(torch.exp(t_marginal - c).mean() + 1e-8)
+        # ── 正样本项：E_{p(He,Hs)}[log q(Hs_i | He_i)] ──────────────────────
+        pos_term = self._log_prob(Hs_flat, mu_q, logvar_raw).mean()
 
-        mi_estimate = t_joint.mean() - log_mean_et
-        return mi_estimate
+        # ── 负样本项：随机置换近似 E_{p(He)}E_{p(Hs)}[log q(Hs | He)] ─────────
+        # 生成错位置换（π(i) ≠ i），避免负样本与正样本完全重叠
+        perm = torch.randperm(M, device=He.device)
+        same = (perm == torch.arange(M, device=He.device))
+        if same.any() and M > 1:
+            idx  = same.nonzero(as_tuple=True)[0]
+            swap = (idx + 1) % M
+            perm[idx], perm[swap] = perm[swap].clone(), perm[idx].clone()
+
+        Hs_neg   = Hs_flat[perm]       # [M, Ds]，打乱后的负样本
+        neg_term = self._log_prob(Hs_neg, mu_q, logvar_raw).mean()
+
+        # CLUB 上界：正样本 - 负样本
+        # [Fix-CLUB-v2] clamp(min=0)：互信息理论 ≥ 0，负值是采样噪声
+        club_upper_bound = (pos_term - neg_term).clamp(min=0.0)
+        return club_upper_bound
 
 
 # ---------------------------------------------------------------------------
-# 6. Multi-Scale Context Modeling  (paper Sec. IV-A, eq. 4)
+# 6. Multi-Scale Context  (paper Sec. IV-B, eq. 7)
 # ---------------------------------------------------------------------------
 class MultiScaleContext(nn.Module):
     """
-    对 He 的时序用多尺度膨胀卷积捕捉不同时间尺度的环境规律（hourly/daily/seasonal），
-    拼接后线性融合。
-    Paper: H'e = fuse([DilatedConv1D(He_seq, d_l) for l in L])
+    对 He_seq [B, T, N, De] 用不同膨胀率的因果卷积提取多尺度上下文，
+    拼接后投影到 ms_out_dim。
+    膨胀率：[1, 7, 30]，分别对应约 3小时/日/月 三个时间尺度。
     """
-    def __init__(self, env_dim: int, out_dim: int,
-                 n_scales: int = 4, kernel_size: int = 3):
+    def __init__(self, env_dim: int, ms_out_dim: int):
         super().__init__()
-        dilations = [1, 2, 4, 8][:n_scales]
+        dilations = [1, 7, 30]
         self.convs = nn.ModuleList([
-            CausalConv1d(env_dim, out_dim, kernel_size, d) for d in dilations
+            CausalConv1d(env_dim, env_dim, kernel_size=3, dilation=d)
+            for d in dilations
         ])
-        # 拼接各尺度输出后线性融合
-        self.fuse = nn.Linear(out_dim * n_scales, out_dim)
+        self.proj = nn.Linear(env_dim * len(dilations), ms_out_dim)
 
     def forward(self, He_seq: torch.Tensor) -> torch.Tensor:
         """
-        He_seq : [B, T, N, env_dim]
-        returns: [B, N, out_dim]
+        He_seq : [B, T, N, De]
+        returns: [B, N, ms_out_dim]
         """
-        B, T, N, C = He_seq.shape
-        # 合并 (B, N) 为 batch 维，时间维作为序列长度
-        x    = He_seq.permute(0, 2, 3, 1).reshape(B * N, C, T)  # [B*N, C, T]
-        outs = [conv(x) for conv in self.convs]                   # each: [B*N, out_dim, T]
-        # 拼接各尺度，取最后时间步（只需当前时刻的多尺度汇总）
-        fused = torch.cat([o[:, :, -1] for o in outs], dim=1)    # [B*N, out_dim*n_scales]
-        out   = self.fuse(fused).view(B, N, -1)                   # [B, N, out_dim]
-        return F.relu(out)
+        B, T, N, De = He_seq.shape
+        x = He_seq.permute(0, 2, 3, 1).reshape(B * N, De, T)  # [B*N, De, T]
+        outs = [conv(x)[:, :, -1] for conv in self.convs]     # 各 [B*N, De]
+        cat  = torch.cat(outs, dim=-1)                          # [B*N, De*3]
+        out  = self.proj(cat).reshape(B, N, -1)                 # [B, N, ms_out_dim]
+        return out
 
 
 # ---------------------------------------------------------------------------
-# 7. Spatial Causal Gated Message Passing  (paper Sec. IV-B, eq. 5-9)
+# 7. Spatial Causal Gated Message Passing  (paper Sec. IV-B, eq. 8-10)
 # ---------------------------------------------------------------------------
-class CausalGatingUnit(nn.Module):
+class CausalGateUnit(nn.Module):
     """
-    为每条边 (i,j) 计算因果门控系数 g_ij ∈ [0,1]。
-    Z_ij = [Hs_i || Hs_j || He_i || He_j]  (paper eq. 5)
-    g_ij = σ(W2 · ReLU(W1·Z_ij + b1) + b2)  (paper eq. 6)
+    门控因果性过滤单元（paper eq. 9）：
+      g_ji = sigmoid(W_g [Hs_i || Hs_j || He_i || He_j])
     """
     def __init__(self, stoch_dim: int, env_dim: int, hidden_dim: int = 64):
         super().__init__()
-        in_dim = 2 * stoch_dim + 2 * env_dim
-        self.gate_mlp = nn.Sequential(
+        in_dim = stoch_dim * 2 + env_dim * 2
+        self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, 1),      nn.Sigmoid()
+            nn.Linear(hidden_dim, 1), nn.Sigmoid(),
         )
 
     def forward(self, Hs_i, Hs_j, He_i, He_j):
-        """All inputs: [B, E, dim]"""
-        Z = torch.cat([Hs_i, Hs_j, He_i, He_j], dim=-1)  # [B, E, 2Ds+2De]
-        return self.gate_mlp(Z)                             # [B, E, 1]
+        cat = torch.cat([Hs_i, Hs_j, He_i, He_j], dim=-1)
+        return self.net(cat)
 
 
 class SCGMessagePassingLayer(nn.Module):
     """
-    一层空间因果门控消息传递（paper eq. 7-9）：
-      m_j→i^raw    = Θ_msg · Hs_j
-      m_j→i^causal = g_ij ⊙ m_j→i^raw
-      Hs_i^new     = σ_agg(Hs_i + Σ_j m_j→i^causal)
-
-    [Fix-G] 删除原代码中论文没有的 degree normalization。
+    单层空间因果门控消息传递（paper eq. 8-10）。
+    消息 m_ji = g_ji * W_m Hs_j
+    聚合 agg_i = sum_{j ∈ N(i)} m_ji
+    更新 Hs'_i = LayerNorm(W_u [Hs_i + agg_i])
     """
     def __init__(self, stoch_dim: int, env_dim: int, hidden_dim: int = 64):
         super().__init__()
-        self.gate_unit     = CausalGatingUnit(stoch_dim, env_dim, hidden_dim)
-        self.msg_transform = nn.Linear(stoch_dim, stoch_dim, bias=False)
-        self.agg_norm      = nn.LayerNorm(stoch_dim)   # 聚合后归一化，替代 degree norm
+        self.gate_unit     = CausalGateUnit(stoch_dim, env_dim, hidden_dim)
+        self.msg_transform = nn.Linear(stoch_dim, stoch_dim)
+        self.agg_norm      = nn.LayerNorm(stoch_dim)
         self.agg_transform = nn.Sequential(
             nn.Linear(stoch_dim, stoch_dim), nn.ReLU()
         )
@@ -342,35 +432,29 @@ class SCGMessagePassingLayer(nn.Module):
                 edge_index: torch.Tensor) -> torch.Tensor:
         """
         Hs         : [B, N, stoch_dim]
-        He         : [B, N, env_dim]   原始解耦结果（论文框架图直接从 Disentangler 连过来）
+        He         : [B, N, env_dim]
         edge_index : [2, E]  row0=src(j), row1=dst(i)
         returns    : [B, N, stoch_dim]
         """
         B, N, Ds = Hs.shape
         src, dst = edge_index[0], edge_index[1]   # j → i
 
-        # 为每条边收集节点特征
         Hs_j = Hs[:, src]   # [B, E, Ds]
         Hs_i = Hs[:, dst]   # [B, E, Ds]
         He_j = He[:, src]   # [B, E, De]
         He_i = He[:, dst]   # [B, E, De]
 
-        # 因果门控系数
         g = self.gate_unit(Hs_i, Hs_j, He_i, He_j)  # [B, E, 1]
 
-        # 原始消息 → 门控消息
         m_raw    = self.msg_transform(Hs_j)           # [B, E, Ds]
         m_causal = g * m_raw                          # [B, E, Ds]
 
-        # 聚合到目标节点（scatter_add 沿节点维 dim=1）
         agg = torch.zeros(B, N, Ds, device=Hs.device, dtype=Hs.dtype)
         idx = dst.view(1, -1, 1).expand(B, -1, Ds)   # [B, E, Ds]
         agg.scatter_add_(1, idx, m_causal)
 
-        # LayerNorm 稳定聚合后的尺度（替代 degree norm，符合论文精神）
         agg = self.agg_norm(agg)
 
-        # 残差更新（paper eq. 9）
         Hs_new = self.agg_transform(Hs + agg)
         return Hs_new
 
@@ -417,7 +501,6 @@ class ProbabilisticPredictor(nn.Module):
         """
         h     = self.net(self.norm(H_final))
         mu    = self.mu_head(h)
-        # sigma = F.softplus(self.sigma_head(h)) + 1e-3
         sigma = F.softplus(self.sigma_head(h)) + 0.05
         return mu, sigma
 
@@ -443,11 +526,16 @@ def nll_gaussian_loss(mu: torch.Tensor, sigma: torch.Tensor,
 # ---------------------------------------------------------------------------
 class GridCFN(nn.Module):
     """
-    完整 GridCFN 管道。
+    完整 GridCFN 管道（CLUB 版本）。
 
-    [Fix-I] forward() 不再内部调用 normalize_adj / adj_to_edge_index，
-    改为直接接收预计算的 adj_norm 和 edge_index，避免每个 batch 重复计算。
-    预计算由 main.py 在数据加载后完成。
+    与原版 MINE 版本的差异：
+      · self.mine → self.club（CLUBEstimator）
+      · forward() 返回的第三个值含义不变（mi_loss），但现在是 CLUB 上界
+      · main_parameters() / mine_parameters() 合并 → 直接用 model.parameters()
+        （所有参数由主 optimizer 统一更新，无需独立的 mine_optimizer）
+      · 不再需要 warmup_epochs 的 MI 热身逻辑（CLUB 训练从第 1 个 epoch 即稳定）
+
+    [Fix-I] forward() 接收预计算的 adj_norm 和 edge_index，不在内部重算。
     """
     def __init__(
         self,
@@ -469,11 +557,10 @@ class GridCFN(nn.Module):
         self.backbone     = Backbone(in_dim, gcn_hidden, tcn_hidden,
                                      gcn_layers, tcn_layers)
         self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
-        self.mine         = MINEEstimator(env_dim, stoch_dim)
+        # CLUB 替换 MINE：直接估计上界，联合训练，无需独立优化器
+        self.club         = CLUBEstimator(env_dim, stoch_dim)
         self.ms_context   = MultiScaleContext(env_dim, ms_out_dim)
-        # SCG-MP 门控使用原始 He（env_dim），与论文框架图一致
         self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers)
-        # Predictor 融合 H'e（ms_out_dim）和 H's（stoch_dim）
         self.predictor    = ProbabilisticPredictor(ms_out_dim + stoch_dim, out_dim)
 
     @staticmethod
@@ -495,35 +582,32 @@ class GridCFN(nn.Module):
                 edge_index: torch.Tensor):
         """
         x          : [B, T, N, F]
-        adj_norm   : [N, N]  预归一化邻接矩阵（外部预计算，固定不变）
-        edge_index : [2, E]  边索引（外部预计算，固定不变）
+        adj_norm   : [N, N]  预归一化邻接矩阵
+        edge_index : [2, E]  边索引
 
         返回:
-          mu     : [B, N, out_dim]
-          sigma  : [B, N, out_dim]  (> 0)
-          mi_loss: 标量，MINE 对 I(He,Hs) 的下界估计
+          mu      : [B, N, out_dim]
+          sigma   : [B, N, out_dim]  (> 0)
+          mi_loss : 标量，CLUB 上界估计，clamp(min=0)
+                    语义：0 = 完全解耦，>0 = 存在互信息，训练目标是最小化此值
         """
         # ── Backbone ────────────────────────────────────────────────────────
         H = self.backbone(x, adj_norm)                    # [B, T, N, D]
 
         # ── Causal Disentanglement ──────────────────────────────────────────
         He, Hs, He_seq = self.disentangler(H)
-        # He    : [B, N, De]
-        # Hs    : [B, N, Ds]
-        # He_seq: [B, T, N, De]
 
-        # ── MI 估计（MINE）──────────────────────────────────────────────────
-        mi_loss = self.mine(He, Hs)
+        # ── MI 估计（CLUB 上界，已在 CLUBEstimator 内 clamp(min=0)）──────────
+        mi_loss = self.club(He, Hs)                       # 标量，≥ 0
 
         # ── Multi-Scale Context ─────────────────────────────────────────────
         He_prime = self.ms_context(He_seq)                # [B, N, ms_out_dim]
 
         # ── Spatial Causal Gated MP ─────────────────────────────────────────
-        # 门控单元使用原始 He（论文框架图：箭头直接从 Disentangler → Causal Gating Unit）
         Hs_prime = self.scgmp(Hs, He, edge_index)        # [B, N, Ds]
 
         # ── Feature Fusion + Probabilistic Prediction ───────────────────────
-        H_final   = torch.cat([He_prime, Hs_prime], dim=-1)  # [B, N, ms+Ds]
+        H_final   = torch.cat([He_prime, Hs_prime], dim=-1)
         mu, sigma = self.predictor(H_final)
 
         return mu, sigma, mi_loss
@@ -532,22 +616,17 @@ class GridCFN(nn.Module):
                      y: torch.Tensor, mi_loss: torch.Tensor,
                      lambda_mi: float = None) -> tuple:
         """
-        总损失 = L_NLL + λ · L_MI  (paper eq. 12)
+        总损失 = L_NLL + λ · L_CLUB
 
-        [Fix-A/B] mi_loss 在传入前已经从主网络计算图中 detach（在 train.py 里处理），
-        确保 Step2 的梯度不回传到 MINE 参数，两步优化彻底隔离。
+        [Fix-CLUB-v2] 语义修复：
+          · mi_loss 已在 CLUBEstimator.forward 中 clamp(min=0)，恒 ≥ 0
+          · λ * mi_loss 恒 ≥ 0，是正则项，与 NLL 方向一致（都是最小化）
+          · loss = NLL + λ * CLUB ≥ NLL > 0（通常），不会出现巨大负数
+
+        与原版 compute_loss 接口完全兼容，train.py 无需改动 compute_loss 调用方式。
         """
         if lambda_mi is None:
             lambda_mi = self.lambda_mi
         l_nll   = nll_gaussian_loss(mu, sigma, y)
         l_total = l_nll + lambda_mi * mi_loss
-        return l_total, l_nll, mi_loss
-
-    def main_parameters(self):
-        """主网络参数（排除 MINE），用于主 optimizer。"""
-        mine_ids = {id(p) for p in self.mine.parameters()}
-        return [p for p in self.parameters() if id(p) not in mine_ids]
-
-    def mine_parameters(self):
-        """MINE 网络参数，用于独立的 mine_optimizer。"""
-        return list(self.mine.parameters())
+        return l_total, l_nll

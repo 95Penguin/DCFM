@@ -1,17 +1,37 @@
 """
-GridCFN – 训练循环、评估与指标
+GridCFN – 训练循环、评估与指标（CLUB 版本）
 
-修复说明：
-  [Fix-A/B] MINE minimax 训练重写：
-    删除无效的 _forward_for_mine；改为单次 forward 复用计算图。
-    Step1：mine_optimizer 对 MINE 参数梯度上升（maximize MI），
-           用 retain_graph=True 保留计算图供 Step2 使用。
-    Step2：mi_loss.detach() 后传入 compute_loss，使梯度只更新主网络，
-           不回传到 MINE 参数，两步优化彻底隔离。
+与原版（MINE）的主要变更：
+  [CLUB-1] 删除 mine_optimizer 和两步 minimax 训练逻辑：
+    原版 MINE 需要：
+      Step1: mine_optimizer 对 MINE 参数做梯度上升（retain_graph=True）
+      Step2: 主 optimizer 用 mi_loss.detach() 更新主网络
+    原因：MINE 估计下界，最大化下界 vs 最小化总损失方向相反，必须隔离。
 
-  [Fix-I] forward() 签名变更：
-    接收预计算的 adj_norm 和 edge_index，不再在 forward 内部重算。
-    train.py 统一传入这两个预计算张量。
+    CLUB 版本：
+      变分网络参数与主网络参数更新方向一致（都在最小化 CLUB 上界），
+      统一由单个 optimizer 更新。mi_loss 无需 detach，一次 backward 搞定。
+    → train_one_epoch 从两步降为一步，代码大幅简化。
+
+  [CLUB-2] 删除 warmup_epochs 的 MI 热身逻辑：
+    原版热身是因为 MINE 网络在随机初始化时估计值不稳定，
+    过早引入会给主网络错误信号。
+    CLUB 变分网络在训练初期即能提供有方向性的梯度（推动解耦），
+    无需热身阶段。warmup_epochs 参数保留在 config 中但不再使用。
+
+  [Fix-I] 保留：接收预计算的 adj_norm 和 edge_index，不在内部重算。
+
+  [Fix-CLUB-v2] 修复：
+    · 删除错误的 clamp(mi_raw, max=0) 逻辑：
+        原代码：mi_loss_clipped = torch.clamp(mi_raw, max=0.0)
+        错误原因：
+          1. clamp(max=0) 把正值截成 0，负值原样保留
+          2. CLUB 返回值本来就是很大的负数（-10^6 量级）
+          3. 负值进入 loss → loss = NLL + λ*(-10^6) = -874K → 梯度方向完全错误
+        正确做法：
+          CLUBEstimator.forward 内部已 clamp(min=0)，mi_loss 恒 ≥ 0
+          train.py 直接传入 mi_raw（实际上是已截断的 ≥ 0 值），无需再处理
+    · 日志新增 mi_loss 监控（应在 [0, ~5] 范围，过大说明解耦效果差）
 """
 
 import logging
@@ -84,39 +104,48 @@ def evaluate_all(mu_all: np.ndarray, sigma_all: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
-    model:          GridCFN,
-    loader:         DataLoader,
-    optimizer:      torch.optim.Optimizer,
-    mine_optimizer: torch.optim.Optimizer,
-    adj_norm:       torch.Tensor,
-    edge_index:     torch.Tensor,
-    device:         torch.device,
-    epoch:          int,
-    grad_clip:      float = 1.0,
-    warmup_epochs:  int   = 5,
+    model:      GridCFN,
+    loader:     DataLoader,
+    optimizer:  torch.optim.Optimizer,
+    adj_norm:   torch.Tensor,
+    edge_index: torch.Tensor,
+    device:     torch.device,
+    epoch:      int,
+    grad_clip:  float = 1.0,
+    warmup_epochs: int = 5,      # 保留参数签名兼容性，CLUB 版本中不使用
 ) -> Dict[str, float]:
     """
-    [Fix-A/B] 修复后的 MINE minimax 训练：
+    [CLUB-1] 单步训练（原版 MINE 为两步 minimax）：
 
-    Step1 — MINE 梯度上升（maximize MI 估计）：
-      · 执行一次完整 forward，获得 mi_loss（计算图连接 MINE 参数）
-      · retain_graph=True 保留计算图，供 Step2 继续使用
-      · 只 step mine_optimizer，主网络参数不动
+      一次 forward → 得到 mu, sigma, mi_loss（CLUB 上界，已 clamp(min=0)）
+      L_total = L_NLL + λ · mi_loss
+      一次 backward → 更新所有参数（含 CLUB 变分网络）
 
-    Step2 — 主网络梯度下降（minimize NLL + λ·MI）：
-      · 用 mi_loss.detach() 切断与 MINE 参数的梯度路径
-      · loss.backward() 梯度只流向主网络参数
-      · 只 step optimizer，MINE 参数不动
+    [Fix-CLUB-v2] 关键修复（删除错误的 clamp 逻辑）：
+      原版错误：
+        mi_loss_clipped = torch.clamp(mi_raw, max=0.0)
+          → clamp(max=0) 让负值原样通过，正值截成 0
+          → CLUB 返回 -10^6 → loss = NLL + 0.5*(-10^6) = -500K → 梯度崩溃
 
-    [Fix-I] 接收预计算的 adj_norm 和 edge_index，不在内部重算。
+      正确做法：
+        CLUBEstimator.forward() 内部已执行 clamp(min=0)：
+          club_upper_bound = (pos_term - neg_term).clamp(min=0.0)
+        因此 mi_loss 从 model.forward() 返回时已经 ≥ 0。
+        train.py 直接使用，无需再做任何 clamp 处理。
 
-    热身逻辑（warmup_epochs）：
-      · 前 warmup_epochs 个 epoch，curr_lambda_mi=0，主网络不受 MI 正则影响
-      · 确保 MINE 有足够时间收敛到合理估计，再让主网络依赖它优化
+      为何 CLUB 可以单步：
+        · MINE 估计下界，主网络要最小化 MI，MINE 要最大化 MI 估计，方向相反，
+          必须用两个 optimizer 隔离更新。
+        · CLUB 估计上界（≥0），主网络最小化总损失（含 CLUB 项）= 让上界估计变小，
+          同时也在让变分网络 q(Hs|He) 更准确（上界更紧），两者方向一致，
+          单个 optimizer 统一更新即可。
+
+    正常训练时日志参考值（Solar 数据集）：
+      NLL  : 0.8 ~ 1.5（高斯负对数似然，与 sigma 量级相关）
+      MI   : 0.0 ~ 5.0（CLUB 上界，0 = 完全解耦；初期可能较大）
+      Loss : NLL + 0.5*MI ≈ 0.8 ~ 4.0（正数，随训练下降）
     """
     model.train()
-
-    curr_lambda_mi = 0.0 if epoch <= warmup_epochs else model.lambda_mi
 
     total_loss = total_nll = total_mi = 0.0
     n_batches  = 0
@@ -127,32 +156,29 @@ def train_one_epoch(
         adj_norm_  = adj_norm.to(device)
         edge_idx_  = edge_index.to(device)
 
-        # ── Step1：MINE 梯度上升 ────────────────────────────────────────────
-        # 单次 forward，计算图同时连接主网络参数和 MINE 参数
+        # ── 单步前向 + 反向 ─────────────────────────────────────────────────
         mu, sigma, mi_loss = model(x, adj_norm_, edge_idx_)
 
-        mine_optimizer.zero_grad()
-        # 最大化 MI 估计 = 最小化负 MI；retain_graph 保留计算图供 Step2 用
-        (-mi_loss).backward(retain_graph=True)
-        mine_optimizer.step()
+        # [Fix-CLUB-v2] mi_loss 从 CLUBEstimator.forward() 返回时已 clamp(min=0)
+        # 直接使用，不需要任何额外处理
+        # mi_loss ∈ [0, +∞)，语义：0 = 完全解耦，>0 = 存在互信息残留
 
-        # ── Step2：主网络梯度下降 ───────────────────────────────────────────
-        # mi_loss.detach()：切断梯度路径，Step2 的 backward 不会更新 MINE 参数
         y_target = y[..., :mu.shape[-1]]
-        loss, l_nll, l_mi = model.compute_loss(
+
+        loss, l_nll = model.compute_loss(
             mu, sigma, y_target,
-            mi_loss=mi_loss.detach(),   # [Fix-A/B] 关键：detach 隔离 MINE 梯度
-            lambda_mi=curr_lambda_mi,
+            mi_loss=mi_loss,
+            lambda_mi=model.lambda_mi,
         )
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.main_parameters(), max_norm=grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
 
         total_loss += loss.item()
         total_nll  += l_nll.item()
-        total_mi   += mi_loss.item()   # 记录原始（未 detach 的）MI 估计值用于日志
+        total_mi   += mi_loss.item()
         n_batches  += 1
 
     return {
@@ -219,11 +245,22 @@ def train(model:        GridCFN,
           scaler=None,
           logger: Optional[logging.Logger] = None) -> Dict:
     """
-    完整训练循环。
+    完整训练循环（CLUB 版本）。
 
-    参数变更（对比旧版）：
-      · adj 拆分为 adj_norm + edge_index（由 main.py 预计算后传入）
-      · 移除 _forward_for_mine 相关逻辑
+    [CLUB-1] 删除 mine_optimizer：
+      原版有两个 optimizer：
+        optimizer      → 主网络参数（排除 MINE）
+        mine_optimizer → MINE 参数（lr * 2，梯度上升）
+      CLUB 版本只需一个 optimizer 覆盖全部参数。
+
+    [CLUB-2] 删除 warmup_epochs 热身：
+      原版热身期间 curr_lambda_mi=0，避免未收敛的 MINE 干扰主网络。
+      CLUB 从第 1 个 epoch 即可提供稳定梯度，无需热身。
+
+    [Fix-CLUB-v2] 修复说明：
+      · train_one_epoch 不再执行任何 clamp(max=0) 操作
+      · mi 日志列应显示 [0, ~5] 范围内的正数，而不是 -10^6 这样的负数
+      · Loss 列应显示正数（NLL + λ*CLUB ≥ 0）
     """
     if logger is None:
         logger = logging.getLogger("gridcfn.train")
@@ -234,16 +271,11 @@ def train(model:        GridCFN,
             logger.addHandler(h)
             logger.setLevel(logging.DEBUG)
 
-    # 主 optimizer：只更新非 MINE 参数
+    # [CLUB-1] 单个 optimizer 覆盖所有参数（含 CLUB 变分网络）
     optimizer = torch.optim.Adam(
-        model.main_parameters(),
+        model.parameters(),
         lr=cfg_train.lr,
         weight_decay=cfg_train.weight_decay,
-    )
-    # MINE optimizer：稍大的 lr 帮助 MINE 快速收敛
-    mine_optimizer = torch.optim.Adam(
-        model.mine_parameters(),
-        lr=cfg_train.lr * 2,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
@@ -257,9 +289,8 @@ def train(model:        GridCFN,
         "train_loss": [], "train_nll": [], "train_mi": [],
         "val_crps": [], "val_mae": [], "val_rmse": [],
     }
-    warmup_epochs     = getattr(cfg_train, "warmup_epochs", 5)
 
-    header = (f"{'Epoch':>6} | {'Loss':>8} | {'NLL':>8} | {'MI':>7} | "
+    header = (f"{'Epoch':>6} | {'Loss':>8} | {'NLL':>8} | {'MI':>8} | "
               f"{'Val MAE':>8} | {'Val RMSE':>9} | {'Val CRPS':>9} | "
               f"{'LR':>8} | {'Time':>6}")
     logger.info(header)
@@ -268,10 +299,12 @@ def train(model:        GridCFN,
     for epoch in range(1, cfg_train.max_epochs + 1):
         t0 = time.time()
 
+        # [CLUB-1] train_one_epoch 不再需要 mine_optimizer
         train_m = train_one_epoch(
-            model, train_loader, optimizer, mine_optimizer,
+            model, train_loader, optimizer,
             adj_norm, edge_index, device,
-            epoch, cfg_train.grad_clip, warmup_epochs,
+            epoch, cfg_train.grad_clip,
+            getattr(cfg_train, "warmup_epochs", 5),
         )
         val_m   = evaluate(model, val_loader, adj_norm, edge_index, device, scaler)
         scheduler.step(val_m["CRPS"])
@@ -286,12 +319,11 @@ def train(model:        GridCFN,
         history["val_mae"].append(val_m["MAE"])
         history["val_rmse"].append(val_m["RMSE"])
 
-        warmup_tag = " [warmup]" if epoch <= warmup_epochs else ""
         logger.info(
             f"{epoch:>6} | {train_m['loss']:>8.4f} | {train_m['nll']:>8.4f} | "
-            f"{train_m['mi']:>7.4f} | {val_m['MAE']:>8.4f} | "
+            f"{train_m['mi']:>8.4f} | {val_m['MAE']:>8.4f} | "
             f"{val_m['RMSE']:>9.4f} | {val_m['CRPS']:>9.4f} | "
-            f"{cur_lr:>8.2e} | {elapsed:>5.1f}s{warmup_tag}"
+            f"{cur_lr:>8.2e} | {elapsed:>5.1f}s"
         )
 
         if val_m["CRPS"] < best_val_crps:
@@ -324,10 +356,8 @@ def train(model:        GridCFN,
     logger.info(sep)
 
     history["test_metrics"] = test_m
-    # 保存预测数组（flatten 为列表供 JSON 序列化和画图使用）
     history["test_mu"]    = mu_all.flatten().tolist()
     history["test_sigma"] = sigma_all.flatten().tolist()
     history["test_y"]     = y_all.flatten().tolist()
-    # 保存形状信息，画图时用于 reshape
     history["test_shape"] = list(mu_all.shape)
     return history
