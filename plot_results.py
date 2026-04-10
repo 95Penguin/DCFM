@@ -94,7 +94,7 @@ PAPER_BASELINES_SOLAR = {
     "STGCN*":  {"MAE": 0.160, "RMSE": 0.290, "CRPS": 0.155},
     "MTGNN*":  {"MAE": 0.152, "RMSE": 0.275, "CRPS": 0.145},
     "AGCRN*":  {"MAE": 0.155, "RMSE": 0.280, "CRPS": 0.148},
-    "GridCFN\n(论文)": {"MAE": 0.143, "RMSE": 0.260, "CRPS": 0.135},
+    "GridCFN\n(Paper)": {"MAE": 0.143, "RMSE": 0.260, "CRPS": 0.135},
 }
 
 PAPER_BASELINES_ELECTRICITY = {
@@ -102,7 +102,7 @@ PAPER_BASELINES_ELECTRICITY = {
     "STGCN*":  {"MAE": 0.095, "RMSE": 0.165, "CRPS": 0.090},
     "MTGNN*":  {"MAE": 0.088, "RMSE": 0.155, "CRPS": 0.082},
     "AGCRN*":  {"MAE": 0.090, "RMSE": 0.160, "CRPS": 0.085},
-    "GridCFN\n(论文)": {"MAE": 0.079, "RMSE": 0.145, "CRPS": 0.070},
+    "GridCFN\n(Paper)": {"MAE": 0.079, "RMSE": 0.145, "CRPS": 0.070},
 }
 
 PAPER_BASELINES_WEATHER = {
@@ -110,7 +110,7 @@ PAPER_BASELINES_WEATHER = {
     "STGCN*":  {"MAE": 1.90, "RMSE": 3.00, "CRPS": 1.85},
     "MTGNN*":  {"MAE": 1.80, "RMSE": 2.85, "CRPS": 1.75},
     "AGCRN*":  {"MAE": 1.82, "RMSE": 2.90, "CRPS": 1.78},
-    "GridCFN\n(论文)": {"MAE": 1.75, "RMSE": 2.68, "CRPS": 1.63},
+    "GridCFN\n(Paper)": {"MAE": 1.75, "RMSE": 2.68, "CRPS": 1.63},
 }
 
 BASELINES = {
@@ -145,18 +145,18 @@ def plot_convergence(history: Dict, result_dir: str, dataset: str):
     best_idx   = int(np.argmin(val_crps))
     best_crps  = val_crps[best_idx]
     ax.scatter([best_idx + 1], [best_crps], color=RED, zorder=5, s=60,
-               label=f"最优 epoch {best_idx+1}  CRPS={best_crps:.4f}")
+               label=f"Best epoch {best_idx+1}  CRPS={best_crps:.4f}")
 
     # 论文基线参考线
     baselines = BASELINES.get(dataset, {})
-    if "GridCFN\n(论文)" in baselines:
-        paper_crps = baselines["GridCFN\n(论文)"]["CRPS"]
+    if "GridCFN\n(Paper)" in baselines:
+        paper_crps = baselines["GridCFN\n(Paper)"]["CRPS"]
         ax.axhline(paper_crps, color=RED, lw=1, ls=":", alpha=0.7,
-                   label=f"论文 GridCFN CRPS={paper_crps}")
+                   label=f"Paper GridCFN CRPS={paper_crps}")
 
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Val CRPS")
-    ax.set_title(f"收敛曲线 — {dataset}")
+    ax.set_title(f"Convergence Curve — {dataset}")
     ax.legend(fontsize=9)
     fig.tight_layout()
     path = os.path.join(result_dir, "convergence.png")
@@ -180,13 +180,13 @@ def plot_loss_components(history: Dict, result_dir: str, dataset: str):
     if train_nll:
         ax1.plot(epochs, train_nll, color=TEAL, lw=1.2, ls="--", label="NLL")
     ax1.set_ylabel("Loss")
-    ax1.set_title(f"训练损失分解 — {dataset}")
+    ax1.set_title(f"Train Loss Components — {dataset}")
     ax1.legend(fontsize=9)
 
     if train_mi:
-        ax2.plot(epochs, train_mi, color=PURPLE, lw=1.5, label="MI 估计")
+        ax2.plot(epochs, train_mi, color=PURPLE, lw=1.5, label="MI Estimate")
         ax2.axhline(0, color=GRAY, lw=0.8, ls="--")
-        ax2.set_ylabel("MI 估计值")
+        ax2.set_ylabel("MI Estimate")
         ax2.set_xlabel("Epoch")
         ax2.legend(fontsize=9)
 
@@ -200,7 +200,7 @@ def plot_loss_components(history: Dict, result_dir: str, dataset: str):
         reactivate = np.where((mi_arr[:-1] < 0.1) & (mi_arr[1:] > 0.5))[0]
         if len(reactivate) >= 1:
             ax2.axvline(reactivate[0] + 2, color=TEAL, lw=0.8, ls=":", alpha=0.7,
-                        label="MI 重激活")
+                        label="MI Reactivated")
         ax2.legend(fontsize=9)
 
     fig.tight_layout()
@@ -234,7 +234,7 @@ def plot_metrics_curve(history: Dict, result_dir: str, dataset: str):
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Val MAE", color=BLUE)
     ax.tick_params(axis="y", colors=BLUE)
-    ax.set_title(f"验证集指标曲线 — {dataset}")
+    ax.set_title(f"Validation Metrics — {dataset}")
     lines1, labels1 = ax.get_legend_handles_labels()
     ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9)
 
@@ -294,15 +294,15 @@ def plot_prediction_intervals(history: Dict, result_dir: str, dataset: str,
         steps     = np.arange(len(y_seg))
 
         ax.fill_between(steps, lower, upper,
-                        color=BLUE, alpha=0.18, label="95% 预测区间")
-        ax.plot(steps, y_seg,  color=GRAY, lw=1.2, label="真实值")
-        ax.plot(steps, mu_seg, color=BLUE, lw=1.5, label="预测均值 μ")
-        ax.set_ylabel("值（归一化）")
-        ax.set_title(f"节点 {node_idx}  (σ 方差={node_var[node_idx]:.4f})")
+                        color=BLUE, alpha=0.18, label="95% Pred Interval")
+        ax.plot(steps, y_seg,  color=GRAY, lw=1.2, label="Ground Truth")
+        ax.plot(steps, mu_seg, color=BLUE, lw=1.5, label=r"Pred Mean μ")
+        ax.set_ylabel("Value (normalized)")
+        ax.set_title(f"Node {node_idx}  (σ var={node_var[node_idx]:.4f})")
         ax.legend(fontsize=8, loc="upper right")
 
-    axes[-1].set_xlabel("时间步（测试集）")
-    fig.suptitle(f"预测区间可视化 — {dataset}  (95% CI)", fontsize=13)
+    axes[-1].set_xlabel("Time Step (test set)")
+    fig.suptitle(f"Prediction Intervals — {dataset}  (95% CI)", fontsize=13)
     fig.tight_layout()
     path = os.path.join(result_dir, "prediction_intervals.png")
     fig.savefig(path)
@@ -338,19 +338,19 @@ def plot_reliability_diagram(history: Dict, result_dir: str, dataset: str):
         actual_picps.append(covered.mean())
 
     fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot([0, 1], [0, 1], color=GRAY, lw=1, ls="--", label="理想校准（y=x）")
+    ax.plot([0, 1], [0, 1], color=GRAY, lw=1, ls="--", label="Ideal Calibration (y=x)")
     ax.plot(confidences, actual_picps, color=BLUE, lw=2,
-            marker="o", markersize=4, label="实际覆盖率")
+            marker="o", markersize=4, label="Actual Coverage")
     ax.fill_between(confidences, confidences, actual_picps,
                     where=np.array(actual_picps) > confidences,
-                    color=TEAL, alpha=0.15, label="保守（过宽）")
+                    color=TEAL, alpha=0.15, label="Conservative (too wide)")
     ax.fill_between(confidences, confidences, actual_picps,
                     where=np.array(actual_picps) < confidences,
-                    color=RED, alpha=0.15, label="自信（过窄）")
+                    color=RED, alpha=0.15, label="Overconfident (too narrow)")
 
-    ax.set_xlabel("置信度（名义覆盖率）")
-    ax.set_ylabel("实际覆盖率（PICP）")
-    ax.set_title(f"概率校准图（Reliability Diagram）— {dataset}")
+    ax.set_xlabel("Confidence Level (nominal)")
+    ax.set_ylabel("Actual Coverage (PICP)")
+    ax.set_title(f"Reliability Diagram — {dataset}")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.legend(fontsize=9)
@@ -390,12 +390,12 @@ def plot_error_distribution(history: Dict, result_dir: str, dataset: str):
 
     # 左图：误差直方图
     ax1.hist(errors, bins=60, color=BLUE, alpha=0.75, edgecolor="white", lw=0.3)
-    ax1.axvline(0,            color=RED,  lw=1.5, ls="--", label="零误差线")
+    ax1.axvline(0,            color=RED,  lw=1.5, ls="--", label="Zero Error")
     ax1.axvline(errors.mean(), color=AMBER, lw=1.2, ls="--",
-                label=f"均值={errors.mean():.4f}")
-    ax1.set_xlabel("预测误差 (μ - y)")
-    ax1.set_ylabel("频数")
-    ax1.set_title("误差分布直方图")
+                label=f"Mean={errors.mean():.4f}")
+    ax1.set_xlabel(r"Prediction Error (μ - y)")
+    ax1.set_ylabel("Count")
+    ax1.set_title("Error Distribution")
     ax1.legend(fontsize=9)
 
     # 右图：误差绝对值 vs 平均不确定性（验证 sigma 的"有效性"）
@@ -410,13 +410,13 @@ def plot_error_distribution(history: Dict, result_dir: str, dataset: str):
             bin_center.append((bins[i] + bins[i + 1]) / 2)
 
     ax2.plot(bin_center, bin_sigma, color=TEAL, lw=2,
-             marker="o", markersize=5, label="平均 σ")
-    ax2.set_xlabel("|误差| 分桶中心（归一化）")
-    ax2.set_ylabel("平均预测标准差 σ")
-    ax2.set_title("误差大小 vs 预测不确定性\n（理想情况：σ 随误差增大而增大）")
+             marker="o", markersize=5, label=r"Mean σ")
+    ax2.set_xlabel("Error Bin Center (normalized)")
+    ax2.set_ylabel(r"Mean Predicted Std σ")
+    ax2.set_title("Error vs Uncertainty\n(ideal: σ increases with |error|)")
     ax2.legend(fontsize=9)
 
-    fig.suptitle(f"误差分析 — {dataset}", fontsize=13)
+    fig.suptitle(f"Error Analysis — {dataset}", fontsize=13)
     fig.tight_layout()
     path = os.path.join(result_dir, "error_distribution.png")
     fig.savefig(path)

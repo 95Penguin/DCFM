@@ -207,7 +207,7 @@ def main(cfg: Config):
     logger.info(f"History 已保存: {history_path}")
 
     # 6. 生成图表
-    plot_all(history, result_dir, dataset)
+    # plot_all(history, result_dir, dataset)
 
     logger.info(f"训练完成，所有结果保存于: {result_dir}")
     return history, result_dir
