@@ -1,40 +1,5 @@
 """
 GridCFN: A Causal Spatio-Temporal Framework for Power Flow Uncertainty Prediction
-Reproduction based on IC2ECS 2025 paper by Zhao et al.
-
-Architecture:
-  Input X [B, T, N, F]
-    └─ Backbone (GCN + TCN) → H [B, T, N, D]
-         └─ Causal Disentangler → He [B, N, De], Hs [B, N, Ds], He_seq [B, T, N, De]
-              ├─ Multi-Scale Context (dilated conv on He_seq) → H'e [B, N, ms_out_dim]
-              └─ SCG-MP (causal gated message passing) → H's [B, N, Ds]
-                   └─ Feature Fusion → H_final [B, N, ms_out_dim+Ds]
-                        └─ Predictor → (mu, sigma) [B, N, Fout]
-
-修改说明（MINE → CLUB）：
-  原版使用 MINE（互信息下界估计）来最小化 I(He, Hs)。
-  MINE 本身是为最大化互信息设计的，"最小化下界"在梯度方向上存在理论不一致，
-  且需要 minimax 两步优化（mine_optimizer 单独更新），训练逻辑复杂易出错。
-
-  本版本用 CLUB（Contrastive Log-ratio Upper Bound，NeurIPS 2020）替换 MINE：
-    CLUB 估计互信息上界：
-      I(He; Hs) ≤ E_p(He,Hs)[log q(Hs|He)] - E_p(He)E_p(Hs)[log q(Hs|He)]
-    其中 q(Hs|He) 是一个可学习的变分网络（VariationalNet）。
-
-  优势：
-    1. 直接估计上界 → 最小化上界比最小化下界理论上更保守且更可靠
-    2. 无需 minimax 两步 → 所有参数（含变分网络）统一用主 optimizer 更新
-    3. 梯度方向一致：损失对解耦表征的梯度正确指向"降低互信息"
-    4. 训练更稳定：MINE 在最小化场景下梯度方差大，CLUB 无此问题
-
-  对应代码变更：
-    model.py : MINEEstimator → CLUBEstimator（含 VariationalNet）
-               GridCFN.mine → GridCFN.club
-               main_parameters() / mine_parameters() → 合并为 parameters()（全部参数）
-    train.py : 删除 mine_optimizer 和两步训练逻辑 → 单步 optimizer 更新
-"""
-"""
-GridCFN: A Causal Spatio-Temporal Framework for Power Flow Uncertainty Prediction
 
 [Fix-CLUB-v4] 修复记录：
 
@@ -242,13 +207,20 @@ class CLUBEstimator(nn.Module):
         """
         CLUB 上界估计，无 clamp，允许负值。
         He, Hs: [B,N,dim] → 标量
+
+        [Fix-Elec] L2 归一化：
+          Electricity 等数据集归一化后 He/Hs 数值范围极小，
+          变分网络无法区分正负样本，导致 MI≈0、VarLoss<0。
+          将 He_flat/Hs_flat 投影到单位球面后，
+          无论原始数值尺度多小，变分网络都能有效学习条件分布。
+          eps=1e-8 防止全零向量除零。
         """
         M       = He.shape[0] * He.shape[1]
-        He_flat = He.reshape(M, -1)
-        Hs_flat = Hs.reshape(M, -1)
+        He_flat = F.normalize(He.reshape(M, -1), dim=-1)   # [Fix-Elec] L2 norm
+        Hs_flat = F.normalize(Hs.reshape(M, -1), dim=-1)   # [Fix-Elec] L2 norm
 
         mu_q, logvar_raw = self._get_params(He_flat)
-        pos = self._log_prob(Hs_flat,                        mu_q, logvar_raw).mean()
+        pos = self._log_prob(Hs_flat,                               mu_q, logvar_raw).mean()
         neg = self._log_prob(Hs_flat[self._neg_perm(M, He.device)], mu_q, logvar_raw).mean()
         return pos - neg   # 无 clamp
 
@@ -257,10 +229,12 @@ class CLUBEstimator(nn.Module):
         变分网络损失：-E[log q(Hs|He)]。
         最小化此损失 = 让 q 准确建模 p(Hs|He)。
         He, Hs 应已 detach，避免梯度流回 backbone。
+
+        [Fix-Elec] 同 forward，先做 L2 归一化再送入变分网络。
         """
         M       = He.shape[0] * He.shape[1]
-        He_flat = He.reshape(M, -1)
-        Hs_flat = Hs.reshape(M, -1)
+        He_flat = F.normalize(He.reshape(M, -1), dim=-1)   # [Fix-Elec] L2 norm
+        Hs_flat = F.normalize(Hs.reshape(M, -1), dim=-1)   # [Fix-Elec] L2 norm
         mu_q, logvar_raw = self._get_params(He_flat)
         return -self._log_prob(Hs_flat, mu_q, logvar_raw).mean()
 

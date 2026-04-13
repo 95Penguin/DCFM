@@ -96,10 +96,17 @@ class SlidingWindowDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 class Scaler:
-    """全局 Z-score 归一化（在训练集上 fit）。"""
-    def __init__(self):
+    """
+    全局 Z-score 归一化（在训练集上 fit）。
+
+    log_transform=True 时，inverse_transform 会额外做 expm1 反变换，
+    用于 Electricity 等重尾数据集（load_electricity 中已预先做了 log1p）。
+    训练和评估都在 log 域进行，指标也在 log 域报告，与论文口径一致。
+    """
+    def __init__(self, log_transform: bool = False):
         self.mean: float = 0.0
         self.std:  float = 1.0
+        self.log_transform: bool = log_transform
 
     def fit(self, data: np.ndarray) -> "Scaler":
         self.mean = float(data.mean())
@@ -110,8 +117,17 @@ class Scaler:
         return (data - self.mean) / self.std
 
     def inverse_transform(self, data):
-        """支持 numpy array 或 torch tensor。"""
-        return data * self.std + self.mean
+        """
+        支持 numpy array 或 torch tensor。
+        log_transform=True 时：先反 Z-score，再 expm1（对应 log1p 的逆）。
+        """
+        out = data * self.std + self.mean
+        if self.log_transform:
+            if isinstance(out, np.ndarray):
+                out = np.expm1(out)
+            else:
+                out = out.exp() - 1.0
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +149,33 @@ def load_electricity(data_path: str, T_in: int = 168, T_out: int = 1,
     """
     Electricity (UCI): 321 个用电客户，小时级，2012-2014。
     文件格式: electricity.txt（逗号分隔，[T=26304, N=321]）
+
+    [Fix-Elec] log1p 变换：
+      Electricity 原始数据是重尾分布（工业用户 vs 居民用户量级差异 100x+）。
+      直接 Z-score 后大量数据点压缩到接近 0，导致：
+        · sigma 极易压到最小值（NLL 持续为负）
+        · Hs 数值范围极小，CLUB 变分网络无法区分正负样本（MI≈0）
+
+      log1p(x) = log(1 + x) 变换将重尾分布压缩为近似正态，
+      Z-score 后方差分布更均匀，sigma 学习难度大幅降低。
+
+      注意：
+        · 原始数据必须 ≥ 0（用电量天然满足）
+        · 训练/验证/测试指标均在 log 域报告，与论文口径一致
+        · Scaler(log_transform=True) 的 inverse_transform 包含 expm1 反变换，
+          供需要原始量纲的场景使用
     """
-    raw = np.loadtxt(data_path, delimiter=',')          # [T, N=321]
-    return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Electricity')
+    raw = np.loadtxt(data_path, delimiter=',')   # [T, N=321]
+
+    # [Fix-Elec] log1p 变换：将重尾用电量分布压缩为近似正态
+    # clip(0) 防止极少数负值（数据噪声）导致 log 出现 NaN
+    raw = np.log1p(np.clip(raw, 0, None))
+
+    print(f"  [Electricity] log1p 变换后：mean={raw.mean():.3f}, "
+          f"std={raw.std():.3f}, min={raw.min():.3f}, max={raw.max():.3f}")
+
+    return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size,
+                          name='Electricity', log_transform=True)
 
 
 def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,
@@ -195,7 +235,8 @@ def _build_loaders(raw: np.ndarray,
                    T_in: int, T_out: int,
                    adj_threshold: float,
                    batch_size: int,
-                   name: str = '') -> tuple:
+                   name: str = '',
+                   log_transform: bool = False) -> tuple:
     """
     共享加载逻辑：
       1. 扩展到 [T, N, F]
@@ -217,7 +258,7 @@ def _build_loaders(raw: np.ndarray,
     test_raw  = raw[n_train + n_val :]
 
     # 归一化：只在训练集上 fit
-    scaler     = Scaler().fit(train_raw)
+    scaler     = Scaler(log_transform=log_transform).fit(train_raw)
     train_data = scaler.transform(train_raw)
     val_data   = scaler.transform(val_raw)
     test_data  = scaler.transform(test_raw)
