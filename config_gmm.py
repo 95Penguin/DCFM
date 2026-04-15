@@ -1,15 +1,16 @@
 """
-GridCFN Configuration
-=====================
-所有超参数统一在这里修改，不需要动其他文件。
+GridCFN + GMM Configuration v2
+================================
 
-使用方法：
-  python main.py --preset solar
-  python main.py --preset electricity
-  python main.py --preset weather
+字段名与 model_gmm_v2.py 中 GridCFN.__init__ 的参数名严格一一对应，
+main.py 的 build_model 按名称传参，不会出现 AttributeError。
 
-切换数据集只需修改 DataConfig.dataset 和 data_path，
-或直接使用 --preset 命令行参数。
+ModelConfig 中所有字段：
+  基础（不变）：in_dim / gcn_hidden / gcn_layers / tcn_hidden / tcn_layers /
+               env_dim / stoch_dim / ms_out_dim / n_scg_layers / out_dim / lambda_mi
+  GMM v1：n_components / lambda_mean / lambda_weight
+  GMM v2（新增）：proj_dim / sigma_min_heavy / huber_delta / use_grin
+  注：n_nodes 由 main.py 在数据加载后自动设置，不在 config 中定义。
 """
 
 from dataclasses import dataclass, field, asdict
@@ -17,27 +18,16 @@ from typing import Optional
 
 
 # ===========================================================================
-# 数据集配置
+# 数据集配置（不变）
 # ===========================================================================
 @dataclass
 class DataConfig:
-    # 数据集名称: "solar" | "electricity" | "weather"
-    dataset: str = "solar"
-
-    # 真实数据集的文件路径
-    data_path: Optional[str] = "./data/solar_AL.txt"
-
-    # 输入窗口长度（论文 Table I: 168）
-    T_in: int = 168
-
-    # 预测步长（论文: 1）
-    T_out: int = 1
-
-    # 构建邻接矩阵时的相关性阈值
-    adj_threshold: float = 0.95
-
-    # DataLoader batch size（论文: 32）
-    batch_size: int = 32
+    dataset:       str           = "solar"
+    data_path:     Optional[str] = "./data/solar_AL.txt"
+    T_in:          int           = 168
+    T_out:         int           = 1
+    adj_threshold: float         = 0.95
+    batch_size:    int           = 32
 
 
 # ===========================================================================
@@ -45,81 +35,49 @@ class DataConfig:
 # ===========================================================================
 @dataclass
 class ModelConfig:
-    # 输入特征维度 F
-    in_dim: int = 1
+    # ── 基础参数 ──────────────────────────────────────────────────────────
+    in_dim:       int   = 1
+    gcn_hidden:   int   = 64
+    gcn_layers:   int   = 2
+    tcn_hidden:   int   = 64
+    tcn_layers:   int   = 4
+    env_dim:      int   = 32
+    stoch_dim:    int   = 32
+    ms_out_dim:   int   = 32
+    n_scg_layers: int   = 3
+    out_dim:      int   = 1
+    lambda_mi:    float = 0.5
 
-    # GCN 隐藏层维度
-    gcn_hidden: int = 64
+    # ── GMM v1 参数 ────────────────────────────────────────────────────────
+    n_components:  int   = 3
+    lambda_mean:   float = 0.1
+    lambda_weight: float = 0.01
 
-    # GCN 层数
-    gcn_layers: int = 2
-
-    # TCN 输出维度 D（论文 d_hidden=64）
-    tcn_hidden: int = 64
-
-    # TCN 层数（膨胀系数 1,2,4,...,2^(tcn_layers-1)）
-    tcn_layers: int = 4
-
-    # 环境上下文维度 De
-    env_dim: int = 32
-
-    # 随机实体维度 Ds
-    stoch_dim: int = 32
-
-    # 多尺度上下文输出维度 De'
-    ms_out_dim: int = 32
-
-    # SCG-MP 层数 L_SCG（论文: 3）
-    n_scg_layers: int = 3
-
-    # 输出变量数 Fout（单步单变量预测为 1）
-    out_dim: int = 1
-
-    # MI 正则化权重 λ（论文: 0.5）
-    lambda_mi: float = 0.5
+    # ── GMM v2 新增参数（字段名与 GridCFN.__init__ 严格对齐）──────────────
+    proj_dim:        int   = 64     # CLUB projection MLP 维度
+    sigma_min_heavy: float = 0.5    # GMMHead 重尾分量最小 sigma
+    huber_delta:     float = 1.0    # Huber loss delta
+    use_grin:        bool  = True   # 是否启用 GRIN denorm
 
 
 # ===========================================================================
-# 训练配置
+# 训练配置（不变）
 # ===========================================================================
 @dataclass
 class TrainConfig:
-    # 初始学习率（论文: 0.001）
-    lr: float = 1e-3
-
-    # 最大训练轮数（论文: 200）
-    max_epochs: int = 200
-
-    # 早停耐心值（验证集 CRPS 不再提升的容忍轮数）
-    patience: int = 20
-
-    # 学习率衰减因子（ReduceLROnPlateau）
-    lr_decay_factor: float = 0.5
-
-    # 学习率衰减耐心值
-    lr_decay_patience: int = 10
-
-    # 梯度裁剪阈值
-    grad_clip: float = 1.0
-
-    # 权重衰减（L2 正则）
-    weight_decay: float = 1e-5
-
-    # 最佳模型保存路径
-    save_path: str = "best_model.pt"
-
-    # 随机种子
-    seed: int = 42
-
-    # 热身 epoch 数：前 warmup_epochs 个 epoch MI 正则权重为 0
-    warmup_epochs: int = 5
-
-    # GPU 配置（-1 自动选择，>=0 指定卡号）
-    gpu_id: int = -1
-
-    # 日志配置
-    log_dir: Optional[str] = "logs"
-    log_to_console: bool = True
+    lr:                float        = 1e-3
+    max_epochs:        int          = 200
+    patience:          int          = 20
+    lr_decay_factor:   float        = 0.5
+    lr_decay_patience: int          = 10
+    grad_clip:         float        = 1.0
+    weight_decay:      float        = 1e-5
+    save_path:         str          = "best_model.pt"
+    seed:              int          = 42
+    warmup_epochs:     int          = 5
+    gpu_id:            int          = -1
+    log_dir:           Optional[str]= "logs"
+    log_to_console:    bool         = True
 
 
 # ===========================================================================
@@ -132,13 +90,13 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def summary(self) -> str:
-        lines = ["=" * 52, "GridCFN Configuration", "=" * 52]
+        lines = ["=" * 52, "GridCFN + GMM v2 Configuration", "=" * 52]
         for section_name, section in [("Data",  self.data),
                                        ("Model", self.model),
                                        ("Train", self.train)]:
             lines.append(f"\n[{section_name}]")
             for k, v in asdict(section).items():
-                lines.append(f"  {k:<22} = {v}")
+                lines.append(f"  {k:<24} = {v}")
         lines.append("=" * 52)
         return "\n".join(lines)
 
@@ -148,10 +106,6 @@ class Config:
 # ===========================================================================
 
 def get_config(preset: str = "solar") -> Config:
-    """
-    快速获取预设配置。
-    preset: "solar" | "electricity" | "weather"
-    """
     if preset == "solar":
         return Config(
             data=DataConfig(
@@ -166,6 +120,11 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+                n_components=3, lambda_mean=0.1, lambda_weight=0.01,
+                proj_dim=64,
+                sigma_min_heavy=0.05,   # Solar 无重尾，与 sigma_min 相同
+                huber_delta=1.0,
+                use_grin=False, #True,
             ),
             train=TrainConfig(
                 lr=5e-4, max_epochs=200, patience=20,
@@ -187,6 +146,11 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+                n_components=5, lambda_mean=0.1, lambda_weight=0.01,
+                proj_dim=64,
+                sigma_min_heavy=0.5,    # 重尾分量捕捉突变用户
+                huber_delta=0.5,        # 更激进地抑制大误差梯度
+                use_grin=False,  #True,
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200, patience=20,
@@ -200,14 +164,19 @@ def get_config(preset: str = "solar") -> Config:
                 dataset="weather",
                 data_path="./data/weather2k.npy",
                 T_in=168, T_out=1,
-                adj_threshold=0.8,   # 从 0.6 → 0.80
-                batch_size=4,      # ← DataConfig 里的 batch_size 从32 → 8
+                adj_threshold=0.8,
+                batch_size=4,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+                n_components=3, lambda_mean=0.1, lambda_weight=0.01,
+                proj_dim=64,
+                sigma_min_heavy=0.1,    # 轻度重尾保护
+                huber_delta=1.0,
+                use_grin=True,
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200, patience=20,
