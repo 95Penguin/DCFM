@@ -1,17 +1,13 @@
 """
-GridCFN – 主入口
-================
-所有参数在 config.py 里修改，这里不需要动。
+GridCFN – 主入口（CFM 版）
+===========================
+相比 Gaussian 版，build_model 新增 cfm_hidden / cfm_time_emb_dim 两个参数。
+其余逻辑完全不变。
 
 快速开始：
   python main.py --preset solar
   python main.py --preset electricity
   python main.py --preset weather
-
-修复说明：
-  [Fix-I] adj 预计算：
-    adj_norm 和 edge_index 在 load_data 之后立即预计算，
-    之后作为固定张量传入 train()，不再在每次 forward 内部重算。
 """
 
 import argparse
@@ -19,7 +15,6 @@ import json
 import logging
 import os
 import random
-import shutil
 import sys
 from datetime import datetime
 
@@ -30,7 +25,7 @@ from config import Config, get_config
 from model import GridCFN
 from dataset import load_solar_energy, load_electricity, load_weather
 from train import train
-from plot_results import plot_all
+# from plot_results import plot_all  # 如需绘图取消注释
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +139,9 @@ def build_model(cfg: Config, in_dim: int = None) -> GridCFN:
         stoch_dim=m.stoch_dim,   ms_out_dim=m.ms_out_dim,
         n_scg_layers=m.n_scg_layers,
         out_dim=m.out_dim,       lambda_mi=m.lambda_mi,
+        # [CFM 新增] 向量场网络参数
+        cfm_hidden=getattr(m, "cfm_hidden", 128),
+        cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 8),
     )
 
 
@@ -172,7 +170,7 @@ def main(cfg: Config):
     logger.info(f"Device     : {gpu_info(device)}")
     logger.info(f"Result dir : {result_dir}")
 
-    # 1. 数据加载（返回 in_dim 用于自动适配模型）
+    # 1. 数据加载
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
     logger.info(f"in_dim     : {in_dim}（数据集实际特征维度，已自动覆盖 config）")
 
@@ -181,7 +179,7 @@ def main(cfg: Config):
     edge_index = GridCFN.adj_to_edge_index(adj)
     logger.info(f"Graph      : {adj.shape[0]} nodes, {edge_index.shape[1]} edges")
 
-    # 3. 模型（in_dim 自动适配）
+    # 3. 模型
     model    = build_model(cfg, in_dim=in_dim).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Parameters : {n_params:,}\n")
@@ -200,13 +198,13 @@ def main(cfg: Config):
         logger=logger,
     )
 
-    # 5. 保存 history（供 plot_results.py 读取）
+    # 5. 保存 history
     history_path = os.path.join(result_dir, f"history_{dataset}_{timestamp}.json")
     with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
     logger.info(f"History 已保存: {history_path}")
 
-    # 6. 生成图表
+    # 6. 生成图表（可选）
     # plot_all(history, result_dir, dataset)
 
     logger.info(f"训练完成，所有结果保存于: {result_dir}")
@@ -214,7 +212,7 @@ def main(cfg: Config):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GridCFN Training")
+    parser = argparse.ArgumentParser(description="GridCFN Training (CFM)")
     parser.add_argument(
         "--preset", type=str, default="solar",
         choices=["solar", "electricity", "weather"],

@@ -1,15 +1,18 @@
 """
-GridCFN Configuration
-=====================
-所有超参数统一在这里修改，不需要动其他文件。
+GridCFN Configuration（CFM 版）
+================================
+相比 Gaussian 版，TrainConfig 新增两个 CFM 推断参数：
+  cfm_n_samples : 验证/推断时的采样粒子数（越大越准，但越慢）
+  cfm_n_steps   : ODE 欧拉积分步数（越大越精确）
 
-使用方法：
+ModelConfig 新增两个 CFM 向量场参数：
+  cfm_hidden      : 向量场 MLP 隐藏层维度
+  cfm_time_emb_dim: 时间傅里叶编码维度
+
+使用方法不变：
   python main.py --preset solar
   python main.py --preset electricity
   python main.py --preset weather
-
-切换数据集只需修改 DataConfig.dataset 和 data_path，
-或直接使用 --preset 命令行参数。
 """
 
 from dataclasses import dataclass, field, asdict
@@ -17,7 +20,7 @@ from typing import Optional
 
 
 # ===========================================================================
-# 数据集配置
+# 数据集配置（不变）
 # ===========================================================================
 @dataclass
 class DataConfig:
@@ -78,6 +81,10 @@ class ModelConfig:
     # MI 正则化权重 λ（论文: 0.5）
     lambda_mi: float = 0.5
 
+    # [CFM 新增] 向量场网络参数
+    cfm_hidden: int = 128       # 向量场 MLP 隐藏层维度
+    cfm_time_emb_dim: int = 8   # 时间傅里叶编码维度（偶数，n_freqs = dim//2）
+
 
 # ===========================================================================
 # 训练配置
@@ -121,6 +128,15 @@ class TrainConfig:
     log_dir: Optional[str] = "logs"
     log_to_console: bool = True
 
+    # [CFM 新增] 推断采样参数
+    # cfm_n_samples: 验证时 50（速度优先），测试时自动 ×4（精度优先）
+    # 推荐范围：验证 20~100，最终测试 100~500
+    cfm_n_samples: int = 50
+
+    # cfm_n_steps: ODE 欧拉步数，20 步通常已足够（Linear Flow Matching 路径简单）
+    # 推荐范围：10~50
+    cfm_n_steps: int = 20
+
 
 # ===========================================================================
 # 顶层配置
@@ -132,7 +148,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def summary(self) -> str:
-        lines = ["=" * 52, "GridCFN Configuration", "=" * 52]
+        lines = ["=" * 52, "GridCFN Configuration (CFM)", "=" * 52]
         for section_name, section in [("Data",  self.data),
                                        ("Model", self.model),
                                        ("Train", self.train)]:
@@ -166,10 +182,12 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+                cfm_hidden=128, cfm_time_emb_dim=8,
             ),
             train=TrainConfig(
                 lr=5e-4, max_epochs=200, patience=20,
                 seed=42, grad_clip=1.0, warmup_epochs=5,
+                cfm_n_samples=50, cfm_n_steps=20,
             ),
         )
 
@@ -187,10 +205,12 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+                cfm_hidden=128, cfm_time_emb_dim=8,
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200, patience=20,
                 seed=42, grad_clip=1.0, warmup_epochs=5,
+                cfm_n_samples=50, cfm_n_steps=20,
             ),
         )
 
@@ -200,18 +220,20 @@ def get_config(preset: str = "solar") -> Config:
                 dataset="weather",
                 data_path="./data/weather2k.npy",
                 T_in=168, T_out=1,
-                adj_threshold=0.8,   # 从 0.6 → 0.80
-                batch_size=4,      # ← DataConfig 里的 batch_size 从32 → 8
+                adj_threshold=0.8,
+                batch_size=4,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+                cfm_hidden=128, cfm_time_emb_dim=8,
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200, patience=20,
                 seed=42, grad_clip=1.0, warmup_epochs=5,
+                cfm_n_samples=50, cfm_n_steps=20,
             ),
         )
 
