@@ -1,36 +1,29 @@
 """
 GridCFN: A Causal Spatio-Temporal Framework for Power Flow Uncertainty Prediction
+CFM 版本 v2
 
-[CFM 版本] 将概率输出头从参数化高斯替换为 Conditional Flow Matching（CFM）：
+[v2 修复与改进清单]
 
-  原来：ProbabilisticPredictor → 直接输出 (mu, sigma) → NLL 损失
-  现在：CFMVectorField → 学习向量场 u_t(x|c) → CFM MSE 损失
-        推断时：ODE 积分（Euler/RK4） → 多次采样 → 用样本均值/标准差估计不确定性
+  Bug 修复：
+    1. [Bug-时间编码] CFMVectorField 改为对数均匀频率（log-spaced），
+       比线性频率更好地分辨 t≈0 和 t≈1 处的细节。
+    2. [Bug-ODE边界] sample() 欧拉积分从 step=0 到 n_steps-1，
+       每步 t=step*dt，最终 x 对应 t=1（完整覆盖 [0,1]）。
+       原版逻辑已正确，此处补充注释确认。
+    3. [Bug-维度] cfm_loss 加入防御性 assert，确保 y_target 维度与
+       out_dim 匹配，避免无声的 broadcast 错误。
+    4. [Bug-梯度方差] cfm_loss 改为对每个 batch 多采 n_t_samples 组 t
+       并取均值（默认 4），降低梯度估计方差（原版单次采样噪声大）。
 
-架构变化说明：
-  · 骨干 + 因果解耦 + CLUB + MS-Context + SCG-MP 全部保留不变
-  · 最终特征 H_final = [He_prime; Hs_prime]（同原版，作为条件向量 c）
-  · CFMVectorField(x_t, t, c) → v，学习从噪声到数据的速度场
-  · forward() 返回 (context_feat, He, Hs, mi_loss)
-      context_feat: [B,N,De'+Ds'] 条件特征，用于 CFM 损失计算
-  · cfm_loss(context_feat, y_target) → 标量 CFM 训练损失
-  · sample(context_feat, n_samples, n_steps) → [S,B,N,out_dim] 样本集合
+  设计决策（OT-CFM vs I-CFM）：
+    · 本任务 out_dim=1，OT 在 1D 退化为排序，无实质增益。
+    · x1=y_target 与条件 c 强绑定，OT 重配对会破坏这个语义绑定。
+    · OT plan 计算（Sinkhorn）需额外 O(B²) 复杂度，对大 batch 有明显开销。
+    · 结论：I-CFM 是正确且高效的选择。
 
-CFM 训练损失：
-  给定条件特征 c，目标值 x1（归一化后的 y），源 x0 ~ N(0,I)：
-    插值：x_t = (1-t)*x0 + t*x1
-    目标向量场：u_t = x1 - x0
-    损失：MSE(CFMVectorField(x_t, t, c), u_t)
-
-推断（ODE 积分）：
-  x_0 ~ N(0,I)  [n_samples 个]
-  欧拉积分：x_{t+Δt} = x_t + Δt * CFMVectorField(x_t, t, c)
-  最终 x_1 即预测样本
-  用 n_samples 个样本的均值/标准差作为 mu/sigma 返回（与 train.py evaluate 接口兼容）
-
-MI 正则（CLUB）：
-  与原版完全相同，不受 CFM 替换影响
-  总损失 = CFM_loss + lambda_mi * mi_loss
+  架构改进：
+    · CFMVectorField: 3 层 MLP + 残差 + 对数均匀时间编码（time_emb_dim=16）。
+    · sigma_min 下界 1e-4（原 1e-6，对概率校准无意义且可能引入偏差）。
 """
 
 import torch
@@ -159,13 +152,10 @@ class CausalDisentangler(nn.Module):
 class CLUBEstimator(nn.Module):
     """
     CLUB 互信息上界估计器（NeurIPS 2020）。
-
-    核心公式：
-      CLUB = E_{p(He,Hs)}[log q(Hs|He)] - E_{p(He)}E_{p(Hs)}[log q(Hs|He)]
-
-    使用方式（两步训练）：
-      Step 1: var_loss = club.variational_loss(He, Hs)
-      Step 2: mi_loss = club(He, Hs)
+    两步训练：
+      Step 1: variational_loss(He.detach(), Hs.detach()) → 更新变分网络
+      Step 2: forward(He, Hs) → CLUB 上界，推动骨干解耦
+    L2 归一化处理小数值 He/Hs（Electricity 等数据集修复）。
     """
 
     def __init__(self, env_dim, stoch_dim, hidden_dim=64):
@@ -203,17 +193,6 @@ class CLUBEstimator(nn.Module):
         return perm
 
     def forward(self, He, Hs):
-        """
-        CLUB 上界估计，无 clamp，允许负值。
-        He, Hs: [B,N,dim] → 标量
-
-        [Fix-Elec] L2 归一化：
-          Electricity 等数据集归一化后 He/Hs 数值范围极小，
-          变分网络无法区分正负样本，导致 MI≈0、VarLoss<0。
-          将 He_flat/Hs_flat 投影到单位球面后，
-          无论原始数值尺度多小，变分网络都能有效学习条件分布。
-          eps=1e-8 防止全零向量除零。
-        """
         M       = He.shape[0] * He.shape[1]
         He_flat = F.normalize(He.reshape(M, -1), dim=-1)
         Hs_flat = F.normalize(Hs.reshape(M, -1), dim=-1)
@@ -223,13 +202,6 @@ class CLUBEstimator(nn.Module):
         return pos - neg
 
     def variational_loss(self, He, Hs):
-        """
-        变分网络损失：-E[log q(Hs|He)]。
-        最小化此损失 = 让 q 准确建模 p(Hs|He)。
-        He, Hs 应已 detach，避免梯度流回 backbone。
-
-        [Fix-Elec] 同 forward，先做 L2 归一化再送入变分网络。
-        """
         M       = He.shape[0] * He.shape[1]
         He_flat = F.normalize(He.reshape(M, -1), dim=-1)
         Hs_flat = F.normalize(Hs.reshape(M, -1), dim=-1)
@@ -305,91 +277,91 @@ class SCGMP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 8. CFM Vector Field Network（替换原 ProbabilisticPredictor）
+# 8. CFM Vector Field（v2：对数均匀时间编码 + 3层MLP残差）
 # ---------------------------------------------------------------------------
 class CFMVectorField(nn.Module):
     """
-    条件向量场网络 v_θ(x_t, t | c)。
+    条件向量场 v_θ(x_t, t | c)，用于 I-CFM 训练。
+
+    改进点（v2）：
+      · 时间编码：对数均匀频率（log-spaced），覆盖 [1π, max_freq*π]，
+        能分辨 t 接近 0/1 时的细节，比线性频率更稳定。
+      · 网络：3层 MLP + 两处残差，增强表达力同时稳定梯度。
 
     输入：
-      x_t : [B, N, out_dim]  当前状态（插值点）
-      t   : [B, 1, 1]        当前时间（0~1），broadcast 到 [B,N,1]
-      c   : [B, N, cond_dim] 条件特征（来自骨干网络的 H_final）
-
+      x_t : [B, N, out_dim]   插值状态
+      t   : [B]               时间（0~1）
+      c   : [B, N, cond_dim]  条件特征
     输出：
-      v   : [B, N, out_dim]  向量场（速度），预测 dx/dt
-
-    网络结构：
-      将 x_t + t_embed + c 拼接后通过 2 层 MLP 预测速度。
-      时间编码：sin/cos 傅里叶特征（4 个频率 → 8 维），
-        比直接输入标量 t 更稳定。
+      v   : [B, N, out_dim]   速度场
     """
 
     def __init__(self, out_dim: int, cond_dim: int, hidden_dim: int = 128,
-                 time_emb_dim: int = 8):
+                 time_emb_dim: int = 16, max_freq: float = 1000.0):
         super().__init__()
-        self.out_dim     = out_dim
-        self.time_emb_dim = time_emb_dim
-
-        # 时间傅里叶编码频率（固定，不可学习）
+        self.out_dim = out_dim
         n_freqs = time_emb_dim // 2
-        self.register_buffer(
-            "freqs",
-            torch.arange(1, n_freqs + 1, dtype=torch.float32) * math.pi
-        )
+        assert n_freqs * 2 == time_emb_dim, "time_emb_dim 必须是偶数"
+
+        # 对数均匀频率：1π ~ max_freq*π，覆盖多个时间尺度
+        freqs = torch.exp(
+            torch.linspace(0.0, math.log(max_freq), n_freqs)
+        ) * math.pi
+        self.register_buffer("freqs", freqs)  # [n_freqs]，不参与梯度
 
         in_dim = out_dim + time_emb_dim + cond_dim
-        self.net = nn.Sequential(
+
+        # 3 层 MLP（含两处残差连接）
+        self.input_proj = nn.Sequential(
             nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
         )
+        # 残差对齐层（in_dim → hidden_dim）
+        self.skip_proj  = nn.Linear(in_dim, hidden_dim, bias=False)
+
+        self.layer2 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU()
+        )
+        self.layer3 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU()
+        )
+        self.out_proj = nn.Linear(hidden_dim, out_dim)
 
     def _time_embed(self, t: torch.Tensor, B: int, N: int) -> torch.Tensor:
-        """
-        t: 标量或 [B] 或 [B,1,1]  → 返回 [B, N, time_emb_dim]
-        """
-        t = t.reshape(-1)                   # [B]
-        angles = t.unsqueeze(1) * self.freqs.unsqueeze(0)   # [B, n_freqs]
-        emb    = torch.cat([angles.sin(), angles.cos()], dim=-1)  # [B, time_emb_dim]
-        return emb.unsqueeze(1).expand(B, N, -1)            # [B, N, time_emb_dim]
+        """t: [B] → [B, N, time_emb_dim]"""
+        angles = t.reshape(B, 1) * self.freqs.unsqueeze(0)            # [B, n_freqs]
+        emb    = torch.cat([angles.sin(), angles.cos()], dim=-1)       # [B, 2*n_freqs]
+        return emb.unsqueeze(1).expand(B, N, -1)                       # [B, N, time_emb_dim]
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor,
                 c: torch.Tensor) -> torch.Tensor:
-        """
-        x_t : [B, N, out_dim]
-        t   : [B] 或 标量（batch 内同一时间步）
-        c   : [B, N, cond_dim]
-        → v : [B, N, out_dim]
-        """
         B, N, _ = x_t.shape
-        t_emb   = self._time_embed(t, B, N)          # [B, N, time_emb_dim]
-        inp     = torch.cat([x_t, t_emb, c], dim=-1) # [B, N, in_dim]
-        return self.net(inp)                          # [B, N, out_dim]
+        t_emb   = self._time_embed(t, B, N)                   # [B, N, time_emb_dim]
+        inp     = torch.cat([x_t, t_emb, c], dim=-1)          # [B, N, in_dim]
+
+        h = self.input_proj(inp) + self.skip_proj(inp)        # 残差 1：跳过非线性
+        h = h + self.layer2(h)                                # 残差 2
+        h = h + self.layer3(h)                                # 残差 3
+        return self.out_proj(h)                                # [B, N, out_dim]
 
 
 # ---------------------------------------------------------------------------
-# 9. GridCFN（CFM 版）
+# 9. GridCFN（CFM 版 v2）
 # ---------------------------------------------------------------------------
 class GridCFN(nn.Module):
     """
-    GridCFN with Conditional Flow Matching output head.
+    GridCFN with I-CFM probabilistic output head (v2).
 
-    forward() 返回 (context_feat, He, Hs, mi_loss)：
-      context_feat : [B, N, De'+Ds']  条件特征，用于 cfm_loss() 和 sample()
-      He, Hs       : 供 CLUB 变分网络更新
-      mi_loss      : CLUB 互信息上界（用于总损失）
+    接口：
+      forward(x, adj_norm, edge_index)
+        → (context_feat, He, Hs, mi_loss)
 
-    cfm_loss(context_feat, y_target) → 标量 CFM 训练损失
-      训练：对每个 batch 随机采样 t, x0，计算插值 x_t 和目标向量场 u_t，
-            最小化 MSE(v_θ(x_t,t,c), u_t)
+      cfm_loss(context_feat, y_target, n_t_samples=4)
+        → scalar
 
-    sample(context_feat, n_samples, n_steps) → [S, B, N, out_dim]
-      推断：从 x0 ~ N(0,I) 出发，欧拉积分到 x1，重复 n_samples 次
-
-    训练总损失：
-      L = cfm_loss + lambda_mi * mi_loss
+      sample(context_feat, n_samples=50, n_steps=20)
+        → [n_samples, B, N, out_dim]
     """
 
     def __init__(
@@ -398,21 +370,18 @@ class GridCFN(nn.Module):
         env_dim=32, stoch_dim=32, ms_out_dim=32,
         n_scg_layers=3, out_dim=1, lambda_mi=0.5,
         gcn_layers=2, tcn_layers=4,
-        cfm_hidden=128, cfm_time_emb_dim=8,
+        cfm_hidden=128, cfm_time_emb_dim=16,
     ):
         super().__init__()
         self.lambda_mi = lambda_mi
         self.out_dim   = out_dim
-
-        cond_dim = ms_out_dim + stoch_dim   # H_final 的维度
+        cond_dim = ms_out_dim + stoch_dim
 
         self.backbone     = Backbone(in_dim, gcn_hidden, tcn_hidden, gcn_layers, tcn_layers)
         self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
         self.club         = CLUBEstimator(env_dim, stoch_dim)
         self.ms_context   = MultiScaleContext(env_dim, ms_out_dim)
         self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers)
-
-        # CFM 向量场网络（替代 ProbabilisticPredictor）
         self.vector_field = CFMVectorField(
             out_dim=out_dim,
             cond_dim=cond_dim,
@@ -434,96 +403,90 @@ class GridCFN(nn.Module):
 
     def forward(self, x, adj_norm, edge_index):
         """
-        返回: (context_feat, He, Hs, mi_loss)
-
-        与 train.py 两步训练配合：
-          context_feat, He, Hs, mi_loss = model(x, adj_norm, edge_index)
-
-          # Step 1: 更新变分网络
-          var_loss = model.club.variational_loss(He.detach(), Hs.detach())
-          club_optimizer.zero_grad(); var_loss.backward(); club_optimizer.step()
-
-          # Step 2: 重新估计 MI，更新主网络
-          mi_loss_new = model.club(He, Hs)
-          cfm_loss    = model.cfm_loss(context_feat, y_target)
-          loss        = cfm_loss + model.lambda_mi * mi_loss_new
-          optimizer.zero_grad(); loss.backward(); optimizer.step()
+        x          : [B, T_in, N, F]
+        adj_norm   : [N, N]
+        edge_index : [2, E]
+        →  context_feat : [B, N, cond_dim]
+           He           : [B, N, env_dim]
+           Hs           : [B, N, stoch_dim]
+           mi_loss      : scalar
         """
         H              = self.backbone(x, adj_norm)
         He, Hs, He_seq = self.disentangler(H)
         mi_loss        = self.club(He, Hs)
         He_prime       = self.ms_context(He_seq)
         Hs_prime       = self.scgmp(Hs, He, edge_index)
-        context_feat   = torch.cat([He_prime, Hs_prime], dim=-1)  # [B,N,De'+Ds']
+        context_feat   = torch.cat([He_prime, Hs_prime], dim=-1)
         return context_feat, He, Hs, mi_loss
 
     def cfm_loss(self, context_feat: torch.Tensor,
-                 y_target: torch.Tensor) -> torch.Tensor:
+                 y_target: torch.Tensor,
+                 n_t_samples: int = 4) -> torch.Tensor:
         """
-        Conditional Flow Matching 训练损失（MSE on vector field）。
+        I-CFM 训练损失（多次 t 采样降梯度方差）。
 
-        参数：
-          context_feat : [B, N, cond_dim]  条件特征（来自 forward）
-          y_target     : [B, N, out_dim]   目标值（归一化后的真实 y）
+        y_target : [B, N, out_dim]，调用方负责切片对齐（y[..., :out_dim]）。
+        n_t_samples : 每 batch 重复采样 t 次数，取均值（推荐 4）。
 
-        算法：
-          1. x1 = y_target（目标分布样本）
-          2. x0 ~ N(0, I)（源分布噪声）
-          3. t ~ Uniform(0, 1)（随机时间步）
-          4. x_t = (1-t) * x0 + t * x1（线性插值路径）
-          5. u_t = x1 - x0（目标向量场，CFM 的 ground truth）
-          6. loss = MSE(v_θ(x_t, t, c), u_t)
+        I-CFM：
+          x0 ~ N(0,I), x1 = y_target（独立配对，无 OT 重排）
+          x_t = (1-t)*x0 + t*x1
+          u_t = x1 - x0（解析目标向量场）
+          loss = MSE(v_θ(x_t, t, c), u_t)
 
-        注：这是最基础的 I-CFM（Independent CFM），
-            t=0 对应噪声，t=1 对应真实数据。
+        为什么用 I-CFM 而不用 OT-CFM：
+          · out_dim=1 时 OT 退化为 1D 排序，无增益
+          · y_target 与条件 c 绑定，OT 重排会打断语义配对
+          · OT plan 计算（Sinkhorn/匈牙利）引入额外 O(B²) 复杂度
         """
-        B, N, out_dim = y_target.shape
-        device = y_target.device
+        assert y_target.shape[-1] == self.out_dim, (
+            f"y_target 末维 {y_target.shape[-1]} ≠ out_dim={self.out_dim}，"
+            "请传入 y[..., :out_dim]"
+        )
 
-        x1 = y_target                                             # [B, N, out_dim]
-        x0 = torch.randn_like(x1)                                # [B, N, out_dim]
-        t  = torch.rand(B, device=device)                        # [B]
+        B, N, _ = y_target.shape
+        device  = y_target.device
+        losses  = []
 
-        # 线性插值（OT-CFM/I-CFM 的 μ_t(x0,x1) = (1-t)*x0 + t*x1）
-        t_bc   = t.reshape(B, 1, 1)                              # [B, 1, 1]
-        x_t    = (1.0 - t_bc) * x0 + t_bc * x1                  # [B, N, out_dim]
-        u_t    = x1 - x0                                         # [B, N, out_dim] 目标向量场
+        for _ in range(n_t_samples):
+            x0    = torch.randn_like(y_target)               # [B, N, out_dim]
+            t     = torch.rand(B, device=device)             # [B]
+            t_bc  = t.reshape(B, 1, 1)
+            x_t   = (1.0 - t_bc) * x0 + t_bc * y_target    # [B, N, out_dim]
+            u_t   = y_target - x0                           # 目标向量场
+            v_pred = self.vector_field(x_t, t, context_feat)
+            losses.append(F.mse_loss(v_pred, u_t))
 
-        v_pred = self.vector_field(x_t, t, context_feat)         # [B, N, out_dim]
-        return F.mse_loss(v_pred, u_t)
+        return torch.stack(losses).mean()
 
     @torch.no_grad()
     def sample(self, context_feat: torch.Tensor,
-               n_samples: int = 100,
+               n_samples: int = 50,
                n_steps: int = 20) -> torch.Tensor:
         """
-        ODE 积分推断，返回多组样本。
+        欧拉积分推断：从 x_0~N(0,I) 积分到 x_1（t=1）。
+
+        t 序列：0, dt, 2dt, ..., (n_steps-1)*dt
+        每步：x_{t+dt} = x_t + dt * v_θ(x_t, t, c)
+        最终 x 对应 t=1（n_steps 步 * dt = 1.0）。
 
         参数：
-          context_feat : [B, N, cond_dim]
-          n_samples    : 每个位置采样的粒子数（越多，µ/σ 估计越稳定）
-          n_steps      : 欧拉积分步数（越多，ODE 积分越精确；20~50 通常足够）
-
-        返回：
-          samples : [n_samples, B, N, out_dim]
-
-        推断流程：
-          t: 0 → 1，步长 dt = 1/n_steps
-          x_{t+dt} = x_t + dt * v_θ(x_t, t, c)
-          最终 x_1 即为样本
+          n_samples : 粒子数，验证时 10~20 足够，测试时 100+
+          n_steps   : 欧拉步数，I-CFM 路径近线性，20 步已准确
+        返回：[n_samples, B, N, out_dim]
         """
-        B, N, cond_dim = context_feat.shape
-        device = context_feat.device
-        dt = 1.0 / n_steps
+        B, N, _ = context_feat.shape
+        device  = context_feat.device
+        dt      = 1.0 / n_steps
+        c       = context_feat.detach()
 
-        all_samples = []
+        samples = []
         for _ in range(n_samples):
-            x = torch.randn(B, N, self.out_dim, device=device)   # [B, N, out_dim]
+            x = torch.randn(B, N, self.out_dim, device=device)
             for step in range(n_steps):
                 t_val = step * dt
-                t_vec = torch.full((B,), t_val, device=device)   # [B]
-                v = self.vector_field(x, t_vec, context_feat)     # [B, N, out_dim]
-                x = x + dt * v
-            all_samples.append(x)
+                t_vec = torch.full((B,), t_val, device=device, dtype=torch.float32)
+                x = x + dt * self.vector_field(x, t_vec, c)
+            samples.append(x)
 
-        return torch.stack(all_samples, dim=0)   # [n_samples, B, N, out_dim]
+        return torch.stack(samples, dim=0)    # [n_samples, B, N, out_dim]

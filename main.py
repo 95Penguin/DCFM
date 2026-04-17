@@ -1,7 +1,7 @@
 """
-GridCFN – 主入口（CFM 版）
-===========================
-相比 Gaussian 版，build_model 新增 cfm_hidden / cfm_time_emb_dim 两个参数。
+GridCFN – 主入口（CFM 版 v2）
+================================
+相比 v1，build_model 更新了 cfm_time_emb_dim 默认值（8→16）。
 其余逻辑完全不变。
 
 快速开始：
@@ -25,7 +25,6 @@ from config import Config, get_config
 from model import GridCFN
 from dataset import load_solar_energy, load_electricity, load_weather
 from train import train
-# from plot_results import plot_all  # 如需绘图取消注释
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +48,6 @@ def setup_logger(cfg_train, dataset_name: str = "",
         ch.setFormatter(fmt)
         logger.addHandler(ch)
 
-    # 日志同时写到 logs/（兼容旧习惯）和 result/ 目录
     log_dirs = []
     if cfg_train.log_dir is not None:
         log_dirs.append(cfg_train.log_dir)
@@ -110,7 +108,7 @@ def set_seed(seed: int):
 
 def load_data(cfg: Config):
     d = cfg.data
-    assert d.data_path, "data_path 未设置，请在 config.py 或 --preset 中指定"
+    assert d.data_path, "data_path 未设置"
 
     if d.dataset == "solar":
         return load_solar_energy(
@@ -126,22 +124,26 @@ def load_data(cfg: Config):
             feature_idx=getattr(d, "weather_feature_idx", 0),
         )
     else:
-        raise ValueError(f"未知数据集: '{d.dataset}'，可选: solar, electricity, weather")
+        raise ValueError(f"未知数据集: '{d.dataset}'")
 
 
 def build_model(cfg: Config, in_dim: int = None) -> GridCFN:
     m = cfg.model
-    actual_in_dim = in_dim if in_dim is not None else m.in_dim
     return GridCFN(
-        in_dim=actual_in_dim,    gcn_hidden=m.gcn_hidden,
-        gcn_layers=m.gcn_layers, tcn_hidden=m.tcn_hidden,
-        tcn_layers=m.tcn_layers, env_dim=m.env_dim,
-        stoch_dim=m.stoch_dim,   ms_out_dim=m.ms_out_dim,
+        in_dim=in_dim if in_dim is not None else m.in_dim,
+        gcn_hidden=m.gcn_hidden,
+        gcn_layers=m.gcn_layers,
+        tcn_hidden=m.tcn_hidden,
+        tcn_layers=m.tcn_layers,
+        env_dim=m.env_dim,
+        stoch_dim=m.stoch_dim,
+        ms_out_dim=m.ms_out_dim,
         n_scg_layers=m.n_scg_layers,
-        out_dim=m.out_dim,       lambda_mi=m.lambda_mi,
-        # [CFM 新增] 向量场网络参数
+        out_dim=m.out_dim,
+        lambda_mi=m.lambda_mi,
+        # CFM 向量场参数（兼容旧 config 无此字段的情况）
         cfm_hidden=getattr(m, "cfm_hidden", 128),
-        cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 8),
+        cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 16),
     )
 
 
@@ -150,16 +152,12 @@ def build_model(cfg: Config, in_dim: int = None) -> GridCFN:
 # ---------------------------------------------------------------------------
 
 def main(cfg: Config):
-    # ── 时间戳（整个 run 共享同一个，用于模型命名和结果目录）────────────────
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dataset   = cfg.data.dataset
-
-    # ── result 目录：result/<dataset>/<timestamp>/ ─────────────────────────
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset    = cfg.data.dataset
     result_dir = os.path.join("result", dataset, timestamp)
     os.makedirs(result_dir, exist_ok=True)
 
-    # 模型权重路径（带数据集名和时间戳）
-    model_save_path = os.path.join(result_dir, f"gridcfn_{dataset}_{timestamp}.pt")
+    model_save_path     = os.path.join(result_dir, f"gridcfn_{dataset}_{timestamp}.pt")
     cfg.train.save_path = model_save_path
 
     logger = setup_logger(cfg.train, dataset, timestamp, result_dir)
@@ -172,9 +170,9 @@ def main(cfg: Config):
 
     # 1. 数据加载
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
-    logger.info(f"in_dim     : {in_dim}（数据集实际特征维度，已自动覆盖 config）")
+    logger.info(f"in_dim     : {in_dim}（数据集实际特征维度）")
 
-    # 2. 预计算 adj_norm 和 edge_index
+    # 2. 图结构预计算
     adj_norm   = GridCFN.normalize_adj(adj)
     edge_index = GridCFN.adj_to_edge_index(adj)
     logger.info(f"Graph      : {adj.shape[0]} nodes, {edge_index.shape[1]} edges")
@@ -204,19 +202,15 @@ def main(cfg: Config):
         json.dump(history, f, indent=2, ensure_ascii=False)
     logger.info(f"History 已保存: {history_path}")
 
-    # 6. 生成图表（可选）
-    # plot_all(history, result_dir, dataset)
-
     logger.info(f"训练完成，所有结果保存于: {result_dir}")
     return history, result_dir
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GridCFN Training (CFM)")
+    parser = argparse.ArgumentParser(description="GridCFN Training (CFM v2)")
     parser.add_argument(
         "--preset", type=str, default="solar",
         choices=["solar", "electricity", "weather"],
-        help="预设配置名（在 config.py 中定义）",
     )
     args = parser.parse_args()
     cfg  = get_config(args.preset)
