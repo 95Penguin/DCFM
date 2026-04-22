@@ -1,24 +1,21 @@
 """
-GridCFN Configuration（CFM 版 v3）
+GridCFN Configuration（CFM 版 v4，全量修复）
 
-[v3 改动]
-  · cfm_n_samples 默认从 10 → 50（修复验证 CRPS 噪声大、PICP 低估问题）
-  · cfm_n_samples_test 新增（测试时用更多粒子，默认 200）
-  · Solar patience: 20 → 30（防止在噪声平台上过早停止）
-  · Electricity lambda_mi: 0.5 → 0.1（MI 出现负值说明 0.5 偏强）
-  · 各数据集 lr_decay_patience 微调
+[v4 改动]
+  全局：
+    · build_model 中新增 chunk_size 参数（Weather 传 4096，Solar/Electricity 传 16384）
+      防止 SCGMessagePassingLayer 对大图一次性创建 [B,E,dim] 张量导致 OOM
 
-关于 cfm_n_samples=50 的速度影响：
-  · Solar (137 节点, batch=32): 验证约 30s/epoch，可接受
-  · Electricity (321 节点, batch=32): 验证约 70s/epoch，可接受
-  · Weather (1866 节点, batch=4): 验证约 120s/epoch，如果太慢改回 20
-    （Weather 节点多但 batch 小，并行度低，显存压力也大）
+  Electricity：
+    · lambda_mi: 0.1 → 0.05（CLUB 修复后 MI 不再塌缩，降低权重防止过强正则）
+    · adj_threshold: 0.7 → 0.6（减少边数，降低 SCG-MP 过平滑风险）
+    · warmup_epochs: 5 → 8（延长让主网络先学好表征再引入 CLUB）
 
-使用方法不变：
-  python main.py --preset solar
-  python main.py --preset electricity
-  python main.py --preset weather
+  Solar：基本不变（问题不大）
 
+  Weather：
+    · chunk_size: 4096（N=1866 节点，边数可能达数十万，需要分块处理）
+    · cfm_n_samples: 20（节点多，并行采样显存压力大）
 """
 
 from dataclasses import dataclass, field, asdict
@@ -50,6 +47,7 @@ class ModelConfig:
     lambda_mi:        float = 0.5
     cfm_hidden:       int   = 128
     cfm_time_emb_dim: int   = 16
+    chunk_size:       int   = 16384   # SCGMessagePassingLayer 边分块大小
 
 
 @dataclass
@@ -68,11 +66,10 @@ class TrainConfig:
     log_dir:             Optional[str] = "logs"
     log_to_console:      bool         = True
 
-    # CFM 推断参数（v3 更新）
-    cfm_n_samples:       int = 50    # 验证时采样粒子数（v3: 50，解决 PICP 低估）
-    cfm_n_samples_test:  int = 200   # 测试时采样粒子数（更精确）
-    cfm_n_steps:         int = 20    # ODE 步数
-    cfm_n_t_samples:     int = 4     # 训练时每 batch 采 t 次数
+    cfm_n_samples:       int = 50
+    cfm_n_samples_test:  int = 200
+    cfm_n_steps:         int = 20
+    cfm_n_t_samples:     int = 4
 
 
 @dataclass
@@ -82,7 +79,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def summary(self) -> str:
-        lines = ["=" * 52, "GridCFN Configuration (CFM v3)", "=" * 52]
+        lines = ["=" * 52, "GridCFN Configuration (CFM v4)", "=" * 52]
         for section_name, section in [("Data",  self.data),
                                        ("Model", self.model),
                                        ("Train", self.train)]:
@@ -109,16 +106,18 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.5,              # Solar MI 正常，保持 0.5
+                lambda_mi=0.5,
                 cfm_hidden=128, cfm_time_emb_dim=16,
+                chunk_size=16384,   # Solar E≈34k，不需要分块，16384 等效不分块
             ),
             train=TrainConfig(
                 lr=5e-4, max_epochs=200,
-                patience=30,               # v3: Solar 延长到 30，防止噪声早停
+                patience=30,
                 lr_decay_factor=0.5,
-                lr_decay_patience=15,      # v3: 跟着 patience 调大
-                seed=42, grad_clip=1.0, warmup_epochs=5,
-                cfm_n_samples=50,          # v3: 50 粒子验证
+                lr_decay_patience=15,
+                seed=42, grad_clip=1.0,
+                warmup_epochs=5,
+                cfm_n_samples=50,
                 cfm_n_samples_test=200,
                 cfm_n_steps=20,
                 cfm_n_t_samples=4,
@@ -131,7 +130,7 @@ def get_config(preset: str = "solar") -> Config:
                 dataset="electricity",
                 data_path="./data/electricity.txt",
                 T_in=168, T_out=1,
-                adj_threshold=0.7,
+                adj_threshold=0.6,   # [v4] 0.7 → 0.6，减少边数降低过平滑
                 batch_size=32,
             ),
             model=ModelConfig(
@@ -139,17 +138,17 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.1,             # v3: 从 0.5 降到 0.1
-                                           # 原因：Electricity 的 MI 频繁出现负值，
-                                           # 说明 0.5 过强干扰了 CFM 主损失
+                lambda_mi=0.05,      # [v4] 0.1 → 0.05，CLUB 修复后降低权重
                 cfm_hidden=128, cfm_time_emb_dim=16,
+                chunk_size=16384,    # Electricity E≈20k~34k，不需要分块
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,
-                patience=25,               # v3: 适当延长
+                patience=25,
                 lr_decay_factor=0.5,
                 lr_decay_patience=12,
-                seed=42, grad_clip=1.0, warmup_epochs=5,
+                seed=42, grad_clip=1.0,
+                warmup_epochs=8,     # [v4] 5 → 8，延长 warmup
                 cfm_n_samples=50,
                 cfm_n_samples_test=200,
                 cfm_n_steps=20,
@@ -158,9 +157,6 @@ def get_config(preset: str = "solar") -> Config:
         )
 
     elif preset == "weather":
-        # Weather: 1866 节点，batch=4，显存压力大
-        # 并行采样时 B*S*N = 4*50*1866 = 373200，可能 OOM
-        # 如果 OOM 把 cfm_n_samples 降到 20
         return Config(
             data=DataConfig(
                 dataset="weather",
@@ -176,16 +172,16 @@ def get_config(preset: str = "solar") -> Config:
                 n_scg_layers=3, out_dim=1,
                 lambda_mi=0.5,
                 cfm_hidden=128, cfm_time_emb_dim=16,
+                chunk_size=4096,    # [v4] Weather E可能达数十万，分块处理防 OOM
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,
                 patience=25,
                 lr_decay_factor=0.5,
                 lr_decay_patience=12,
-                seed=42, grad_clip=1.0, warmup_epochs=5,
-                # Weather 节点多，并行采样显存占用大，保守用 20
-                # 如果 OOM 降到 10 并在 model.sample() 里改回串行
-                cfm_n_samples=20,
+                seed=42, grad_clip=1.0,
+                warmup_epochs=5,
+                cfm_n_samples=20,        # Weather 节点多，并行采样显存压力大
                 cfm_n_samples_test=100,
                 cfm_n_steps=20,
                 cfm_n_t_samples=4,

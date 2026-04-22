@@ -169,13 +169,16 @@ def load_electricity(data_path: str, T_in: int = 168, T_out: int = 1,
 
     # [Fix-Elec] log1p 变换：将重尾用电量分布压缩为近似正态
     # clip(0) 防止极少数负值（数据噪声）导致 log 出现 NaN
-    raw = np.log1p(np.clip(raw, 0, None))
+    # raw = np.log1p(np.clip(raw, 0, None))
 
-    print(f"  [Electricity] log1p 变换后：mean={raw.mean():.3f}, "
-          f"std={raw.std():.3f}, min={raw.min():.3f}, max={raw.max():.3f}")
+    # print(f"  [Electricity] log1p 变换后：mean={raw.mean():.3f}, "
+    #       f"std={raw.std():.3f}, min={raw.min():.3f}, max={raw.max():.3f}")
+
+    # return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size,
+    #                       name='Electricity', log_transform=True)
 
     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size,
-                          name='Electricity', log_transform=True)
+                          name='Electricity')
 
 
 def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,

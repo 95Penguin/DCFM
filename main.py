@@ -1,6 +1,6 @@
 """
-GridCFN – 主入口（CFM 版 v3）
-相比 v2 无改动，cfm_n_samples_test 参数通过 getattr 兼容旧 config。
+GridCFN – 主入口（CFM 版 v4）
+[v4] build_model 新增 chunk_size 参数，透传给 SCGMP 防 Weather OOM。
 """
 
 import argparse
@@ -103,6 +103,8 @@ def build_model(cfg, in_dim=None):
         n_scg_layers=m.n_scg_layers, out_dim=m.out_dim, lambda_mi=m.lambda_mi,
         cfm_hidden=getattr(m, "cfm_hidden", 128),
         cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 16),
+        # [v4] chunk_size 透传给 SCGMessagePassingLayer，Weather 用 4096 防 OOM
+        chunk_size=getattr(m, "chunk_size", 16384),
     )
 
 
@@ -155,7 +157,7 @@ def main(cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GridCFN Training (CFM v3)")
+    parser = argparse.ArgumentParser(description="GridCFN Training (CFM v4)")
     parser.add_argument("--preset", type=str, default="solar",
                         choices=["solar", "electricity", "weather"])
     args = parser.parse_args()

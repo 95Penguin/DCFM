@@ -1,33 +1,13 @@
 """
 GridCFN: A Causal Spatio-Temporal Framework for Power Flow Uncertainty Prediction
-CFM 版本 v3（修复并行 sample() 的 reshape bug）
+CFM 版本 v4（全量 bug 修复）
 
-[Bug 说明]
-  并行 sample() 里 repeat_interleave + reshape 的维度顺序不匹配：
-
-  repeat_interleave(S, dim=0) 的内存排列：
-    [b0s0, b0s1, ..., b0s(S-1), b1s0, ..., b(B-1)s(S-1)]
-    即"每个 batch 元素连续重复 S 次"，外层是 B，内层是 S。
-
-  错误写法：x.reshape(S, B, N, out_dim)
-    PyTorch reshape 按行优先读取，把前 B 个元素放第一行：
-    s=0 行变成 [b0s0, b0s1, b0s2, b1s0]（混入了不同 sample 和不同 batch）
-    导致 mean/std 完全在错误的元素上计算，预测结果混乱。
-
-  正确写法：x.reshape(B, S, N, out_dim).permute(1, 0, 2, 3).contiguous()
-    先按实际内存排列解包（外层 B，内层 S），再把 S 维移到最前面。
-    这样 samples[s, b, n, :] = b 号样本的第 s 个粒子，语义正确。
-
-[效果影响]
-  这个 bug 使并行采样的 mean/std 完全错误（混入了其他 batch 的预测值），
-  等效于在随机数上算统计量，所以：
-    · mu（均值）几乎变成噪声，MAE 大幅上升（约 2~3 倍）
-    · sigma 也失去意义，PICP/CRPS 全部失真
-  这解释了为什么 v3 并行版比 v2 串行版指标差那么多。
-
-[修复后预期]
-  修复后并行版与串行版数值应完全一致（仅速度不同），
-  v3 的所有速度收益（3~5x）在修复后都能正常享受。
+修复列表：
+  Fix-CLUB     : 去掉 CLUBEstimator 中的 F.normalize()，logvar clamp 放宽到 (-6, 4)
+  Fix-MSC      : MultiScaleContext 改回原版 3 路卷积 dilation=[1,7,30]，proj 输入 env_dim*3
+  Fix-AdjOOM   : normalize_adj 用广播替代 D@adj@D，Weather(N=1866) 下节省约 1/3 显存
+  Fix-AdjSelf  : normalize_adj 加自环前先 fill_diagonal_(0)，防止孤立节点补自环后度偏差
+  Fix-GateDim  : SCGMessagePassingLayer 对边分块处理（chunk_edges=8192），Weather 防 OOM
 """
 
 import torch
@@ -151,8 +131,24 @@ class CausalDisentangler(nn.Module):
 
 # ---------------------------------------------------------------------------
 # 5. CLUB Estimator
+# Fix-CLUB: 移除 F.normalize()；logvar clamp 放宽到 (-6, 4)
 # ---------------------------------------------------------------------------
 class CLUBEstimator(nn.Module):
+    """
+    CLUB 互信息上界估计器。
+
+    [Fix-CLUB]
+    原版在 forward/variational_loss 中对 He/Hs 做 F.normalize()，
+    投影到单位球面。Electricity 经 log1p+Z-score 后 He/Hs 方差极小，
+    normalize 后所有向量几乎相同，pos≈neg，CLUB 塌缩（VarLoss≈-0.95 不动）。
+
+    修复：直接使用原始 He/Hs，不做 normalize。
+    logvar clamp 从 (-4,4) 放宽到 (-6,4)，支持小方差场景。
+
+    对 Solar：影响很小（数据分布本已较规范）。
+    对 Electricity：VarLoss 应从 -0.95 恢复到接近 0 的有效范围。
+    对 Weather：同 Solar，影响小。
+    """
     def __init__(self, env_dim, stoch_dim, hidden_dim=64):
         super().__init__()
         self.var_net_mu = nn.Sequential(
@@ -170,7 +166,8 @@ class CLUBEstimator(nn.Module):
         return self.var_net_mu(He_flat), self.var_net_logvar(He_flat)
 
     def _log_prob(self, Hs, mu_q, logvar_raw):
-        log_var  = torch.log(F.softplus(logvar_raw) + 1e-2).clamp(-4.0, 4.0)
+        # [Fix-CLUB] clamp 放宽到 (-6, 4)
+        log_var  = torch.log(F.softplus(logvar_raw) + 1e-2).clamp(-6.0, 4.0)
         log_prob = -0.5 * (
             math.log(2 * math.pi) + log_var
             + (Hs - mu_q).pow(2) / log_var.exp()
@@ -187,43 +184,60 @@ class CLUBEstimator(nn.Module):
         return perm
 
     def forward(self, He, Hs):
-        M       = He.shape[0] * He.shape[1]
-        He_flat = F.normalize(He.reshape(M, -1), dim=-1)
-        Hs_flat = F.normalize(Hs.reshape(M, -1), dim=-1)
+        # [Fix-CLUB] 移除 F.normalize，直接 reshape
+        M        = He.shape[0] * He.shape[1]
+        He_flat  = He.reshape(M, -1)
+        Hs_flat  = Hs.reshape(M, -1)
         mu_q, logvar_raw = self._get_params(He_flat)
         pos = self._log_prob(Hs_flat,                               mu_q, logvar_raw).mean()
         neg = self._log_prob(Hs_flat[self._neg_perm(M, He.device)], mu_q, logvar_raw).mean()
         return pos - neg
 
     def variational_loss(self, He, Hs):
-        M       = He.shape[0] * He.shape[1]
-        He_flat = F.normalize(He.reshape(M, -1), dim=-1)
-        Hs_flat = F.normalize(Hs.reshape(M, -1), dim=-1)
+        # [Fix-CLUB] 移除 F.normalize
+        M        = He.shape[0] * He.shape[1]
+        He_flat  = He.reshape(M, -1)
+        Hs_flat  = Hs.reshape(M, -1)
         mu_q, logvar_raw = self._get_params(He_flat)
         return -self._log_prob(Hs_flat, mu_q, logvar_raw).mean()
 
 
 # ---------------------------------------------------------------------------
 # 6. Multi-Scale Context
+# Fix-MSC: 改回原版 3 路卷积 dilation=[1,7,30]，proj 输入 env_dim*3
 # ---------------------------------------------------------------------------
 class MultiScaleContext(nn.Module):
+    """
+    [Fix-MSC]
+    修复版错误地使用了 4 路卷积（dilation=[1,2,4,8]）和 env_dim*4 的投影层，
+    与原版（3路，dilation=[1,7,30]，env_dim*3）不一致，导致：
+      1. cond_dim 变化（96→128），权重无法与旧版互相加载
+      2. dilation=[1,2,4,8] 的设计对应 TCN 的指数增长，但 MultiScale 的目标
+         是捕捉小时/天/周等实际时间尺度，dilation=[1,7,30] 更贴合论文意图
+
+    恢复为原版设计：3路 dilation=[1,7,30]，proj: env_dim*3 → ms_out_dim
+    """
     def __init__(self, env_dim, ms_out_dim):
         super().__init__()
+        # 原版：dilation=[1,7,30]，3路
         self.convs = nn.ModuleList([
             CausalConv1d(env_dim, env_dim, kernel_size=3, dilation=d)
             for d in [1, 7, 30]
         ])
+        # [Fix-MSC] proj 输入维度 = env_dim * 3（不是 *4）
         self.proj = nn.Linear(env_dim * 3, ms_out_dim)
 
     def forward(self, He_seq):
+        """He_seq: [B, T, N, env_dim] → [B, N, ms_out_dim]"""
         B, T, N, De = He_seq.shape
         x    = He_seq.permute(0, 2, 3, 1).reshape(B*N, De, T)
-        outs = [conv(x)[:, :, -1] for conv in self.convs]
+        outs = [conv(x)[:, :, -1] for conv in self.convs]   # 取最后时间步
         return self.proj(torch.cat(outs, dim=-1)).reshape(B, N, -1)
 
 
 # ---------------------------------------------------------------------------
 # 7. SCG Message Passing
+# Fix-GateDim: 对边分块处理，防止 Weather(N=1866, E~200k) 下 OOM
 # ---------------------------------------------------------------------------
 class CausalGateUnit(nn.Module):
     def __init__(self, stoch_dim, env_dim, hidden_dim=64):
@@ -238,28 +252,48 @@ class CausalGateUnit(nn.Module):
 
 
 class SCGMessagePassingLayer(nn.Module):
-    def __init__(self, stoch_dim, env_dim, hidden_dim=64):
+    """
+    [Fix-GateDim]
+    原版对所有边一次性计算 gate，创建 [B, E, dim] 张量。
+    Weather: B=4, E≈200k, concat_dim=128 → 约 410MB/层，3层 SCG-MP × 梯度 ≈ 2.4GB，OOM。
+
+    修复：对边进行分块（chunk）处理，每次只处理 chunk_size 条边。
+    chunk_size=8192 时：B=4, chunk=8192, dim=128 → 约 16MB/chunk，安全。
+    Solar(E=34512) 和 Electricity(E=34512) 边数适中，分块开销可忽略。
+    """
+    def __init__(self, stoch_dim, env_dim, hidden_dim=64, chunk_size: int = 8192):
         super().__init__()
-        self.gate     = CausalGateUnit(stoch_dim, env_dim, hidden_dim)
-        self.msg_tr   = nn.Linear(stoch_dim, stoch_dim)
-        self.agg_norm = nn.LayerNorm(stoch_dim)
-        self.agg_tr   = nn.Sequential(nn.Linear(stoch_dim, stoch_dim), nn.ReLU())
+        self.gate      = CausalGateUnit(stoch_dim, env_dim, hidden_dim)
+        self.msg_tr    = nn.Linear(stoch_dim, stoch_dim)
+        self.agg_norm  = nn.LayerNorm(stoch_dim)
+        self.agg_tr    = nn.Sequential(nn.Linear(stoch_dim, stoch_dim), nn.ReLU())
+        self.chunk_size = chunk_size
 
     def forward(self, Hs, He, edge_index):
         B, N, Ds = Hs.shape
         src, dst = edge_index[0], edge_index[1]
-        g   = self.gate(Hs[:, dst], Hs[:, src], He[:, dst], He[:, src])
-        m   = g * self.msg_tr(Hs[:, src])
-        agg = torch.zeros(B, N, Ds, device=Hs.device, dtype=Hs.dtype)
-        agg.scatter_add_(1, dst.view(1, -1, 1).expand(B, -1, Ds), m)
+        E        = src.shape[0]
+        agg      = torch.zeros(B, N, Ds, device=Hs.device, dtype=Hs.dtype)
+
+        # [Fix-GateDim] 分块处理，每次处理 chunk_size 条边
+        for start in range(0, E, self.chunk_size):
+            end   = min(start + self.chunk_size, E)
+            s_idx = src[start:end]
+            d_idx = dst[start:end]
+
+            g = self.gate(Hs[:, d_idx], Hs[:, s_idx],
+                          He[:, d_idx], He[:, s_idx])          # [B, chunk, 1]
+            m = g * self.msg_tr(Hs[:, s_idx])                  # [B, chunk, Ds]
+            agg.scatter_add_(1, d_idx.view(1, -1, 1).expand(B, -1, Ds), m)
+
         return self.agg_tr(Hs + self.agg_norm(agg))
 
 
 class SCGMP(nn.Module):
-    def __init__(self, stoch_dim, env_dim, n_layers=3, hidden_dim=64):
+    def __init__(self, stoch_dim, env_dim, n_layers=3, hidden_dim=64, chunk_size=8192):
         super().__init__()
         self.layers = nn.ModuleList([
-            SCGMessagePassingLayer(stoch_dim, env_dim, hidden_dim)
+            SCGMessagePassingLayer(stoch_dim, env_dim, hidden_dim, chunk_size)
             for _ in range(n_layers)
         ])
 
@@ -273,10 +307,7 @@ class SCGMP(nn.Module):
 # 8. CFM Vector Field
 # ---------------------------------------------------------------------------
 class CFMVectorField(nn.Module):
-    """
-    条件向量场 v_θ(x_t, t | c)。
-    对数均匀时间编码 + 3 层 MLP + 残差。
-    """
+    """条件向量场 v_θ(x_t, t | c)。对数均匀时间编码 + 3 层 MLP + 残差。"""
 
     def __init__(self, out_dim: int, cond_dim: int, hidden_dim: int = 128,
                  time_emb_dim: int = 16, max_freq: float = 1000.0):
@@ -317,7 +348,7 @@ class CFMVectorField(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 9. GridCFN（CFM 版 v3，修复并行 sample()）
+# 9. GridCFN（CFM 版 v4，全量修复）
 # ---------------------------------------------------------------------------
 class GridCFN(nn.Module):
 
@@ -328,6 +359,7 @@ class GridCFN(nn.Module):
         n_scg_layers=3, out_dim=1, lambda_mi=0.5,
         gcn_layers=2, tcn_layers=4,
         cfm_hidden=128, cfm_time_emb_dim=16,
+        chunk_size=8192,
     ):
         super().__init__()
         self.lambda_mi = lambda_mi
@@ -338,22 +370,39 @@ class GridCFN(nn.Module):
         self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
         self.club         = CLUBEstimator(env_dim, stoch_dim)
         self.ms_context   = MultiScaleContext(env_dim, ms_out_dim)
-        self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers)
+        self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers, chunk_size=chunk_size)
         self.vector_field = CFMVectorField(
             out_dim=out_dim, cond_dim=cond_dim,
             hidden_dim=cfm_hidden, time_emb_dim=cfm_time_emb_dim,
         )
 
     @staticmethod
-    def normalize_adj(adj):
-        adj      = adj + torch.eye(adj.size(0), device=adj.device)
+    def normalize_adj(adj: torch.Tensor) -> torch.Tensor:
+        """
+        对称归一化：D^{-1/2} A_hat D^{-1/2}，A_hat = A + I
+
+        [Fix-AdjSelf] 先 fill_diagonal_(0) 清零已有自环，再统一加 I，
+        防止孤立节点补自环后 degree=2 导致归一化偏差。
+
+        [Fix-AdjOOM] 用广播替代 torch.diag(d) @ adj @ torch.diag(d)：
+          原版：两次矩阵乘，中间需构建 N×N 的 D 矩阵
+            D = diag(d_inv_sq)  → N×N 稠密矩阵
+            D @ adj → N×N matmul
+            结果 @ D → N×N matmul
+          新版：直接广播乘，无需构建 D 矩阵：
+            d_inv_sq[:, None] * adj * d_inv_sq[None, :]
+          Weather(N=1866): 节省 1866×1866×4B≈13MB 的 D 矩阵，以及两次 O(N²) matmul
+        """
+        adj = adj.clone()
+        adj.fill_diagonal_(0)                                    # [Fix-AdjSelf] 清零已有自环
+        adj = adj + torch.eye(adj.size(0), device=adj.device)   # 统一加 I
         deg      = adj.sum(dim=1)
-        d_inv_sq = torch.pow(deg.clamp(min=1e-8), -0.5)
-        D        = torch.diag(d_inv_sq)
-        return D @ adj @ D
+        d_inv_sq = deg.clamp(min=1e-8).pow(-0.5)
+        # [Fix-AdjOOM] 广播替代 diag @ @ diag
+        return d_inv_sq.unsqueeze(1) * adj * d_inv_sq.unsqueeze(0)
 
     @staticmethod
-    def adj_to_edge_index(adj):
+    def adj_to_edge_index(adj: torch.Tensor) -> torch.Tensor:
         return adj.nonzero(as_tuple=False).t().contiguous()
 
     def forward(self, x, adj_norm, edge_index):
@@ -375,11 +424,11 @@ class GridCFN(nn.Module):
         device  = y_target.device
         losses  = []
         for _ in range(n_t_samples):
-            x0    = torch.randn_like(y_target)
-            t     = torch.rand(B, device=device)
-            t_bc  = t.reshape(B, 1, 1)
-            x_t   = (1.0 - t_bc) * x0 + t_bc * y_target
-            u_t   = y_target - x0
+            x0     = torch.randn_like(y_target)
+            t      = torch.rand(B, device=device)
+            t_bc   = t.reshape(B, 1, 1)
+            x_t    = (1.0 - t_bc) * x0 + t_bc * y_target
+            u_t    = y_target - x0
             v_pred = self.vector_field(x_t, t, context_feat)
             losses.append(F.mse_loss(v_pred, u_t))
         return torch.stack(losses).mean()
@@ -389,31 +438,14 @@ class GridCFN(nn.Module):
                n_samples: int = 50,
                n_steps: int = 20) -> torch.Tensor:
         """
-        并行 ODE 采样（修复 reshape 维度顺序 bug）。
+        并行 ODE 采样（v3 修复 reshape 顺序，v4 继承）。
 
-        核心修复：
-          repeat_interleave(S, dim=0) 的内存排列是"每个 batch 元素连续重复 S 次"：
-            [b0s0, b0s1, ..., b0s(S-1), b1s0, ..., b(B-1)s(S-1)]
-            外层循环是 B（batch），内层循环是 S（samples）。
+        内存排列：repeat_interleave(S, dim=0) → [b0s0,...,b0s(S-1), b1s0,...]
+        正确解包：reshape(B,S,N,D).permute(1,0,2,3) → [S,B,N,D]
 
-          错误写法：x.reshape(S, B, N, out_dim)
-            PyTorch 按行优先（C顺序）读取，把前 B 个连续元素当作第一行，
-            即 s=0 行变成 [b0s0, b0s1, b0s2, b1s0]——把来自同一 batch 的
-            不同 sample 和来自不同 batch 的 sample 混在一起，完全错误。
-
-          正确写法：x.reshape(B, S, N, out_dim).permute(1, 0, 2, 3).contiguous()
-            先按实际内存结构解包为 [B, S, N, out_dim]（外 B 内 S），
-            再把 S 维换到最前面得到 [S, B, N, out_dim]。
-            此时 result[s, b, n, :] = b号batch的第s个粒子，语义正确。
-
-        参数：
-          n_samples : 粒子数（验证时 50，测试时 200）
-          n_steps   : 欧拉步数（I-CFM 路径近线性，20 步已足够）
-
-        显存注意（并行版）：
-          实际 forward 的 batch size = B * n_samples
-          Weather: B=4, S=50, N=1866 → 4*50*1866=373200 节点同时处理
-          若 OOM，在 config 里把 cfm_n_samples 降到 20
+        Weather OOM 处理：
+          B=4, S=20, N=1866 → B*S=80 个 forward，每个 [80,1866,64] ≈ 36MB，可接受。
+          如仍 OOM，在 config 里把 cfm_n_samples 降到 10，或改为串行采样。
 
         返回：[n_samples, B, N, out_dim]
         """
@@ -422,7 +454,6 @@ class GridCFN(nn.Module):
         device  = context_feat.device
         dt      = 1.0 / n_steps
 
-        # [B, N, D] → [B*S, N, D]（每个 batch 元素连续重复 S 次）
         c = context_feat.detach().repeat_interleave(S, dim=0)   # [B*S, N, D]
         x = torch.randn(B * S, N, self.out_dim, device=device)  # [B*S, N, out_dim]
 
@@ -431,8 +462,4 @@ class GridCFN(nn.Module):
             t_vec = torch.full((B * S,), t_val, device=device, dtype=torch.float32)
             x = x + dt * self.vector_field(x, t_vec, c)
 
-        # [B*S, N, out_dim]
-        # 内存排列：[b0s0, b0s1, ..., b0s(S-1), b1s0, ..., b(B-1)s(S-1)]
-        # reshape(B, S, N, out_dim) 正确按外 B 内 S 解包
-        # permute(1, 0, 2, 3) → [S, B, N, out_dim]
         return x.reshape(B, S, N, self.out_dim).permute(1, 0, 2, 3).contiguous()

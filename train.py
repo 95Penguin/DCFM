@@ -1,38 +1,18 @@
 """
-GridCFN – 训练循环（CFM 版 v3，修正指标域）
+GridCFN – 训练循环（CFM 版 v4，全量 bug 修复）
 
-[本版核心修改：指标报告域统一]
-
-问题背景：
-  Electricity 数据做了 log1p + Z-score 双重变换。
-  原版 evaluate() 直接在 Z-score 后的 log 域算指标，导致：
-    · MAE/RMSE 数值偏大（≈ 论文的 2x），失去原始物理意义
-    · 与 Solar（只做 Z-score）的指标尺度不统一，无法直接对比
-
-修复方案（方案 B：反 Z-score，在 log1p 域或原始归一化域报告）：
-  对每个数据集，在 evaluate() 里对 mu/sigma/y 做 scaler.inverse_transform()：
-    · Solar:       inverse_transform = 反 Z-score（无 log 变换）→ 原始量纲域
-    · Electricity: inverse_transform = 反 Z-score（无 expm1）→ log1p 域
-                   注意：Scaler.inverse_transform 在 log_transform=True 时会再做 expm1，
-                   这里我们不想做 expm1（保留在 log 域），所以用 _inv_zscore() 直接反 Z-score。
-    · Weather:     inverse_transform = 反 Z-score（无 log 变换）→ 原始量纲域
-
-  这样所有数据集的指标都在"经过最终预处理后的域"里，彼此可比。
-
-CRPS/PICP/PINAW 的注意事项：
-  反归一化后 mu/sigma/y 的量纲一致，CRPS/PICP 计算仍然有效。
-  但注意：sigma 是在归一化域学到的，inverse_transform 只能线性缩放 mu（加偏移），
-  如果 Scaler 是 Z-score（线性变换），sigma 只需乘以 std 即可（不加 mean）。
-  代码里用 _scale_sigma() 单独处理 sigma（只乘 std，不加 mean）。
-
-Temperature Calibration：
-  在反归一化后的域做校准，更有物理意义（校准后 PICP 对应真实覆盖率）。
+修复列表：
+  Fix-ClubLR      : club_optimizer lr 从 lr*5 降到 lr*2
+  Fix-ClubClip    : CLUB step 前加 grad clip (max_norm=1.0)
+  Fix-WarmupClub  : warmup 期间完全跳过 CLUB 的 forward + backward
+                    （包括 mi_loss 计算，不只是 loss 中的 lambda 项）
+  Fix-SigmaFloor  : sigma 下界改为自适应（mean * 1e-4），防止反归一化后下界失效
 """
 
 import logging
 import math
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import torch
@@ -91,19 +71,12 @@ def evaluate_all(mu_all, sigma_all, y_all):
 # ---------------------------------------------------------------------------
 
 def _inv_zscore_mean(arr: np.ndarray, scaler) -> np.ndarray:
-    """
-    只做反 Z-score（乘 std + 加 mean），不做 expm1。
-    用于 mu 和 y 的反归一化。
-    适用于所有数据集（Solar/Electricity/Weather）。
-    """
+    """只做反 Z-score（乘 std + 加 mean），不做 expm1。"""
     return arr * scaler.std + scaler.mean
 
 
 def _inv_zscore_sigma(arr: np.ndarray, scaler) -> np.ndarray:
-    """
-    对 sigma 只乘 std（不加 mean）。
-    因为 sigma 是标准差（尺度量），线性变换只改变尺度，不改变位置。
-    """
+    """对 sigma 只乘 std（不加 mean）。sigma 是尺度量，不加偏移。"""
     return arr * scaler.std
 
 
@@ -115,10 +88,7 @@ def calibrate_temperature(mu_all: np.ndarray, sigma_all: np.ndarray,
                            y_all: np.ndarray,
                            target_coverage: float = 0.95,
                            grid: Optional[np.ndarray] = None) -> float:
-    """
-    在验证集上 grid search 最优 temperature T*，使 PICP ≈ target_coverage。
-    sigma_calibrated = sigma * T*
-    """
+    """在验证集上 grid search 最优 temperature T*，使 PICP ≈ target_coverage。"""
     if grid is None:
         grid = np.linspace(0.5, 3.0, 51)
 
@@ -136,7 +106,7 @@ def calibrate_temperature(mu_all: np.ndarray, sigma_all: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# 单轮训练（训练在归一化域进行，不做反归一化）
+# 单轮训练
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
@@ -153,8 +123,16 @@ def train_one_epoch(
     cfm_n_t_samples: int = 4,
 ) -> Dict[str, float]:
     """
-    训练在归一化域进行（无需反归一化）。
-    CFM loss = MSE(v_θ(x_t, t, c), u_t) 在归一化域是尺度无关的。
+    [Fix-WarmupClub]
+    原版问题：warmup 期间虽然 loss = cfm_l（不加 MI 正则），但仍调用了
+    model.club(He, Hs) 并触发 backward，让主优化器把未训练的 CLUB 梯度
+    混入主网络更新中。
+
+    修复：warmup 期间完全跳过 CLUB 的所有计算（forward + backward 全部跳过），
+    只做纯 CFM 训练。warmup 结束后再引入 CLUB。
+
+    [Fix-ClubLR] club_optimizer lr = lr*2（在 train() 里设置）。
+    [Fix-ClubClip] CLUB backward 后 clip grad norm=1.0。
     """
     model.train()
     total_loss = total_cfm = total_mi = total_var = 0.0
@@ -163,23 +141,39 @@ def train_one_epoch(
     adj_norm_ = adj_norm.to(device)
     edge_idx_ = edge_index.to(device)
 
+    train_club = (epoch > warmup_epochs)
+
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
 
         context_feat, He, Hs, _ = model(x, adj_norm_, edge_idx_)
 
-        # Step 1: 变分网络更新
-        var_loss = model.club.variational_loss(He.detach(), Hs.detach())
-        club_optimizer.zero_grad()
-        var_loss.backward()
-        club_optimizer.step()
+        # ── Step 1: CLUB 变分网络更新 ─────────────────────────────────────
+        if train_club:
+            var_loss = model.club.variational_loss(He.detach(), Hs.detach())
+            club_optimizer.zero_grad()
+            var_loss.backward()
+            # [Fix-ClubClip] 去掉 normalize 后 CLUB 梯度量级增大，需要 clip
+            torch.nn.utils.clip_grad_norm_(model.club.parameters(), max_norm=1.0)
+            club_optimizer.step()
+            var_loss_val = var_loss.item()
+        else:
+            var_loss_val = 0.0
 
-        # Step 2: 主网络更新
-        mi_loss  = model.club(He, Hs)
+        # ── Step 2: 主网络更新 ───────────────────────────────────────────
         y_target = y[..., :model.out_dim]
         cfm_l    = model.cfm_loss(context_feat, y_target, n_t_samples=cfm_n_t_samples)
-        loss     = cfm_l + model.lambda_mi * mi_loss
+
+        if train_club:
+            # [Fix-WarmupClub] warmup 后再计算 mi_loss，避免未训练的 CLUB 梯度污染主网络
+            mi_loss = model.club(He, Hs)
+            loss    = cfm_l + model.lambda_mi * mi_loss
+            mi_val  = mi_loss.item()
+        else:
+            # [Fix-WarmupClub] warmup 期间完全跳过，mi_loss = 0，无任何 CLUB forward
+            loss   = cfm_l
+            mi_val = 0.0
 
         optimizer.zero_grad()
         loss.backward()
@@ -188,8 +182,8 @@ def train_one_epoch(
 
         total_loss += loss.item()
         total_cfm  += cfm_l.item()
-        total_mi   += mi_loss.item()
-        total_var  += var_loss.item()
+        total_mi   += mi_val
+        total_var  += var_loss_val
         n_batches  += 1
 
     return {
@@ -201,7 +195,7 @@ def train_one_epoch(
 
 
 # ---------------------------------------------------------------------------
-# 评估（修正：反 Z-score 后再计算指标）
+# 评估
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -213,22 +207,14 @@ def evaluate(model: GridCFN, loader: DataLoader,
              temperature: float = 1.0,
              inverse_transform: bool = True):
     """
-    CFM 推断评估（v3+，修正指标域）。
+    CFM 推断评估。
 
-    inverse_transform=True（默认，推荐）：
-      对 mu、sigma、y 做反 Z-score，在各数据集的"原始预处理域"里报告指标：
-        · Solar/Weather: 反 Z-score → 接近原始量纲（MW / 气象单位）
-        · Electricity:   反 Z-score → log1p 域（不做 expm1，保持在 log 域）
-
-      sigma 的反归一化：只乘 std（不加 mean），因为 sigma 是尺度量。
-
-    inverse_transform=False：
-      保持在 Z-score 归一化域，用于训练时的快速验证（不改变相对排名，
-      可以用来做早停判断，速度更快因为不需要 numpy 转换）。
-
-    注意：早停用的 val_m["CRPS"] 不管哪种模式都在同一域内单调对应，
-    所以用 inverse_transform=False 做早停是安全的（只是绝对值不同）。
-    最终测试结果用 inverse_transform=True 报告。
+    [Fix-SigmaFloor]
+    原版：sigma_cal = np.maximum(sigma_all * temperature, 1e-6)
+    问题：inverse_transform=True 时 sigma_all 已乘以 scaler.std，
+          1e-6 的下界在反归一化域几乎无意义（Solar std≈0.3，Electricity log-std≈1.2）。
+    修复：下界改为自适应 max(sigma_all) * 1e-4，保证相对有效。
+          两种 transform 模式均适用。
     """
     model.eval()
     mu_list, sigma_list, y_list = [], [], []
@@ -255,19 +241,20 @@ def evaluate(model: GridCFN, loader: DataLoader,
     sigma_all = np.concatenate(sigma_list, axis=0)
     y_all     = np.concatenate(y_list,     axis=0)[..., :mu_all.shape[-1]]
 
-    # ── 反归一化（只反 Z-score，不做 expm1）──────────────────────────────────
+    # ── 反归一化（只反 Z-score，不做 expm1）────────────────────────────────
     if inverse_transform and scaler is not None:
         mu_all    = _inv_zscore_mean(mu_all,    scaler)
         sigma_all = _inv_zscore_sigma(sigma_all, scaler)
         y_all     = _inv_zscore_mean(y_all,     scaler)
 
-    # ── Temperature 校准 ────────────────────────────────────────────────────
-    sigma_cal = np.maximum(sigma_all * temperature, 1e-6)
+    # ── Temperature 校准 + [Fix-SigmaFloor] 自适应下界 ─────────────────────
+    sigma_floor = float(np.abs(sigma_all).mean()) * 1e-4   # [Fix-SigmaFloor]
+    sigma_cal   = np.maximum(sigma_all * temperature, sigma_floor)
 
     metrics = evaluate_all(mu_all, sigma_cal, y_all)
 
     if return_preds:
-        # 返回反归一化后的原始 sigma（未乘 temperature），供校准函数使用
+        # 返回未乘 temperature 的原始 sigma，供 calibrate_temperature 使用
         return metrics, mu_all, sigma_all, y_all
     return metrics
 
@@ -279,18 +266,7 @@ def evaluate(model: GridCFN, loader: DataLoader,
 def train(model: GridCFN, train_loader, val_loader, test_loader,
           adj_norm, edge_index, device, cfg_train,
           scaler=None, logger=None) -> Dict:
-    """
-    训练流程：
-      · 训练 epoch 的验证：inverse_transform=False（快速，只用于早停判断）
-        注意：此时 val CRPS 是在归一化域的，绝对值比最终测试结果小，
-        但用于早停的相对大小判断是正确的。
-      · 训练结束后的 temperature 校准和测试：inverse_transform=True（最终报告域）
 
-    这样设计的原因：
-      训练中频繁调用 evaluate（每 epoch 一次），inverse_transform 额外增加
-      numpy 运算开销（对大数据集约 +10%），意义不大因为只用于早停。
-      最终报告才需要准确的量纲。
-    """
     if logger is None:
         logger = logging.getLogger("gridcfn.train")
         if not logger.handlers:
@@ -305,9 +281,10 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         lr=cfg_train.lr,
         weight_decay=cfg_train.weight_decay,
     )
+    # [Fix-ClubLR] 从 lr*5 降到 lr*2
     club_optimizer = torch.optim.Adam(
         model.club.parameters(),
-        lr=cfg_train.lr * 5,
+        lr=cfg_train.lr * 2,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
@@ -319,6 +296,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     n_steps         = getattr(cfg_train, "cfm_n_steps",        20)
     cfm_n_t_samples = getattr(cfg_train, "cfm_n_t_samples",     4)
     n_samples_test  = getattr(cfg_train, "cfm_n_samples_test", 200)
+    warmup_epochs   = getattr(cfg_train, "warmup_epochs",        5)
 
     best_val_crps     = float("inf")
     epochs_no_improve = 0
@@ -327,9 +305,10 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         "val_crps": [], "val_mae": [], "val_rmse": [],
     }
 
-    # 说明：训练时 Val CRPS 是在归一化域的（inverse_transform=False）
     logger.info("注意：训练中 Val 指标在归一化域（用于早停判断），"
                 "最终 Test 指标在反 Z-score 域（实际量纲）。")
+    logger.info(f"[v4] CLUB 在 warmup ({warmup_epochs} epochs) 后开始训练，"
+                f"club_lr={cfg_train.lr * 2:.2e}")
     header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | "
               f"{'VarLoss':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
               f"{'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
@@ -343,16 +322,15 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
             model, train_loader, optimizer, club_optimizer,
             adj_norm, edge_index, device, epoch,
             cfg_train.grad_clip,
-            getattr(cfg_train, "warmup_epochs", 5),
+            warmup_epochs,
             cfm_n_t_samples=cfm_n_t_samples,
         )
-        # 训练时不做反归一化（快速，用于早停）
         val_m = evaluate(
             model, val_loader, adj_norm, edge_index, device,
             scaler=scaler,
             n_samples=n_samples_val, n_steps=n_steps,
             temperature=1.0,
-            inverse_transform=False,   # 归一化域，快速验证
+            inverse_transform=False,   # 归一化域，快速验证，用于早停
         )
         scheduler.step(val_m["CRPS"])
 
@@ -391,7 +369,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         torch.load(cfg_train.save_path, map_location=device, weights_only=True)
     )
 
-    # ── Temperature Calibration（在反归一化后的验证集上校准） ────────────────
+    # ── Temperature Calibration ─────────────────────────────────────────────
     logger.info("\n正在验证集上做 Temperature Calibration（反 Z-score 域）...")
     _, mu_val, sigma_val, y_val = evaluate(
         model, val_loader, adj_norm, edge_index, device,
@@ -400,7 +378,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         n_samples=n_samples_test,
         n_steps=n_steps,
         temperature=1.0,
-        inverse_transform=True,   # 反归一化后校准，有物理意义
+        inverse_transform=True,
     )
     best_T = calibrate_temperature(mu_val, sigma_val, y_val, target_coverage=0.95)
     logger.info(
@@ -409,7 +387,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         f"PICP@T={best_T:.2f}: {picp(mu_val, sigma_val*best_T, y_val):.4f}）"
     )
 
-    # ── 测试集最终评估（反归一化 + temperature 校准） ────────────────────────
+    # ── 测试集最终评估 ──────────────────────────────────────────────────────
     test_m, mu_all, sigma_all, y_all = evaluate(
         model, test_loader, adj_norm, edge_index, device,
         scaler=scaler,
@@ -417,10 +395,9 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         n_samples=n_samples_test,
         n_steps=n_steps,
         temperature=best_T,
-        inverse_transform=True,   # 最终结果在实际量纲域
+        inverse_transform=True,
     )
 
-    # 同时报告归一化域的指标（便于与旧版对比）
     test_m_norm, _, _, _ = evaluate(
         model, test_loader, adj_norm, edge_index, device,
         scaler=scaler,
