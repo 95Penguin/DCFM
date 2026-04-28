@@ -1,0 +1,63 @@
+2026-04-21 15:07:09 | ====================================================
+GridCFN Configuration (CFM v4)
+====================================================
+
+[Data]
+  dataset                  = solar
+  data_path                = ./data/solar_AL.txt
+  T_in                     = 168
+  T_out                    = 1
+  adj_threshold            = 0.95
+  batch_size               = 32
+
+[Model]
+  in_dim                   = 1
+  gcn_hidden               = 64
+  gcn_layers               = 2
+  tcn_hidden               = 64
+  tcn_layers               = 4
+  env_dim                  = 32
+  stoch_dim                = 32
+  ms_out_dim               = 32
+  n_scg_layers             = 3
+  out_dim                  = 1
+  lambda_mi                = 0.5
+  cfm_hidden               = 128
+  cfm_time_emb_dim         = 16
+  chunk_size               = 16384
+
+[Train]
+  lr                       = 0.0005
+  max_epochs               = 200
+  patience                 = 30
+  lr_decay_factor          = 0.5
+  lr_decay_patience        = 15
+  grad_clip                = 1.0
+  weight_decay             = 1e-05
+  save_path                = result/solar/20260421_150709/gridcfn_solar_20260421_150709.pt
+  seed                     = 42
+  warmup_epochs            = 5
+  gpu_id                   = -1
+  log_dir                  = logs
+  log_to_console           = True
+  cfm_n_samples            = 50
+  cfm_n_samples_test       = 200
+  cfm_n_steps              = 20
+  cfm_n_t_samples          = 4
+====================================================
+2026-04-21 15:07:09 | Device     : GPU 0: NVIDIA GeForce RTX 3090 (23.6 GB)
+2026-04-21 15:07:09 | Result dir : result/solar/20260421_150709
+2026-04-21 15:07:10 | in_dim     : 1
+2026-04-21 15:07:10 | Graph      : 137 nodes, 2896 edges
+2026-04-21 15:07:10 | Parameters : 235,430
+
+2026-04-21 15:07:11 | 注意：训练中 Val 指标在归一化域（用于早停判断），最终 Test 指标在反 Z-score 域（实际量纲）。
+2026-04-21 15:07:11 | [v4] CLUB 在 warmup (5 epochs) 后开始训练，club_lr=1.00e-03
+2026-04-21 15:07:11 |  Epoch |     Loss |      CFM |       MI |   VarLoss |  Val MAE |  Val RMSE |  Val CRPS |       LR |   Time
+2026-04-21 15:07:11 | ----------------------------------------------------------------------------------------------------------
+2026-04-21 15:10:31 |      1 |   0.4041 |   0.4041 |   0.0000 |    0.0000 |   0.1168 |    0.2861 |    0.0880 | 5.00e-04 | 199.8s
+2026-04-21 15:13:50 |      2 |   0.2723 |   0.2723 |   0.0000 |    0.0000 |   0.1061 |    0.2745 |    0.0764 | 5.00e-04 | 199.6s
+2026-04-21 15:17:11 |      3 |   0.2396 |   0.2396 |   0.0000 |    0.0000 |   0.1090 |    0.2727 |    0.0779 | 5.00e-04 | 200.3s
+2026-04-21 15:20:31 |      4 |   0.2257 |   0.2257 |   0.0000 |    0.0000 |   0.0897 |    0.2341 |    0.0660 | 5.00e-04 | 200.5s
+2026-04-21 15:23:52 |      5 |   0.2115 |   0.2115 |   0.0000 |    0.0000 |   0.0855 |    0.2303 |    0.0632 | 5.00e-04 | 200.6s
+2026-04-21 15:27:16 |      6 |  -3.3582 |   0.3907 |  -7.4978 |   23.1941 |   0.1216 |    0.3102 |    0.0930 | 5.00e-04 | 204.0s

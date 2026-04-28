@@ -168,8 +168,18 @@ def train_one_epoch(
         if train_club:
             # [Fix-WarmupClub] warmup 后再计算 mi_loss，避免未训练的 CLUB 梯度污染主网络
             mi_loss = model.club(He, Hs)
-            loss    = cfm_l + model.lambda_mi * mi_loss
-            mi_val  = mi_loss.item()
+
+            # [Fix-MIClamp] MI 理论上 >= 0，但 CLUB 是上界估计，偶尔可为小负数。
+            # 若 mi_loss < -1，说明变分网络本次估计严重失效（过拟合），
+            # 跳过 MI 项，只用 cfm_l 更新主网络，避免极端负梯度冲垮表征。
+            if mi_loss.item() < -1.0:
+                loss   = cfm_l
+                mi_val = mi_loss.item()   # 仍记录用于监控，但不加入 loss
+            else:
+                # clamp 到 [-0.5, 正无穷]，允许小幅负值但阻断极端崩溃
+                mi_loss_clamped = mi_loss.clamp(min=-0.5)
+                loss   = cfm_l + model.lambda_mi * mi_loss_clamped
+                mi_val = mi_loss.item()
         else:
             # [Fix-WarmupClub] warmup 期间完全跳过，mi_loss = 0，无任何 CLUB forward
             loss   = cfm_l
@@ -281,10 +291,10 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         lr=cfg_train.lr,
         weight_decay=cfg_train.weight_decay,
     )
-    # [Fix-ClubLR] 从 lr*5 降到 lr*2
+    # [Fix-ClubLR2] 进一步从 lr*2 降到 lr*0.5，防止变分网络过拟合崩溃
     club_optimizer = torch.optim.Adam(
         model.club.parameters(),
-        lr=cfg_train.lr * 2,
+        lr=cfg_train.lr * 0.5,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
@@ -307,8 +317,8 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
 
     logger.info("注意：训练中 Val 指标在归一化域（用于早停判断），"
                 "最终 Test 指标在反 Z-score 域（实际量纲）。")
-    logger.info(f"[v4] CLUB 在 warmup ({warmup_epochs} epochs) 后开始训练，"
-                f"club_lr={cfg_train.lr * 2:.2e}")
+    logger.info(f"[v5-fix] CLUB 在 warmup ({warmup_epochs} epochs) 后开始训练，"
+                f"club_lr={cfg_train.lr * 0.5:.2e}，MI clamp 保护已启用")
     header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | "
               f"{'VarLoss':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
               f"{'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
