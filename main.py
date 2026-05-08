@@ -105,6 +105,8 @@ def build_model(cfg, in_dim=None):
         cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 16),
         # [v4] chunk_size 透传给 SCGMessagePassingLayer，Weather 用 4096 防 OOM
         chunk_size=getattr(m, "chunk_size", 16384),
+        # [v6-Dilation] ms_dilations 按数据集分辨率配置
+        ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
     )
 
 

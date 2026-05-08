@@ -48,6 +48,11 @@ class ModelConfig:
     cfm_hidden:       int   = 128
     cfm_time_emb_dim: int   = 16
     chunk_size:       int   = 16384   # SCGMessagePassingLayer 边分块大小
+    # [v6-Dilation] MultiScaleContext dilation，按数据集分辨率配置物理时间尺度
+    # Solar  (10min): [1, 144, 1008] → 10min / 日(24h=144步) / 周(168h=1008步)
+    # Elec/Weather(1h): [1, 24, 168] → 1h / 日(24h) / 周(168h)
+    # 默认 [1, 7, 30] 向后兼容（若不需要按分辨率区分）
+    ms_dilations:     tuple = (1, 7, 30)
 
 
 @dataclass
@@ -70,6 +75,8 @@ class TrainConfig:
     cfm_n_samples_test:  int = 200
     cfm_n_steps:         int = 20
     cfm_n_t_samples:     int = 4
+    cfm_sigma_min:       float = 0.01   # OT-CFM sigma_min，控制采样 spread
+    cfm_x0_scale:        float = 1.0    # 采样初始噪声幅值缩放，>1 补偿 spread 欠估计
 
 
 @dataclass
@@ -109,6 +116,8 @@ def get_config(preset: str = "solar") -> Config:
                 lambda_mi=0.5,
                 cfm_hidden=128, cfm_time_emb_dim=16,
                 chunk_size=16384,   # Solar E≈34k，不需要分块，16384 等效不分块
+                # [v6-Dilation] Solar 10min分辨率：日周期=144步，周周期=1008步
+                ms_dilations=(1, 24, 84),
             ),
             train=TrainConfig(
                 lr=5e-4, max_epochs=200,
@@ -141,6 +150,8 @@ def get_config(preset: str = "solar") -> Config:
                 lambda_mi=0.05,      # [v4] 0.1 → 0.05，CLUB 修复后降低权重
                 cfm_hidden=128, cfm_time_emb_dim=16,
                 chunk_size=16384,    # Electricity E≈20k~34k，不需要分块
+                # [v6-Dilation] Electricity 1h分辨率：日周期=24步，周周期=168步
+                ms_dilations=(1, 12, 84),
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,
@@ -162,8 +173,10 @@ def get_config(preset: str = "solar") -> Config:
                 dataset="weather",
                 data_path="./data/weather2k.npy",
                 T_in=168, T_out=1,
-                adj_threshold=0.8,
-                batch_size=4,
+                # adj_threshold=0.8,
+                adj_threshold=0.95,
+                # batch_size=4,
+                batch_size=1,
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -172,7 +185,10 @@ def get_config(preset: str = "solar") -> Config:
                 n_scg_layers=3, out_dim=1,
                 lambda_mi=0.5,
                 cfm_hidden=128, cfm_time_emb_dim=16,
-                chunk_size=4096,    # [v4] Weather E可能达数十万，分块处理防 OOM
+                # chunk_size=4096,    # [v4] Weather E可能达数十万，分块处理防 OOM
+                chunk_size=1024, 
+                # [v6-Dilation] Weather 1h分辨率：日周期=24步，周周期=168步
+                ms_dilations=(1, 12, 84),
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,

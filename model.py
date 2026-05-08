@@ -216,16 +216,21 @@ class MultiScaleContext(nn.Module):
          是捕捉小时/天/周等实际时间尺度，dilation=[1,7,30] 更贴合论文意图
 
     恢复为原版设计：3路 dilation=[1,7,30]，proj: env_dim*3 → ms_out_dim
+
+    [v6-Dilation] 支持可配置 dilations，不同数据集分辨率对应不同的时间尺度：
+      - Solar (10min):  → 10min / 日(1440min) / 周(10080min)
+      - Electricity/Weather (1h):  → 1h / 日(24h) / 周(168h)
+    默认保留原版 [1, 7, 30] 以向后兼容。
     """
-    def __init__(self, env_dim, ms_out_dim):
+    def __init__(self, env_dim, ms_out_dim, dilations=(1, 7, 30)):
         super().__init__()
-        # 原版：dilation=[1,7,30]，3路
+        self.dilations = list(dilations)
         self.convs = nn.ModuleList([
             CausalConv1d(env_dim, env_dim, kernel_size=3, dilation=d)
-            for d in [1, 7, 30]
+            for d in self.dilations
         ])
-        # [Fix-MSC] proj 输入维度 = env_dim * 3（不是 *4）
-        self.proj = nn.Linear(env_dim * 3, ms_out_dim)
+        # proj 输入维度 = env_dim * n_scales
+        self.proj = nn.Linear(env_dim * len(self.dilations), ms_out_dim)
 
     def forward(self, He_seq):
         """He_seq: [B, T, N, env_dim] → [B, N, ms_out_dim]"""
@@ -304,27 +309,38 @@ class SCGMP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 8. CFM Vector Field（v5: AdaLN + 零初始化，其余与 v4 完全相同）
+# 8. CFM Vector Field（v6: 双流 AdaLN，He→shift，Hs→scale）
 # ---------------------------------------------------------------------------
 class CFMVectorField(nn.Module):
     """
-    条件向量场 v_θ(x_t, t | c)。
+    条件向量场 v_θ(x_t, t | He_prime, Hs_prime)。
 
-    v4 原版问题：
-      cat([x_t, t_emb, c]) 后做 LayerNorm，会把条件 c 的幅值归一化掉，
-      导致向量场对条件不敏感，采样分布主要由噪声决定，sigma 偏小。
+    v5 问题：
+      He_prime（环境背景）和 Hs_prime（内生随机）无差别拼接为 c，
+      再共同投影为 scale/shift，CFM 无法区分"分布中心"和"分布宽度"
+      两类信号，Hs 的随机性信息容易被 He 的确定性信号淹没。
 
-    v5 改动（仅替换条件注入方式，其余结构不变）：
-      [AdaLN] t_emb + c → cond_proj → 生成每个残差块的 scale/shift 参数，
-              直接调制每层 LayerNorm 后的激活，条件信号不被归一化削弱。
-      [ZeroInit] out_proj 零初始化，训练初期向量场输出接近 0，避免早期梯度爆炸。
+    v6 改动（双流 AdaLN）：
+      [DualStream]
+        · He_prime → env_proj   → (env_shift)        控制分布中心（shift）
+        · Hs_prime → stoch_proj → (stoch_scale_extra) 控制分布宽度（scale）
+        · t_emb    → time_proj  → 基础 (scale, shift)（时间步信号）
+      融合方式（每个残差块）：
+        scale = 1 + time_s + stoch_scale_extra   # Hs 决定"有多宽"
+        shift =     time_b + env_shift            # He 决定"中心在哪"
+      物理含义：
+        · 环境因素告诉模型"预测分布的中心在哪"（shift）
+        · 内生随机因素告诉模型"分布有多宽"（额外 scale 扰动）
+        · 二者在生成过程中扮演不同角色，对应论文核心贡献叙事
 
-    参数量变化：v4 约 66k → v5 约 115k（cond_proj 多了 hidden*6 的输出层），
-    整体模型参数从 235k 增至约 284k，可接受。
+    接口变化：
+      v5: forward(x_t, t, c)              c = cat([He_prime, Hs_prime])
+      v6: forward(x_t, t, He_prime, Hs_prime)  两流分开传入
     """
 
-    def __init__(self, out_dim: int, cond_dim: int, hidden_dim: int = 128,
-                 time_emb_dim: int = 16, max_freq: float = 1000.0):
+    def __init__(self, out_dim: int, env_dim: int, stoch_dim: int,
+                 hidden_dim: int = 128, time_emb_dim: int = 16,
+                 max_freq: float = 1000.0):
         super().__init__()
         self.out_dim = out_dim
         n_freqs = time_emb_dim // 2
@@ -335,18 +351,35 @@ class CFMVectorField(nn.Module):
         ) * math.pi
         self.register_buffer("freqs", freqs)
 
-        # [AdaLN] 条件投影：(t_emb, c) → 3个残差块的 scale+shift，共 hidden*6
-        self.cond_proj = nn.Sequential(
-            nn.LayerNorm(time_emb_dim + cond_dim),
-            nn.Linear(time_emb_dim + cond_dim, hidden_dim),
+        # 时间嵌入 → 每个残差块的基础 (scale, shift)，共 hidden*6
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_emb_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim * 6),
         )
 
-        # x_t 单独投影（不与时间/条件拼接，避免 LayerNorm 稀释条件信号）
+        # [DualStream] He 流：环境背景 → shift（控制分布中心）
+        # 输出 hidden*3：每个残差块一个 env_shift
+        self.env_proj = nn.Sequential(
+            nn.LayerNorm(env_dim),
+            nn.Linear(env_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim * 3),   # b1_env, b2_env, b3_env
+        )
+
+        # [DualStream] Hs 流：内生随机 → extra scale（控制分布宽度）
+        # 输出 hidden*3：每个残差块一个额外 scale
+        self.stoch_proj = nn.Sequential(
+            nn.LayerNorm(stoch_dim),
+            nn.Linear(stoch_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim * 3),   # s1_st, s2_st, s3_st
+        )
+
+        # x_t 单独投影
         self.input_proj = nn.Linear(out_dim, hidden_dim)
 
-        # 3 个残差块，AdaLN 在外部施加
+        # 3 个残差块
         self.layer1 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
         self.layer2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
         self.layer3 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
@@ -362,35 +395,54 @@ class CFMVectorField(nn.Module):
         emb    = torch.cat([angles.sin(), angles.cos()], dim=-1)
         return emb.unsqueeze(1).expand(B, N, -1)
 
-    def forward(self, x_t, t, c):
+    def forward(self, x_t, t, He_prime, Hs_prime):
+        """
+        x_t      : [B, N, out_dim]
+        t        : [B]
+        He_prime : [B, N, env_dim]    （来自 MultiScaleContext，控制分布中心）
+        Hs_prime : [B, N, stoch_dim]  （来自 SCGMP，控制分布宽度）
+        """
         B, N, _ = x_t.shape
 
-        # 生成所有层的 AdaLN 参数
+        # ── 时间嵌入 → 6份基础 AdaLN 参数 ─────────────────────────────────
         t_emb = self._time_embed(t, B, N)                        # [B, N, time_emb_dim]
-        cond  = torch.cat([t_emb, c], dim=-1)                    # [B, N, time_emb_dim+cond_dim]
-        # chunk 成 6 份：s1,b1,s2,b2,s3,b3
-        s1, b1, s2, b2, s3, b3 = self.cond_proj(cond).chunk(6, dim=-1)
+        t_s1, t_b1, t_s2, t_b2, t_s3, t_b3 = \
+            self.time_proj(t_emb).chunk(6, dim=-1)               # 各 [B, N, hidden]
 
-        # x_t 投影
-        h = self.input_proj(x_t)                                 # [B, N, hidden_dim]
+        # ── He 流：环境背景 → shift（分布中心）─────────────────────────────
+        b1_env, b2_env, b3_env = \
+            self.env_proj(He_prime).chunk(3, dim=-1)             # 各 [B, N, hidden]
 
-        # 残差块 1
+        # ── Hs 流：内生随机 → extra scale（分布宽度）──────────────────────
+        s1_st, s2_st, s3_st = \
+            self.stoch_proj(Hs_prime).chunk(3, dim=-1)           # 各 [B, N, hidden]
+
+        # ── x_t 投影 ─────────────────────────────────────────────────────
+        h = self.input_proj(x_t)                                 # [B, N, hidden]
+
+        # ── 残差块 1：Hs决定宽度，He决定中心 ─────────────────────────────
         h_norm = F.layer_norm(h, [h.shape[-1]])
-        h = h + self.layer1(h_norm * (1.0 + s1) + b1)
+        scale1 = 1.0 + t_s1 + s1_st   # 时间基础scale + Hs额外scale
+        shift1 = t_b1 + b1_env         # 时间基础shift + He环境shift
+        h = h + self.layer1(h_norm * scale1 + shift1)
 
-        # 残差块 2
+        # ── 残差块 2 ─────────────────────────────────────────────────────
         h_norm = F.layer_norm(h, [h.shape[-1]])
-        h = h + self.layer2(h_norm * (1.0 + s2) + b2)
+        scale2 = 1.0 + t_s2 + s2_st
+        shift2 = t_b2 + b2_env
+        h = h + self.layer2(h_norm * scale2 + shift2)
 
-        # 残差块 3
+        # ── 残差块 3 ─────────────────────────────────────────────────────
         h_norm = F.layer_norm(h, [h.shape[-1]])
-        h = h + self.layer3(h_norm * (1.0 + s3) + b3)
+        scale3 = 1.0 + t_s3 + s3_st
+        shift3 = t_b3 + b3_env
+        h = h + self.layer3(h_norm * scale3 + shift3)
 
-        return self.out_proj(h)                                   # [B, N, out_dim]
+        return self.out_proj(h)                                  # [B, N, out_dim]
 
 
 # ---------------------------------------------------------------------------
-# 9. GridCFN（CFM 版 v4，全量修复）
+# 9. GridCFN（CFM 版 v6，双流条件注入 + 可配置 dilation）
 # ---------------------------------------------------------------------------
 class GridCFN(nn.Module):
 
@@ -402,19 +454,23 @@ class GridCFN(nn.Module):
         gcn_layers=2, tcn_layers=4,
         cfm_hidden=128, cfm_time_emb_dim=16,
         chunk_size=8192,
+        ms_dilations=(1, 7, 30),   # [v6-Dilation] 可按数据集分辨率配置
     ):
         super().__init__()
         self.lambda_mi = lambda_mi
         self.out_dim   = out_dim
-        cond_dim = ms_out_dim + stoch_dim
+        self.env_dim   = env_dim    # [v6-DualStream] 保留供 sample/cfm_loss 传参
+        self.stoch_dim = stoch_dim
 
         self.backbone     = Backbone(in_dim, gcn_hidden, tcn_hidden, gcn_layers, tcn_layers)
         self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
         self.club         = CLUBEstimator(env_dim, stoch_dim)
-        self.ms_context   = MultiScaleContext(env_dim, ms_out_dim)
+        # [v6-Dilation] 透传 ms_dilations，支持各数据集的物理时间尺度
+        self.ms_context   = MultiScaleContext(env_dim, ms_out_dim, dilations=ms_dilations)
         self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers, chunk_size=chunk_size)
+        # [v6-DualStream] He_prime 和 Hs_prime 分开传入，不再拼接为 cond_dim
         self.vector_field = CFMVectorField(
-            out_dim=out_dim, cond_dim=cond_dim,
+            out_dim=out_dim, env_dim=ms_out_dim, stoch_dim=stoch_dim,
             hidden_dim=cfm_hidden, time_emb_dim=cfm_time_emb_dim,
         )
 
@@ -451,14 +507,33 @@ class GridCFN(nn.Module):
         H              = self.backbone(x, adj_norm)
         He, Hs, He_seq = self.disentangler(H)
         mi_loss        = self.club(He, Hs)
-        He_prime       = self.ms_context(He_seq)
-        Hs_prime       = self.scgmp(Hs, He, edge_index)
-        context_feat   = torch.cat([He_prime, Hs_prime], dim=-1)
-        return context_feat, He, Hs, mi_loss
+        He_prime       = self.ms_context(He_seq)           # [B, N, ms_out_dim]
+        Hs_prime       = self.scgmp(Hs, He, edge_index)   # [B, N, stoch_dim]
+        # [v6-DualStream] 返回分开的 He_prime 和 Hs_prime，供 cfm_loss/sample 双流传入
+        return He_prime, Hs_prime, He, Hs, mi_loss
 
-    def cfm_loss(self, context_feat: torch.Tensor,
+    def cfm_loss(self, He_prime: torch.Tensor, Hs_prime: torch.Tensor,
                  y_target: torch.Tensor,
-                 n_t_samples: int = 4) -> torch.Tensor:
+                 n_t_samples: int = 4,
+                 sigma_min: float = 0.01) -> torch.Tensor:
+        """
+        [Fix-Sigma] 使用 sigma_min 缩放的 OT-CFM 路径，替代原始线性插值。
+
+        原版问题：
+          x_t = (1-t)*x0 + t*y，u_t = y - x0
+          在 t→0 时 x_t 完全由 x0 决定，在 t→1 时完全由 y 决定。
+          向量场目标幅值 = ||y - x0||，在重尾数据（Electricity）下幅值极大，
+          模型学到的向量场偏向均值，采样粒子 spread 系统性偏小，PICP 严重不足。
+
+        修复（OT-CFM with sigma_min，Flow Matching 论文标准做法）：
+          x_t = (1 - (1 - sigma_min)*t)*x0 + t*y
+          u_t = y - (1 - sigma_min)*x0
+          sigma_min > 0 保证 t=1 时 x_1 = sigma_min*x0 + y ≠ y，
+          条件分布不退化为 delta，采样自然保留 spread。
+          sigma_min=0.01 是标准推荐值（Flow Matching 原论文 §3.3）。
+
+        [v6-DualStream] He_prime 和 Hs_prime 分开传入向量场，不再拼接。
+        """
         assert y_target.shape[-1] == self.out_dim, (
             f"y_target 末维 {y_target.shape[-1]} ≠ out_dim={self.out_dim}"
         )
@@ -466,42 +541,53 @@ class GridCFN(nn.Module):
         device  = y_target.device
         losses  = []
         for _ in range(n_t_samples):
-            x0     = torch.randn_like(y_target)
-            t      = torch.rand(B, device=device)
-            t_bc   = t.reshape(B, 1, 1)
-            x_t    = (1.0 - t_bc) * x0 + t_bc * y_target
-            u_t    = y_target - x0
-            v_pred = self.vector_field(x_t, t, context_feat)
+            x0    = torch.randn_like(y_target)
+            t     = torch.rand(B, device=device)
+            t_bc  = t.reshape(B, 1, 1)
+            # [Fix-Sigma] OT-CFM 路径
+            x_t   = (1.0 - (1.0 - sigma_min) * t_bc) * x0 + t_bc * y_target
+            u_t   = y_target - (1.0 - sigma_min) * x0
+            # [v6-DualStream] 双流传入
+            v_pred = self.vector_field(x_t, t, He_prime, Hs_prime)
             losses.append(F.mse_loss(v_pred, u_t))
         return torch.stack(losses).mean()
 
     @torch.no_grad()
-    def sample(self, context_feat: torch.Tensor,
+    def sample(self, He_prime: torch.Tensor, Hs_prime: torch.Tensor,
                n_samples: int = 50,
-               n_steps: int = 20) -> torch.Tensor:
+               n_steps: int = 20,
+               sigma_min: float = 0.01,
+               x0_scale: float = 1.0) -> torch.Tensor:
         """
-        并行 ODE 采样（v3 修复 reshape 顺序，v4 继承）。
+        并行 ODE 采样（v6：双流条件 + OT-CFM sigma_min 对齐）。
 
-        内存排列：repeat_interleave(S, dim=0) → [b0s0,...,b0s(S-1), b1s0,...]
-        正确解包：reshape(B,S,N,D).permute(1,0,2,3) → [S,B,N,D]
+        [Fix-Sigma] 采样时与训练路径保持一致：
+          - 初始噪声 x0 乘以 x0_scale（默认1.0，可在 config 里调大补偿 spread）
+          - Euler 积分步长不变
 
-        Weather OOM 处理：
-          B=4, S=20, N=1866 → B*S=80 个 forward，每个 [80,1866,64] ≈ 36MB，可接受。
-          如仍 OOM，在 config 里把 cfm_n_samples 降到 10，或改为串行采样。
+        [v6-DualStream] He_prime 和 Hs_prime 分开 repeat_interleave 后传入向量场。
+
+        x0_scale 调参建议：
+          - 如果 PICP 仍然偏低（< 0.90），把 x0_scale 从 1.0 逐步升到 1.5
 
         返回：[n_samples, B, N, out_dim]
         """
-        B, N, _ = context_feat.shape
+        B, N, _ = He_prime.shape
         S       = n_samples
-        device  = context_feat.device
+        device  = He_prime.device
         dt      = 1.0 / n_steps
 
-        c = context_feat.detach().repeat_interleave(S, dim=0)   # [B*S, N, D]
-        x = torch.randn(B * S, N, self.out_dim, device=device)  # [B*S, N, out_dim]
+        # [v6-DualStream] 两路条件分别扩展 S 倍
+        he = He_prime.detach().repeat_interleave(S, dim=0)     # [B*S, N, ms_out_dim]
+        hs = Hs_prime.detach().repeat_interleave(S, dim=0)     # [B*S, N, stoch_dim]
+
+        # [Fix-Sigma] x0_scale 控制初始噪声幅值，补偿 spread 欠估计
+        x = torch.randn(B * S, N, self.out_dim, device=device) * x0_scale
 
         for step in range(n_steps):
             t_val = step * dt
             t_vec = torch.full((B * S,), t_val, device=device, dtype=torch.float32)
-            x = x + dt * self.vector_field(x, t_vec, c)
+            # [v6-DualStream] 双流传入
+            x = x + dt * self.vector_field(x, t_vec, he, hs)
 
         return x.reshape(B, S, N, self.out_dim).permute(1, 0, 2, 3).contiguous()
