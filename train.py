@@ -1,12 +1,12 @@
 """
-GridCFN – 训练循环（CFM 版 v4，全量 bug 修复）
+GridCFN – 训练循环
 
-修复列表：
-  Fix-ClubLR      : club_optimizer lr 从 lr*5 降到 lr*2
-  Fix-ClubClip    : CLUB step 前加 grad clip (max_norm=1.0)
-  Fix-WarmupClub  : warmup 期间完全跳过 CLUB 的 forward + backward
-                    （包括 mi_loss 计算，不只是 loss 中的 lambda 项）
-  Fix-SigmaFloor  : sigma 下界改为自适应（mean * 1e-4），防止反归一化后下界失效
+训练策略：
+  - warmup 期间完全跳过 CLUB（包括 forward），让主网络先稳定
+  - warmup 结束后用独立 club_optimizer 更新变分网络
+  - MI loss clamp(-1, +∞)：CLUB 是上界估计，偶发小负值属正常，
+    但 < -1 通常表示变分网络本次估计严重失效，此时跳过 MI 项
+  - Val 在归一化域评估（用于早停判断）；Test 在反归一化域报告
 """
 
 import logging
@@ -35,72 +35,47 @@ def rmse(pred, true):
 
 def crps_empirical(samples: np.ndarray, y: np.ndarray) -> float:
     """
-    [Fix-CRPS] 经验 CRPS，直接用 CFM 采样粒子计算，不依赖高斯假设。
+    经验 CRPS（Gneiting & Raftery 2007）：
+      CRPS(F, y) = E|X - y| - 0.5 * E|X - X'|，X, X' iid ~ F
 
-    经验 CRPS 公式（Gneiting & Raftery 2007）：
-      CRPS(F, y) = E|X - y| - 0.5 * E|X - X'|
-      其中 X, X' iid ~ F（用 samples 近似），且 X ≠ X'（不放回）
+    使用不放回置换近似 E|X - X'|，避免自配对（|X-X|=0）压低 spread 导致 CRPS 虚高。
 
-    [Fix-Spread] 原版用有放回随机抽对，idx1==idx2 时 |X-X'|=0，
-    人为压低 spread，导致 CRPS 虚高。
-    修复：用不放回随机排列保证每对 i≠j，消除自配对偏差。
-
-    参数：
-      samples : [S, ...] S 个粒子
-      y       : [...] 真实值，与 samples[i] shape 相同
+    samples : [S, ...] S 个粒子
+    y       : [...] 真实值
     """
     S        = samples.shape[0]
-    mae_term = np.abs(samples - y[None]).mean(axis=0)   # E|X - y|
+    mae_term = np.abs(samples - y[None]).mean(axis=0)
 
-    # [Fix-Spread] 不放回配对：对 samples 做随机置换，与原始对齐后取差
-    # 每次 shuffle 得到一组 (samples[i], samples[perm[i]]) 且 i≠perm[i]（大概率）
-    # 重复 n_pairs_per_S 次取均值，近似 E|X - X'|
-    n_rep   = min(10, S - 1)   # 重复次数，S 小时少重复
+    n_rep   = min(10, S - 1)
     spreads = []
-    rng     = np.random.default_rng(seed=0)   # 固定 seed 保证复现
+    rng     = np.random.default_rng(seed=0)
     for _ in range(n_rep):
-        perm = rng.permutation(S)
-        # 保证 perm[i] != i（derangement 近似：若有碰撞，循环移一位）
+        perm  = rng.permutation(S)
         clash = np.where(perm == np.arange(S))[0]
         for idx in clash:
             swap = (idx + 1) % S
             perm[idx], perm[swap] = perm[swap], perm[idx]
         spreads.append(np.abs(samples - samples[perm]).mean(axis=0))
 
-    spread        = np.mean(spreads, axis=0)   # E|X - X'|（无放回近似）
+    spread        = np.mean(spreads, axis=0)
     crps_per_node = mae_term - 0.5 * spread
     return float(crps_per_node.mean())
 
 
-def picp(mu, sigma, y, confidence=0.95):
-    from scipy.stats import norm
-    z       = norm.ppf((1 + confidence) / 2)
-    covered = ((y >= mu - z*sigma) & (y <= mu + z*sigma)).astype(float)
-    return float(covered.mean())
-
-
 def picp_empirical(samples: np.ndarray, y: np.ndarray, confidence: float = 0.95) -> float:
-    """
-    [Fix-PICP] 基于经验分位数的区间覆盖率，不依赖高斯假设。
-
-    lower = quantile(samples, (1-confidence)/2)
-    upper = quantile(samples, (1+confidence)/2)
-    PICP  = mean(lower <= y <= upper)
-    """
-    alpha = (1.0 - confidence) / 2.0
-    lower = np.quantile(samples, alpha,     axis=0)   # [B, N, D]
-    upper = np.quantile(samples, 1 - alpha, axis=0)
+    """基于经验分位数的区间覆盖率（PICP），不依赖高斯假设。"""
+    alpha   = (1.0 - confidence) / 2.0
+    lower   = np.quantile(samples, alpha,     axis=0)
+    upper   = np.quantile(samples, 1 - alpha, axis=0)
     covered = ((y >= lower) & (y <= upper)).astype(float)
     return float(covered.mean())
 
 
 def pinaw_empirical(samples: np.ndarray, y: np.ndarray, confidence: float = 0.95) -> float:
-    """
-    [Fix-PINAW] 基于经验分位数的归一化区间宽度。
-    """
-    alpha = (1.0 - confidence) / 2.0
-    lower = np.quantile(samples, alpha,     axis=0)
-    upper = np.quantile(samples, 1 - alpha, axis=0)
+    """基于经验分位数的归一化区间宽度（PINAW）。"""
+    alpha   = (1.0 - confidence) / 2.0
+    lower   = np.quantile(samples, alpha,     axis=0)
+    upper   = np.quantile(samples, 1 - alpha, axis=0)
     width   = upper - lower
     y_range = y.max() - y.min() + 1e-8
     return float((width / y_range).mean())
@@ -108,21 +83,18 @@ def pinaw_empirical(samples: np.ndarray, y: np.ndarray, confidence: float = 0.95
 
 def evaluate_all(samples: np.ndarray, y_all: np.ndarray) -> dict:
     """
-    [Fix-EvalAll] 统一入口，接收原始 samples，所有指标走经验计算路径。
+    统一评估入口，所有概率指标走经验路径（不依赖高斯假设）。
 
-    samples : [S, total, N, out_dim]（concatenate 后的完整测试集采样）
+    samples : [S, total, N, out_dim]
     y_all   : [total, N, out_dim]
-
-    内部计算 mu/sigma 用于记录，但 CRPS/PICP/PINAW 全用经验版。
     """
-    mu_all    = samples.mean(axis=0)                             # [total, N, D]
-    sigma_all = samples.std(axis=0, ddof=1)                     # Bessel 校正
+    mu_all = samples.mean(axis=0)
     return {
         "MAE":   mae(mu_all, y_all),
         "RMSE":  rmse(mu_all, y_all),
-        "CRPS":  crps_empirical(samples, y_all),                 # [Fix-CRPS]
-        "PICP":  picp_empirical(samples, y_all),                 # [Fix-PICP]
-        "PINAW": pinaw_empirical(samples, y_all),                # [Fix-PINAW]
+        "CRPS":  crps_empirical(samples, y_all),
+        "PICP":  picp_empirical(samples, y_all),
+        "PINAW": pinaw_empirical(samples, y_all),
     }
 
 
@@ -131,24 +103,14 @@ def evaluate_all(samples: np.ndarray, y_all: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 
 def _inverse_samples(samples: np.ndarray, scaler) -> np.ndarray:
-    """
-    [Fix-InvTransform] 对 [S, ...] 格式的采样粒子做批量反归一化。
-
-    修复：
-      原版逐样本 for 循环调用 scaler.inverse_transform，性能差。
-      scaler 的反变换是逐元素线性操作（乘 std + 加 mean，可选 expm1），
-      对任意 shape 的 ndarray 均可广播，直接对整个 [S*rest] 做一次调用即可。
-    """
-    shape    = samples.shape           # [S, total, N, D]
-    flat     = samples.reshape(-1)     # [S*total*N*D]
-    inv_flat = scaler.inverse_transform(flat)
-    return inv_flat.reshape(shape)
+    """对 [S, ...] 格式的采样粒子批量反归一化。"""
+    shape = samples.shape
+    return scaler.inverse_transform(samples.reshape(-1)).reshape(shape)
 
 
 def _inverse_y(y: np.ndarray, scaler) -> np.ndarray:
-    """对真实值 y [total, N, D] 做反归一化，走 scaler.inverse_transform()。"""
-    shape = y.shape
-    return scaler.inverse_transform(y.reshape(-1)).reshape(shape)
+    """对真实值 [total, N, D] 反归一化。"""
+    return scaler.inverse_transform(y.reshape(-1)).reshape(y.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -159,27 +121,22 @@ def calibrate_temperature(samples: np.ndarray, y_all: np.ndarray,
                            target_coverage: float = 0.95,
                            grid: np.ndarray = None) -> float:
     """
-    [Fix-CalibTemp] Temperature Calibration 改为走经验 PICP，不再用高斯公式。
+    后验温度缩放：以均值为中心放缩粒子，搜索使经验 PICP 最接近目标覆盖率的 T。
 
-    原版问题：
-      calibrate_temperature(mu, sigma, y) 用高斯区间 [mu±z*sigma*T]，
-      当真实分布非高斯时（Electricity 重尾），T 的最优值偏大（如 3.0），
-      但即使 T=3.0 PICP 也只有 83%，无法达到 95%。
+    samples_scaled = mu + T * (samples - mu)
 
-    修复：
-      直接对 samples 做分位数缩放：scale t → samples_scaled = mu + t*(samples-mu)，
-      等效于以 mu 为中心放缩粒子，再用经验分位数计算 PICP。
-      这样 T 的搜索空间与真实分布形状匹配，能找到更准确的校准值。
+    使用经验分位数 PICP，对非高斯分布（如 Electricity 重尾）也适用。
+    搜索范围 [0.5, 5.0]，T>1 表示放宽置信区间，T<1 表示收紧。
     """
     if grid is None:
-        grid = np.linspace(0.5, 5.0, 91)           # 搜索范围扩大到 5.0
+        grid = np.linspace(0.5, 5.0, 91)
 
-    mu = samples.mean(axis=0)                       # [B, N, D]
+    mu       = samples.mean(axis=0)
     best_T   = 1.0
     best_gap = float("inf")
 
     for T in grid:
-        samples_scaled = mu[None] + T * (samples - mu[None])   # [S, B, N, D]
+        samples_scaled = mu[None] + T * (samples - mu[None])
         coverage = picp_empirical(samples_scaled, y_all, target_coverage)
         gap      = abs(coverage - target_coverage)
         if gap < best_gap:
@@ -207,18 +164,6 @@ def train_one_epoch(
     cfm_n_t_samples: int = 4,
     sigma_min:       float = 0.01,
 ) -> Dict[str, float]:
-    """
-    [Fix-WarmupClub]
-    原版问题：warmup 期间虽然 loss = cfm_l（不加 MI 正则），但仍调用了
-    model.club(He, Hs) 并触发 backward，让主优化器把未训练的 CLUB 梯度
-    混入主网络更新中。
-
-    修复：warmup 期间完全跳过 CLUB 的所有计算（forward + backward 全部跳过），
-    只做纯 CFM 训练。warmup 结束后再引入 CLUB。
-
-    [Fix-ClubLR] club_optimizer lr = lr*2（在 train() 里设置）。
-    [Fix-ClubClip] CLUB backward 后 clip grad norm=1.0。
-    """
     model.train()
     total_loss = total_cfm = total_mi = total_var = 0.0
     n_batches  = 0
@@ -232,45 +177,36 @@ def train_one_epoch(
         x = x.to(device)
         y = y.to(device)
 
-        # [v6-DualStream] forward 返回 (He_prime, Hs_prime, He, Hs, mi_loss_raw)
         He_prime, Hs_prime, He, Hs, _ = model(x, adj_norm_, edge_idx_)
 
-        # ── Step 1: CLUB 变分网络更新 ─────────────────────────────────────
+        # Step 1: 更新 CLUB 变分网络（主网络参数 detach）
         if train_club:
             var_loss = model.club.variational_loss(He.detach(), Hs.detach())
             club_optimizer.zero_grad()
             var_loss.backward()
-            # [Fix-ClubClip] 去掉 normalize 后 CLUB 梯度量级增大，需要 clip
             torch.nn.utils.clip_grad_norm_(model.club.parameters(), max_norm=1.0)
             club_optimizer.step()
             var_loss_val = var_loss.item()
         else:
             var_loss_val = 0.0
 
-        # ── Step 2: 主网络更新 ───────────────────────────────────────────
+        # Step 2: 更新主网络
         y_target = y[..., :model.out_dim]
-        # [v6-DualStream] cfm_loss 接收分开的 He_prime 和 Hs_prime
         cfm_l    = model.cfm_loss(He_prime, Hs_prime, y_target,
                                    n_t_samples=cfm_n_t_samples,
                                    sigma_min=sigma_min)
 
         if train_club:
-            # [Fix-WarmupClub] warmup 后再计算 mi_loss，避免未训练的 CLUB 梯度污染主网络
             mi_loss = model.club(He, Hs)
-
-            # [Fix-MIClamp] MI 理论上 >= 0，但 CLUB 是上界估计，偶尔可为小负数。
-            # 若 mi_loss < -1，说明变分网络本次估计严重失效（过拟合），
-            # 跳过 MI 项，只用 cfm_l 更新主网络，避免极端负梯度冲垮表征。
             if mi_loss.item() < -1.0:
+                # 变分网络估计失效，跳过 MI 项，仍记录用于监控
                 loss   = cfm_l
-                mi_val = mi_loss.item()   # 仍记录用于监控，但不加入 loss
+                mi_val = mi_loss.item()
             else:
-                # clamp 到 [-0.5, 正无穷]，允许小幅负值但阻断极端崩溃
                 mi_loss_clamped = mi_loss.clamp(min=-0.5)
                 loss   = cfm_l + model.lambda_mi * mi_loss_clamped
                 mi_val = mi_loss.item()
         else:
-            # [Fix-WarmupClub] warmup 期间完全跳过，mi_loss = 0，无任何 CLUB forward
             loss   = cfm_l
             mi_val = 0.0
 
@@ -308,19 +244,11 @@ def evaluate(model: GridCFN, loader: DataLoader,
              sigma_min: float = 0.01,
              x0_scale: float = 1.0):
     """
-    CFM 推断评估（v6：经验指标 + 统一反归一化）。
+    CFM 推断评估。
 
-    [Fix-InvTransform] 反归一化统一走 scaler.inverse_transform()，
-      支持纯 Z-score 和 log+Z-score 两种模式，不再手动乘 std + mean。
-
-    [Fix-CRPS] evaluate_all 内部走经验 CRPS/PICP/PINAW，不依赖高斯假设。
-
-    [Fix-Temperature] temperature 作用于粒子（以 mu 为中心放缩），
-      而非乘在 sigma 上，与 calibrate_temperature 的定义对齐。
-
-    返回值：
-      metrics                  : dict（MAE/RMSE/CRPS/PICP/PINAW）
-      (可选) samples_inv, y_inv: 反归一化后的粒子和真实值，供 calibrate_temperature 用
+    inverse_transform=False 时在归一化域评估（用于验证集早停）；
+    inverse_transform=True  时反归一化后评估（用于最终测试报告）。
+    temperature 作用于粒子（以 mu 为中心放缩），与 calibrate_temperature 定义一致。
     """
     model.eval()
     samples_list, y_list = [], []
@@ -330,10 +258,8 @@ def evaluate(model: GridCFN, loader: DataLoader,
 
     for x, y in loader:
         x = x.to(device)
-        # [v6-DualStream] forward 返回 (He_prime, Hs_prime, He, Hs, mi_loss_raw)
         He_prime, Hs_prime, _, _, _ = model(x, adj_norm_, edge_idx_)
 
-        # [S, B, N, out_dim]
         raw_samples = model.sample(
             He_prime, Hs_prime,
             n_samples=n_samples,
@@ -345,19 +271,15 @@ def evaluate(model: GridCFN, loader: DataLoader,
         samples_list.append(raw_samples)
         y_list.append(y.numpy())
 
-    # 沿 batch 维拼接：[S, total, N, D]
-    samples_all = np.concatenate(samples_list, axis=1)
-    y_all       = np.concatenate(y_list,       axis=0)[..., :model.out_dim]  # [total, N, D]
+    samples_all = np.concatenate(samples_list, axis=1)              # [S, total, N, D]
+    y_all       = np.concatenate(y_list, axis=0)[..., :model.out_dim]
 
-    # ── 反归一化 ───────────────────────────────────────────────────────────
     if inverse_transform and scaler is not None:
-        # [Fix-InvTransform] 走 scaler，支持 log+Z-score
         samples_all = _inverse_samples(samples_all, scaler)
         y_all       = _inverse_y(y_all, scaler)
 
-    # ── Temperature 校准：以 mu 为中心放缩粒子 ────────────────────────────
     if temperature != 1.0:
-        mu = samples_all.mean(axis=0, keepdims=True)            # [1, total, N, D]
+        mu          = samples_all.mean(axis=0, keepdims=True)
         samples_all = mu + temperature * (samples_all - mu)
 
     metrics = evaluate_all(samples_all, y_all)
@@ -389,7 +311,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         lr=cfg_train.lr,
         weight_decay=cfg_train.weight_decay,
     )
-    # [Fix-ClubLR2] 进一步从 lr*2 降到 lr*0.5，防止变分网络过拟合崩溃
+    # club_optimizer 使用较小学习率，防止变分网络过拟合崩溃
     club_optimizer = torch.optim.Adam(
         model.club.parameters(),
         lr=cfg_train.lr * 0.5,
@@ -415,10 +337,8 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         "val_crps": [], "val_mae": [], "val_rmse": [],
     }
 
-    logger.info("注意：训练中 Val 指标在归一化域（用于早停判断），"
-                "最终 Test 指标在反 Z-score 域（实际量纲）。")
-    logger.info(f"[v5-fix] CLUB 在 warmup ({warmup_epochs} epochs) 后开始训练，"
-                f"club_lr={cfg_train.lr * 0.5:.2e}，MI clamp 保护已启用")
+    logger.info("Val 指标在归一化域（用于早停），Test 指标在反归一化域（实际量纲）")
+    logger.info(f"CLUB warmup: {warmup_epochs} epochs，club_lr={cfg_train.lr * 0.5:.2e}")
     header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | "
               f"{'VarLoss':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
               f"{'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
@@ -431,8 +351,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         train_m = train_one_epoch(
             model, train_loader, optimizer, club_optimizer,
             adj_norm, edge_index, device, epoch,
-            cfg_train.grad_clip,
-            warmup_epochs,
+            cfg_train.grad_clip, warmup_epochs,
             cfm_n_t_samples=cfm_n_t_samples,
             sigma_min=sigma_min,
         )
@@ -441,9 +360,8 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
             scaler=scaler,
             n_samples=n_samples_val, n_steps=n_steps,
             temperature=1.0,
-            inverse_transform=False,   # 归一化域，快速验证，用于早停
-            sigma_min=sigma_min,
-            x0_scale=x0_scale,
+            inverse_transform=False,
+            sigma_min=sigma_min, x0_scale=x0_scale,
         )
         scheduler.step(val_m["CRPS"])
 
@@ -477,76 +395,61 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
                 )
                 break
 
-    # ── 加载最优权重 ────────────────────────────────────────────────────────
     model.load_state_dict(
         torch.load(cfg_train.save_path, map_location=device, weights_only=True)
     )
 
-    # ── Temperature Calibration ─────────────────────────────────────────────
-    logger.info("\n正在验证集上做 Temperature Calibration（反 Z-score 域）...")
+    # Temperature Calibration（在验证集反归一化域上搜索）
+    logger.info("\n正在验证集上做 Temperature Calibration...")
     _, samples_val, y_val = evaluate(
         model, val_loader, adj_norm, edge_index, device,
-        scaler=scaler,
-        return_preds=True,
-        n_samples=n_samples_test,
-        n_steps=n_steps,
-        temperature=1.0,
-        inverse_transform=True,
-        sigma_min=sigma_min,
-        x0_scale=x0_scale,
+        scaler=scaler, return_preds=True,
+        n_samples=n_samples_test, n_steps=n_steps,
+        temperature=1.0, inverse_transform=True,
+        sigma_min=sigma_min, x0_scale=x0_scale,
     )
-    best_T = calibrate_temperature(samples_val, y_val, target_coverage=0.95)
+    best_T      = calibrate_temperature(samples_val, y_val, target_coverage=0.95)
     picp_before = picp_empirical(samples_val, y_val)
     mu_val      = samples_val.mean(axis=0)
     scaled_val  = mu_val[None] + best_T * (samples_val - mu_val[None])
     picp_after  = picp_empirical(scaled_val, y_val)
     logger.info(
         f"最优 Temperature: {best_T:.3f}  "
-        f"（验证集 PICP@T=1.0: {picp_before:.4f} → "
-        f"PICP@T={best_T:.2f}: {picp_after:.4f}）"
+        f"（验证集 PICP@T=1.0: {picp_before:.4f} → PICP@T={best_T:.2f}: {picp_after:.4f}）"
     )
 
-    # ── 测试集最终评估 ──────────────────────────────────────────────────────
+    # 测试集最终评估（反归一化域 + 归一化域各报一次）
     test_m, samples_test, y_test = evaluate(
         model, test_loader, adj_norm, edge_index, device,
-        scaler=scaler,
-        return_preds=True,
-        n_samples=n_samples_test,
-        n_steps=n_steps,
-        temperature=best_T,
-        inverse_transform=True,
-        sigma_min=sigma_min,
-        x0_scale=x0_scale,
+        scaler=scaler, return_preds=True,
+        n_samples=n_samples_test, n_steps=n_steps,
+        temperature=best_T, inverse_transform=True,
+        sigma_min=sigma_min, x0_scale=x0_scale,
     )
-
     test_m_norm, _, _ = evaluate(
         model, test_loader, adj_norm, edge_index, device,
-        scaler=scaler,
-        return_preds=True,
-        n_samples=n_samples_test,
-        n_steps=n_steps,
-        temperature=best_T,
-        inverse_transform=False,
-        sigma_min=sigma_min,
-        x0_scale=x0_scale,
+        scaler=scaler, return_preds=True,
+        n_samples=n_samples_test, n_steps=n_steps,
+        temperature=best_T, inverse_transform=False,
+        sigma_min=sigma_min, x0_scale=x0_scale,
     )
 
     sep = "=" * 60
     logger.info(f"\n{sep}")
-    logger.info(f"TEST SET RESULTS — 反 Z-score 域 (Temperature={best_T:.3f})")
+    logger.info(f"TEST SET RESULTS — 反归一化域 (Temperature={best_T:.3f})")
     logger.info(sep)
     for k, v in test_m.items():
         logger.info(f"  {k:<8}: {v:.4f}")
 
     logger.info(f"\n{sep}")
-    logger.info("TEST SET RESULTS — 归一化域（对应训练时的 Val CRPS 尺度）")
+    logger.info("TEST SET RESULTS — 归一化域")
     logger.info(sep)
     for k, v in test_m_norm.items():
         logger.info(f"  {k:<8}: {v:.4f}")
     logger.info(sep)
 
-    history["test_metrics"]          = test_m
-    history["test_metrics_norm"]     = test_m_norm
-    history["best_temperature"]      = best_T
-    history["test_shape"]            = list(samples_test.shape)
+    history["test_metrics"]      = test_m
+    history["test_metrics_norm"] = test_m_norm
+    history["best_temperature"]  = best_T
+    history["test_shape"]        = list(samples_test.shape)
     return history

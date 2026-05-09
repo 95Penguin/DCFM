@@ -1,53 +1,47 @@
 """
 GridCFN – 数据集工具
-支持论文使用的三个数据集：
+
+支持四个数据集：
   - Solar-Energy  (137 PV plants, 10-min, 2007)
   - Electricity   (UCI, 321 clients, 1-hour, 2012-2014)
   - Weather2k     (1866 stations, 1-hour, 2017-2021)
+  - SDWPF         (134 wind turbines, 10-min, 2020-2021, KDD Cup 2022)
 
-数据文件获取（与论文一致）：
-  Solar / Electricity → LSTNet repo:
-    https://github.com/laiguokun/multivariate-time-series-data
-  Weather2k → 原始论文仓库或 Kaggle 搜索 Weather2k
-
-所有数据集遵循相同接口：
-  1. 加载原始 CSV / npy
-  2. Z-score 归一化（均值方差在训练集上计算）
-  3. 滑动窗口切片（T_in=168, T_out=1，对应论文设置）
-  4. 构建相关性邻接矩阵
-  5. 70/10/20 划分
+数据文件获取：
+  Solar / Electricity → https://github.com/laiguokun/multivariate-time-series-data
+  Weather2k           → 原始论文仓库或 Kaggle
+  SDWPF               → https://figshare.com/articles/dataset/SDWPF_dataset/24798654
+                        （Nature Scientific Data 2024，龙源电力 SCADA 实采数据）
 """
 
 import os
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Tuple, Optional
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
-# 邻接矩阵构建
+# 邻接矩阵
 # ---------------------------------------------------------------------------
 
 def build_correlation_adj(data: np.ndarray, threshold: float = 0.7) -> np.ndarray:
     """
-    基于训练集皮尔逊相关系数构建二值邻接矩阵。
-    data : [T, N]（单特征或多特征均值）
-    返回 A : [N, N]（|corr| >= threshold 置 1，对角线置 0）
+    基于皮尔逊相关系数构建二值邻接矩阵。
 
-    健壮性处理：
-      - Electricity 数据集中部分客户用电量长期为 0（缺失/停业），其相关系数
-        为 NaN（零向量无法计算皮尔逊相关）。nan_to_num 将 NaN 替换为 0，
-        避免后续矩阵运算中 NaN 传播。
-      - 阈值过高时可能产生孤立节点（度为 0），GCN normalize_adj 会因除以 0
-        出错。检测并给孤立节点补一条自环边。
+    data : [T, N]
+    返回 A : [N, N]，|corr| >= threshold 置 1，对角线置 0
+
+    孤立节点保护：度为 0 的节点补自环，防止 normalize_adj 除以 0。
+    部分数据集（如 Electricity）有全零列（缺失节点），其相关系数为 NaN，
+    nan_to_num 将其替换为 0。
     """
-    corr = np.corrcoef(data.T)                                   # [N, N]
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0) # 修复 NaN
+    corr = np.corrcoef(data.T)
+    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
     adj  = (np.abs(corr) >= threshold).astype(np.float32)
-    np.fill_diagonal(adj, 0)                                     # 先去掉自环
+    np.fill_diagonal(adj, 0)
 
-    # 孤立节点保护：度为 0 的节点补自环，防止 normalize_adj 除以 0
     isolated = (adj.sum(axis=1) == 0)
     if isolated.any():
         print(f"  [adj] 检测到 {isolated.sum()} 个孤立节点，已补自环")
@@ -62,20 +56,20 @@ def build_correlation_adj(data: np.ndarray, threshold: float = 0.7) -> np.ndarra
 
 class SlidingWindowDataset(Dataset):
     """
-    通用多变量时序滑动窗口数据集。
+    多变量时序滑动窗口数据集。
 
     data  : [T, N, F]  已归一化
     adj   : [N, N]
-    T_in  : 输入窗口长度（论文: 168）
-    T_out : 预测步长（论文: 1）
+    T_in  : 输入窗口长度
+    T_out : 预测步长
     """
     def __init__(self, data: np.ndarray, adj: np.ndarray,
                  T_in: int = 168, T_out: int = 1):
         super().__init__()
-        self.data     = torch.tensor(data, dtype=torch.float32)  # [T, N, F]
-        self.adj      = torch.tensor(adj,  dtype=torch.float32)  # [N, N]
-        self.T_in     = T_in
-        self.T_out    = T_out
+        self.data      = torch.tensor(data, dtype=torch.float32)
+        self.adj       = torch.tensor(adj,  dtype=torch.float32)
+        self.T_in      = T_in
+        self.T_out     = T_out
         self.n_samples = len(data) - T_in - T_out + 1
         assert self.n_samples > 0, (
             f"数据长度 {len(data)} 不足以构造窗口 T_in={T_in} + T_out={T_out}"
@@ -85,10 +79,9 @@ class SlidingWindowDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx):
-        x = self.data[idx : idx + self.T_in]                           # [T_in, N, F]
-        y = self.data[idx + self.T_in : idx + self.T_in + self.T_out] # [T_out, N, F]
-        # T_out=1 时 squeeze 掉时间维，输出 y:[N,F]
-        return x, y.squeeze(0)
+        x = self.data[idx : idx + self.T_in]
+        y = self.data[idx + self.T_in : idx + self.T_in + self.T_out]
+        return x, y.squeeze(0)   # T_out=1 时 squeeze 掉时间维
 
 
 # ---------------------------------------------------------------------------
@@ -97,11 +90,10 @@ class SlidingWindowDataset(Dataset):
 
 class Scaler:
     """
-    全局 Z-score 归一化（在训练集上 fit）。
+    全局 Z-score 归一化，在训练集上 fit。
 
-    log_transform=True 时，inverse_transform 会额外做 expm1 反变换，
-    用于 Electricity 等重尾数据集（load_electricity 中已预先做了 log1p）。
-    训练和评估都在 log 域进行，指标也在 log 域报告，与论文口径一致。
+    log_transform=True 时，inverse_transform 额外执行 expm1 反变换，
+    用于预先做过 log1p 的数据集（Electricity 重尾场景）。
     """
     def __init__(self, log_transform: bool = False):
         self.mean: float = 0.0
@@ -117,10 +109,7 @@ class Scaler:
         return (data - self.mean) / self.std
 
     def inverse_transform(self, data):
-        """
-        支持 numpy array 或 torch tensor。
-        log_transform=True 时：先反 Z-score，再 expm1（对应 log1p 的逆）。
-        """
+        """支持 numpy array 或 torch tensor。"""
         out = data * self.std + self.mean
         if self.log_transform:
             if isinstance(out, np.ndarray):
@@ -131,7 +120,7 @@ class Scaler:
 
 
 # ---------------------------------------------------------------------------
-# 数据集加载器（三个真实数据集）
+# 数据集加载器
 # ---------------------------------------------------------------------------
 
 def load_solar_energy(data_path: str, T_in: int = 168, T_out: int = 1,
@@ -140,7 +129,7 @@ def load_solar_energy(data_path: str, T_in: int = 168, T_out: int = 1,
     Solar-Energy: 137 个 PV 电站，2007 年，10 分钟分辨率。
     文件格式: solar_AL.txt（逗号分隔，[T=52560, N=137]）
     """
-    raw = np.loadtxt(data_path, delimiter=',')          # [T, N=137]
+    raw = np.loadtxt(data_path, delimiter=',')
     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Solar')
 
 
@@ -150,35 +139,23 @@ def load_electricity(data_path: str, T_in: int = 168, T_out: int = 1,
     Electricity (UCI): 321 个用电客户，小时级，2012-2014。
     文件格式: electricity.txt（逗号分隔，[T=26304, N=321]）
 
-    [Fix-Elec] log1p 变换：
-      Electricity 原始数据是重尾分布（工业用户 vs 居民用户量级差异 100x+）。
-      直接 Z-score 后大量数据点压缩到接近 0，导致：
-        · sigma 极易压到最小值（NLL 持续为负）
-        · Hs 数值范围极小，CLUB 变分网络无法区分正负样本（MI≈0）
-
-      log1p(x) = log(1 + x) 变换将重尾分布压缩为近似正态，
-      Z-score 后方差分布更均匀，sigma 学习难度大幅降低。
-
-      注意：
-        · 原始数据必须 ≥ 0（用电量天然满足）
-        · 训练/验证/测试指标均在 log 域报告，与论文口径一致
-        · Scaler(log_transform=True) 的 inverse_transform 包含 expm1 反变换，
-          供需要原始量纲的场景使用
+    注：Electricity 是重尾分布（工业 vs 居民用电量差异 100x+）。
+    若直接 Z-score 导致 sigma 学习困难，可在此处开启 log1p 预处理：
+      raw = np.log1p(np.clip(raw, 0, None))
+    并将 _build_loaders 的 log_transform 参数改为 True。
     """
-    raw = np.loadtxt(data_path, delimiter=',')   # [T, N=321]
+    # raw = np.loadtxt(data_path, delimiter=',')
+    # raw = np.log1p(np.clip(raw, 0, None))
 
-    # [Fix-Elec] log1p 变换：将重尾用电量分布压缩为近似正态
-    # clip(0) 防止极少数负值（数据噪声）导致 log 出现 NaN
-    raw = np.log1p(np.clip(raw, 0, None))
-
-    print(f"  [Electricity] log1p 变换后：mean={raw.mean():.3f}, "
-          f"std={raw.std():.3f}, min={raw.min():.3f}, max={raw.max():.3f}")
-
-    return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size,
-                          name='Electricity', log_transform=True)
+    # print(f"  [Electricity] log1p 变换后：mean={raw.mean():.3f}, "
+    #       f"std={raw.std():.3f}, min={raw.min():.3f}, max={raw.max():.3f}")
 
     # return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size,
-    #                       name='Electricity')
+    #                       name='Electricity', log_transform=True)
+    
+    raw = np.loadtxt(data_path, delimiter=',')
+    return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Electricity')
+
 
 
 def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,
@@ -188,36 +165,24 @@ def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,
     Weather2k: 1866 个气象站，小时级，2017-2021。
     文件格式: weather2k.npy
 
-    Weather2k 的 npy 文件有两种常见 shape，代码自动识别：
+    npy 文件有两种常见 shape，代码自动识别：
+      格式 A (T, N, F)：直接使用。
+      格式 B (N, F, T)：Weather2k 论文原始格式，第 0 维为站点数（1866），
+                        第 2 维为时间步（远大于 N），自动 transpose 为 (T, N, F)。
 
-    格式 A（标准时序格式）: shape = (T, N, F)
-      T = 时间步数，N = 站点数，F = 特征数
-      直接使用，无需转置。
-
-    格式 B（Weather2k 论文原始格式）: shape = (N, C, L)
-      N = 1866 站点，C = 特征数（如 13），L = 时间步数（如 13632）
-      需要 transpose 成 (L, N, C) = (T, N, F)。
-      识别条件：shape[0] == 1866（论文站点数）且 ndim == 3。
-
-    参数：
-      feature_idx : 选取哪个特征（0 = 第一个，通常是温度）。
-                    设为 -1 则使用全部特征。
+    feature_idx : 选取哪个特征（0=第一个，通常为温度；-1=全部特征）。
     """
     raw = np.load(data_path)
     print(f"  [Weather2k] 原始 shape: {raw.shape}, dtype: {raw.dtype}")
 
     if raw.ndim == 2:
-        # (T, N) → (T, N, 1)
         raw = raw[:, :, None]
         print(f"  [Weather2k] 2D → 3D: {raw.shape}")
 
     elif raw.ndim == 3:
         T0, D1, D2 = raw.shape
-        # 识别格式 B：第 0 维是站点数（论文 1866），第 2 维是最长的时间轴
-        # 判断条件：shape[0] 远小于 shape[2]，且 shape[0] 与论文站点数接近
         if D2 > D1 and D2 > T0 and T0 < 5000:
-            # 格式 B: (N=stations, F=features, T=time) → transpose → (T, N, F)
-            raw = raw.transpose(2, 0, 1)   # (T, N, F)
+            raw = raw.transpose(2, 0, 1)
             print(f"  [Weather2k] 检测到格式 B (N,F,T)，已转置为 (T,N,F): {raw.shape}")
         else:
             print(f"  [Weather2k] 检测到格式 A (T,N,F): {raw.shape}")
@@ -227,11 +192,164 @@ def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,
 
     if F > 1 and feature_idx >= 0:
         print(f"  [Weather2k] 选取特征索引 {feature_idx}（共 {F} 个特征）")
-        raw = raw[:, :, feature_idx : feature_idx + 1]   # (T, N, 1)
+        raw = raw[:, :, feature_idx : feature_idx + 1]
     elif feature_idx < 0:
         print(f"  [Weather2k] 使用全部 {F} 个特征（config.in_dim 需设为 {F}）")
 
     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Weather')
+
+
+def load_sdwpf(data_path: str, T_in: int = 168, T_out: int = 1,
+               adj_threshold: float = 0.88, batch_size: int = 32):
+    """
+    SDWPF：134 台风机，10 分钟分辨率，2020-2021年。
+    来源：龙源电力 SCADA 系统实采数据，KDD Cup 2022 / Nature Scientific Data 2024。
+    下载：https://figshare.com/articles/dataset/SDWPF_dataset/24798654
+
+    文件格式：sdwpf_245days_v1.csv（KDD版，约245天）
+              或 sdwpf_full/ 目录下的完整版（约两年）
+    推荐使用 KDD 版（245天，约52,560个时间步，与 Solar 规模相近）。
+
+    CSV 列：TurbID, Day, Tmstamp, Wspd, Wdir, Etmp, Itmp, Ndir,
+            Pab1, Pab2, Pab3, Prtv, Patv
+    目标列：Patv（有功功率，kW）
+
+    数据清洗规则（来自官方论文）：
+      1. Patv < 0 → 置 0（传感器底噪，风机未发电）
+      2. Patv <= 0 且 Wspd > 2.5 → 标记为 NaN（风机停机，功率未知）
+      3. Pab1/2/3 > 89° → 标记为 NaN（风机静止，桨叶顺桨）
+      4. 任意列存在异常值（Wspd<0, Etmp/Itmp 超出合理范围等）→ 标记为 NaN
+      最终 NaN 用该风机列的线性插值填充，首尾 NaN 用前向/后向填充兜底。
+
+    adj_threshold 建议 0.88：风机聚集在同一风场，相关性普遍较高（>0.9），
+    0.88 可保留适量边，避免图过于稠密导致过平滑。
+    """
+    raw = _load_sdwpf_csv(data_path)
+    return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='SDWPF')
+
+
+def _load_sdwpf_csv(data_path: str) -> np.ndarray:
+    """
+    将 SDWPF CSV 解析为 [T, N=134] 的有功功率矩阵。
+
+    处理流程：
+      1. 读取 CSV，统一列名
+      2. 构造时间索引（Day + Tmstamp → 全局时间步编号）
+      3. pivot：行=时间步，列=TurbID，值=Patv
+      4. 数据清洗（异常置 NaN → 插值填充）
+      5. 返回 [T, N] float32 数组
+    """
+    print(f"  [SDWPF] 正在读取: {data_path}")
+    df = pd.read_csv(data_path)
+
+    # ── 列名标准化 ────────────────────────────────────────────────────────
+    # 原始列名可能带单位后缀（如 "Wspd (m/s)"），统一去掉括号内容
+    df.columns = [c.split('(')[0].strip() for c in df.columns]
+    # 确保关键列存在
+    required = {'TurbID', 'Day', 'Tmstamp', 'Patv'}
+    missing  = required - set(df.columns)
+    assert not missing, f"CSV 缺少列: {missing}，现有列: {list(df.columns)}"
+
+    print(f"  [SDWPF] 原始行数: {len(df):,}，风机数: {df['TurbID'].nunique()}")
+
+    # ── 构造全局时间步编号 ────────────────────────────────────────────────
+    # Tmstamp 格式为 "HH:MM"（每10分钟一步，每天144步）
+    # 全局时间步 = (Day - 1) * 144 + 步内编号
+    df['time_step'] = _parse_time_step(df)
+
+    # ── 数据清洗：异常置 NaN ──────────────────────────────────────────────
+    df = _clean_sdwpf(df)
+
+    # ── Pivot：[时间步, 风机] ─────────────────────────────────────────────
+    pivot = df.pivot_table(
+        index='time_step', columns='TurbID', values='Patv', aggfunc='mean'
+    )
+    # 确保风机列完整有序（1~134）
+    expected_turbs = sorted(df['TurbID'].unique())
+    pivot = pivot.reindex(columns=expected_turbs)
+
+    # 确保时间步连续（补全缺失时间步为 NaN）
+    t_min, t_max = pivot.index.min(), pivot.index.max()
+    full_index   = np.arange(t_min, t_max + 1)
+    pivot        = pivot.reindex(full_index)
+
+    T, N = pivot.shape
+    print(f"  [SDWPF] Pivot 完成: T={T} 时间步（{T/144:.1f} 天），N={N} 风机")
+
+    # ── 插值填充 NaN ──────────────────────────────────────────────────────
+    raw = pivot.values.astype(np.float32)   # [T, N]
+    nan_ratio = np.isnan(raw).mean()
+    print(f"  [SDWPF] 清洗后 NaN 比例: {nan_ratio:.3%}")
+
+    # 逐列线性插值（时间轴），首尾用前向/后向填充兜底
+    df_raw = pd.DataFrame(raw)
+    df_raw = df_raw.interpolate(method='linear', axis=0, limit_direction='both')
+    raw    = df_raw.values.astype(np.float32)
+
+    remaining_nan = np.isnan(raw).sum()
+    if remaining_nan > 0:
+        print(f"  [SDWPF] 插值后仍有 {remaining_nan} 个 NaN，用 0 填充")
+        raw = np.nan_to_num(raw, nan=0.0)
+
+    print(f"  [SDWPF] 最终数据: shape={raw.shape}, "
+          f"min={raw.min():.2f}, max={raw.max():.2f}, mean={raw.mean():.2f} kW")
+    return raw   # [T, N=134]
+
+
+def _parse_time_step(df: pd.DataFrame) -> pd.Series:
+    """
+    将 Day + Tmstamp（"HH:MM"）转为全局时间步编号（从0开始）。
+    每天 144 步（24h × 6步/h）。
+    """
+    def tmstamp_to_step(ts: str) -> int:
+        """"HH:MM" → 步内编号（0~143）"""
+        try:
+            h, m = map(int, str(ts).strip().split(':'))
+            return h * 6 + m // 10
+        except Exception:
+            return 0
+
+    intra_step = df['Tmstamp'].apply(tmstamp_to_step)
+    # Day 从1开始，转为0-based
+    day_0based = (df['Day'] - df['Day'].min())
+    return (day_0based * 144 + intra_step).astype(int)
+
+
+def _clean_sdwpf(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    官方论文定义的数据清洗规则，将无效功率值置为 NaN。
+
+    规则1: Patv < 0 → 置 0（传感器底噪，非停机）
+    规则2: Patv <= 0 且 Wspd > 2.5 → NaN（风速足够但功率为零，风机停机）
+    规则3: Pab1/2/3 > 89° → NaN（桨叶顺桨，风机静止）
+    规则4: Wspd < 0 → NaN（风速传感器异常）
+    规则5: Etmp/Itmp 超出合理范围（< -40 或 > 80°C）→ NaN
+    """
+    # 规则1：负功率底噪置0
+    df.loc[df['Patv'] < 0, 'Patv'] = 0.0
+
+    # 规则2：停机标记（Patv<=0 且 Wspd>2.5）
+    if 'Wspd' in df.columns:
+        mask_stop = (df['Patv'] <= 0) & (df['Wspd'] > 2.5)
+        df.loc[mask_stop, 'Patv'] = np.nan
+
+    # 规则3：桨叶顺桨（任一桨距角 > 89°）
+    pab_cols = [c for c in ['Pab1', 'Pab2', 'Pab3'] if c in df.columns]
+    if pab_cols:
+        mask_pab = (df[pab_cols] > 89.0).any(axis=1)
+        df.loc[mask_pab, 'Patv'] = np.nan
+
+    # 规则4：风速传感器异常
+    if 'Wspd' in df.columns:
+        df.loc[df['Wspd'] < 0, 'Patv'] = np.nan
+
+    # 规则5：温度传感器异常
+    for col in ['Etmp', 'Itmp']:
+        if col in df.columns:
+            mask_temp = (df[col] < -40) | (df[col] > 80)
+            df.loc[mask_temp, 'Patv'] = np.nan
+
+    return df
 
 
 def _build_loaders(raw: np.ndarray,
@@ -245,12 +363,12 @@ def _build_loaders(raw: np.ndarray,
       1. 扩展到 [T, N, F]
       2. 70/10/20 划分
       3. Z-score 归一化（fit on train）
-      4. 构建相关性邻接矩阵（fit on train，基于第一个特征）
+      4. 皮尔逊相关邻接矩阵（fit on train，基于第一个特征）
       5. 返回 (train_loader, val_loader, test_loader, adj_tensor, scaler, in_dim)
-         in_dim = F，供 main.py 自动设置模型的 in_dim，无需手动修改 config
+         in_dim=F 供 main.py 自动设置 config.model.in_dim
     """
     if raw.ndim == 2:
-        raw = raw[:, :, None]                           # [T, N, 1]
+        raw = raw[:, :, None]
 
     T, N, F = raw.shape
     n_train  = int(T * 0.7)
@@ -260,13 +378,11 @@ def _build_loaders(raw: np.ndarray,
     val_raw   = raw[n_train : n_train + n_val]
     test_raw  = raw[n_train + n_val :]
 
-    # 归一化：只在训练集上 fit
     scaler     = Scaler(log_transform=log_transform).fit(train_raw)
     train_data = scaler.transform(train_raw)
     val_data   = scaler.transform(val_raw)
     test_data  = scaler.transform(test_raw)
 
-    # 邻接矩阵：基于训练集第一个特征的皮尔逊相关
     adj = build_correlation_adj(train_data[:, :, 0], threshold=adj_threshold)
 
     print(f"[{name}] T={T}, N={N}, F={F} | "
@@ -285,5 +401,4 @@ def _build_loaders(raw: np.ndarray,
                               shuffle=False, num_workers=0, pin_memory=False)
 
     adj_tensor = torch.tensor(adj, dtype=torch.float32)
-    # 返回 in_dim=F，供 main.py 自动覆盖 config.model.in_dim
     return train_loader, val_loader, test_loader, adj_tensor, scaler, F

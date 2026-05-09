@@ -1,6 +1,5 @@
 """
-GridCFN – 主入口（CFM 版 v4）
-[v4] build_model 新增 chunk_size 参数，透传给 SCGMP 防 Weather OOM。
+GridCFN – 主入口
 """
 
 import argparse
@@ -16,7 +15,7 @@ import torch
 
 from config import Config, get_config
 from model import GridCFN
-from dataset import load_solar_energy, load_electricity, load_weather
+from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf
 from train import train
 
 
@@ -89,8 +88,10 @@ def load_data(cfg):
     elif d.dataset == "weather":
         return load_weather(d.data_path, d.T_in, d.T_out, d.adj_threshold, d.batch_size,
                             feature_idx=getattr(d, "weather_feature_idx", 0))
+    elif d.dataset == "sdwpf":
+        return load_sdwpf(d.data_path, d.T_in, d.T_out, d.adj_threshold, d.batch_size)
     else:
-        raise ValueError(f"未知数据集: '{d.dataset}'")
+        raise ValueError(f"未知数据集: '{d.dataset}'，支持: solar, electricity, weather, sdwpf")
 
 
 def build_model(cfg, in_dim=None):
@@ -103,9 +104,7 @@ def build_model(cfg, in_dim=None):
         n_scg_layers=m.n_scg_layers, out_dim=m.out_dim, lambda_mi=m.lambda_mi,
         cfm_hidden=getattr(m, "cfm_hidden", 128),
         cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 16),
-        # [v4] chunk_size 透传给 SCGMessagePassingLayer，Weather 用 4096 防 OOM
         chunk_size=getattr(m, "chunk_size", 16384),
-        # [v6-Dilation] ms_dilations 按数据集分辨率配置
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
     )
 
@@ -159,9 +158,9 @@ def main(cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GridCFN Training (CFM v4)")
+    parser = argparse.ArgumentParser(description="GridCFN Training")
     parser.add_argument("--preset", type=str, default="solar",
-                        choices=["solar", "electricity", "weather"])
+                        choices=["solar", "electricity", "weather", "sdwpf"])
     args = parser.parse_args()
     cfg  = get_config(args.preset)
     history, result_dir = main(cfg)
