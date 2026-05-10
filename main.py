@@ -1,5 +1,9 @@
 """
-GridCFN – 主入口
+GridCFN – 主入口（多步预测版）
+
+相对单步版的改动：
+  - build_model 传入 T_out（来自 cfg.data.T_out）
+  - 其余逻辑完全不变
 """
 
 import argparse
@@ -91,7 +95,7 @@ def load_data(cfg):
     elif d.dataset == "sdwpf":
         return load_sdwpf(d.data_path, d.T_in, d.T_out, d.adj_threshold, d.batch_size)
     else:
-        raise ValueError(f"未知数据集: '{d.dataset}'，支持: solar, electricity, weather, sdwpf")
+        raise ValueError(f"未知数据集: '{d.dataset}'")
 
 
 def build_model(cfg, in_dim=None):
@@ -102,10 +106,11 @@ def build_model(cfg, in_dim=None):
         tcn_hidden=m.tcn_hidden, tcn_layers=m.tcn_layers,
         env_dim=m.env_dim, stoch_dim=m.stoch_dim, ms_out_dim=m.ms_out_dim,
         n_scg_layers=m.n_scg_layers, out_dim=m.out_dim, lambda_mi=m.lambda_mi,
-        cfm_hidden=getattr(m, "cfm_hidden", 128),
+        cfm_hidden=getattr(m, "cfm_hidden", 256),
         cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 16),
         chunk_size=getattr(m, "chunk_size", 16384),
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
+        T_out=cfg.data.T_out,   # ← 多步版：传入预测步长
     )
 
 
@@ -126,7 +131,7 @@ def main(cfg):
     logger.info(f"Result dir : {result_dir}")
 
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
-    logger.info(f"in_dim     : {in_dim}")
+    logger.info(f"in_dim     : {in_dim},  T_out={cfg.data.T_out}")
 
     adj_norm   = GridCFN.normalize_adj(adj)
     edge_index = GridCFN.adj_to_edge_index(adj)
@@ -134,7 +139,7 @@ def main(cfg):
 
     model    = build_model(cfg, in_dim=in_dim).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Parameters : {n_params:,}\n")
+    logger.info(f"Parameters : {n_params:,}  (cfm_dim={model.cfm_dim})\n")
 
     history = train(
         model=model,
@@ -158,10 +163,15 @@ def main(cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GridCFN Training")
+    parser = argparse.ArgumentParser(description="GridCFN Multi-Step Training")
     parser.add_argument("--preset", type=str, default="solar",
                         choices=["solar", "electricity", "weather", "sdwpf"])
+    # 可选：命令行覆盖 T_out
+    parser.add_argument("--T_out", type=int, default=None,
+                        help="预测步长，覆盖 preset 默认值（如 --T_out 24）")
     args = parser.parse_args()
     cfg  = get_config(args.preset)
+    if args.T_out is not None:
+        cfg.data.T_out = args.T_out
     history, result_dir = main(cfg)
     print(f"\n所有结果已保存至: {result_dir}")
