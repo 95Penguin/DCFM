@@ -98,9 +98,10 @@ def load_data(cfg):
         raise ValueError(f"未知数据集: '{d.dataset}'")
 
 
-def build_model(cfg, in_dim=None):
+def build_model(cfg, in_dim=None, n_nodes=None):
     m = cfg.model
     return GridCFN(
+        n_nodes=n_nodes,                              # ← AdaptiveGCN 需要节点数
         in_dim=in_dim if in_dim is not None else m.in_dim,
         gcn_hidden=m.gcn_hidden, gcn_layers=m.gcn_layers,
         tcn_hidden=m.tcn_hidden, tcn_layers=m.tcn_layers,
@@ -110,7 +111,8 @@ def build_model(cfg, in_dim=None):
         cfm_time_emb_dim=getattr(m, "cfm_time_emb_dim", 16),
         chunk_size=getattr(m, "chunk_size", 16384),
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
-        T_out=cfg.data.T_out,   # ← 多步版：传入预测步长
+        T_out=cfg.data.T_out,
+        adap_dim=getattr(m, "adap_dim", 16),          # ← 自适应邻接嵌入维度
     )
 
 
@@ -135,9 +137,10 @@ def main(cfg):
 
     adj_norm   = GridCFN.normalize_adj(adj)
     edge_index = GridCFN.adj_to_edge_index(adj)
-    logger.info(f"Graph      : {adj.shape[0]} nodes, {edge_index.shape[1]} edges")
+    n_nodes    = adj.shape[0]
+    logger.info(f"Graph      : {n_nodes} nodes, {edge_index.shape[1]} edges")
 
-    model    = build_model(cfg, in_dim=in_dim).to(device)
+    model    = build_model(cfg, in_dim=in_dim, n_nodes=n_nodes).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Parameters : {n_params:,}  (cfm_dim={model.cfm_dim})\n")
 

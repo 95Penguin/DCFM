@@ -176,13 +176,21 @@ def train_one_epoch(
     sigma_min:       float = 0.01,
 ) -> Dict[str, float]:
     model.train()
-    total_loss = total_cfm = total_mi = total_var = 0.0
+    total_loss = total_cfm = total_mi = total_var = total_gnorm = 0.0
     n_batches  = 0
 
     adj_norm_ = adj_norm.to(device)
     edge_idx_ = edge_index.to(device)
 
     train_club = (epoch > warmup_epochs)
+
+    # CLUB 激活后前 3 个 epoch 线性升温 lambda_mi，避免突然引入大正则导致不稳定
+    if train_club:
+        ramp_epochs  = 3
+        epochs_since = epoch - warmup_epochs          # 1, 2, 3, 4, ...
+        ramp_factor  = min(1.0, epochs_since / ramp_epochs)
+    else:
+        ramp_factor  = 0.0
 
     for x, y in loader:
         # x: [B, T_in, N, F]
@@ -214,33 +222,35 @@ def train_one_epoch(
 
         if train_club:
             mi_loss = model.club(He, Hs)
-            if mi_loss.item() < -1.0:
-                loss   = cfm_l
-                mi_val = mi_loss.item()
-            else:
-                mi_loss_clamped = mi_loss.clamp(min=-0.5)
-                loss   = cfm_l + model.lambda_mi * mi_loss_clamped
-                mi_val = mi_loss.item()
+            mi_val  = mi_loss.item()
+            # clamp 到 -1.0：CLUB 在变分网络未收敛时可能给出很负的估计，
+            # 直接加入 loss 会产生过大负梯度。clamp 提供下界保护。
+            # 不能用 relu：relu 在 MI 为负时完全截断梯度，
+            # 导致正则项长期失效（即日志中 MI 列始终为 0 的根本原因）。
+            mi_loss_clamped = mi_loss.clamp(min=-1.0)
+            loss = cfm_l + model.lambda_mi * ramp_factor * mi_loss_clamped
         else:
             loss   = cfm_l
             mi_val = 0.0
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         optimizer.step()
 
-        total_loss += loss.item()
-        total_cfm  += cfm_l.item()
-        total_mi   += mi_val
-        total_var  += var_loss_val
-        n_batches  += 1
+        total_loss  += loss.item()
+        total_cfm   += cfm_l.item()
+        total_mi    += mi_val
+        total_var   += var_loss_val
+        total_gnorm += grad_norm.item()
+        n_batches   += 1
 
     return {
-        "loss":     total_loss / n_batches,
-        "cfm":      total_cfm  / n_batches,
-        "mi":       total_mi   / n_batches,
-        "var_loss": total_var  / n_batches,
+        "loss":      total_loss  / n_batches,
+        "cfm":       total_cfm   / n_batches,
+        "mi":        total_mi    / n_batches,
+        "var_loss":  total_var   / n_batches,
+        "grad_norm": total_gnorm / n_batches,
     }
 
 
@@ -337,6 +347,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     club_optimizer = torch.optim.Adam(
         model.club.parameters(),
         lr=cfg_train.lr * 0.5,
+        weight_decay=cfg_train.weight_decay,   # 防止 CLUB 网络在小图数据集上过拟合
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
@@ -344,7 +355,9 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         patience=cfg_train.lr_decay_patience,
     )
 
-    n_samples_val   = getattr(cfg_train, "cfm_n_samples",      50)
+    # 训练阶段 val 只需相对排序准确，减半采样数可显著加速每 epoch 时间。
+    # 最终 test 评估仍使用 cfm_n_samples_test（默认 200），不受影响。
+    n_samples_val   = max(20, getattr(cfg_train, "cfm_n_samples",      50) // 2)
     n_steps         = getattr(cfg_train, "cfm_n_steps",        20)
     cfm_n_t_samples = getattr(cfg_train, "cfm_n_t_samples",     4)
     n_samples_test  = getattr(cfg_train, "cfm_n_samples_test", 200)
@@ -363,7 +376,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     logger.info(f"多步预测 T_out={model.T_out}")
     logger.info(f"CLUB warmup: {warmup_epochs} epochs，club_lr={cfg_train.lr * 0.5:.2e}")
     header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | "
-              f"{'VarLoss':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
+              f"{'VarLoss':>9} | {'GradNorm':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
               f"{'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
     logger.info(header)
     logger.info("-" * len(header))
@@ -404,6 +417,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         logger.info(
             f"{epoch:>6} | {train_m['loss']:>8.4f} | {train_m['cfm']:>8.4f} | "
             f"{train_m['mi']:>8.4f} | {train_m['var_loss']:>9.4f} | "
+            f"{train_m['grad_norm']:>9.3f} | "
             f"{val_m['MAE']:>8.4f} | {val_m['RMSE']:>9.4f} | "
             f"{val_crps_avg:>9.4f} | {cur_lr:>8.2e} | {elapsed:>5.1f}s"
         )

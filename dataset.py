@@ -81,7 +81,7 @@ class SlidingWindowDataset(Dataset):
     def __getitem__(self, idx):
         x = self.data[idx : idx + self.T_in]
         y = self.data[idx + self.T_in : idx + self.T_in + self.T_out]
-        return x, y.squeeze(0)   # T_out=1 时 squeeze 掉时间维
+        return x, y   # shape: [T_in, N, F], [T_out, N, F]  —— 保持时间维一致
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +288,13 @@ def _load_sdwpf_csv(data_path: str) -> np.ndarray:
 
     remaining_nan = np.isnan(raw).sum()
     if remaining_nan > 0:
-        print(f"  [SDWPF] 插值后仍有 {remaining_nan} 个 NaN，用 0 填充")
-        raw = np.nan_to_num(raw, nan=0.0)
+        # 用各列（各风机）非 NaN 均值填充，而非固定 0。
+        # 0 会被模型误学为停机状态，引入系统性偏差；
+        # 列均值是最保守的中性填充，不引入额外分布偏移。
+        col_means = np.nanmean(raw, axis=0)          # [N]
+        nan_mask  = np.isnan(raw)
+        raw[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+        print(f"  [SDWPF] 插值后仍有 {remaining_nan} 个 NaN，已用各风机列均值填充")
 
     print(f"  [SDWPF] 最终数据: shape={raw.shape}, "
           f"min={raw.min():.2f}, max={raw.max():.2f}, mean={raw.mean():.2f} kW")
@@ -393,12 +398,24 @@ def _build_loaders(raw: np.ndarray,
     val_ds   = SlidingWindowDataset(val_data,   adj, T_in, T_out)
     test_ds  = SlidingWindowDataset(test_data,  adj, T_in, T_out)
 
+    # num_workers 根据节点数自适应：Weather(1866节点) 等超大图用 0 避免 /dev/shm OOM，
+    # 其余数据集用多进程加速（4/2）。batch_size<=4 说明节点极多，保守用 0。
+    nw_train = 0 if (batch_size <= 4 or N > 500) else 4
+    nw_eval  = 0 if (batch_size <= 4 or N > 500) else 2
+    pin      = (nw_train > 0)   # pin_memory 仅在多进程模式下开启，避免 shm 问题
+
     train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              shuffle=True,  num_workers=0, pin_memory=False)
+                              shuffle=True,  num_workers=nw_train,
+                              pin_memory=pin,
+                              persistent_workers=(nw_train > 0))
     val_loader   = DataLoader(val_ds,   batch_size=batch_size,
-                              shuffle=False, num_workers=0, pin_memory=False)
+                              shuffle=False, num_workers=nw_eval,
+                              pin_memory=pin,
+                              persistent_workers=(nw_eval > 0))
     test_loader  = DataLoader(test_ds,  batch_size=batch_size,
-                              shuffle=False, num_workers=0, pin_memory=False)
+                              shuffle=False, num_workers=nw_eval,
+                              pin_memory=pin,
+                              persistent_workers=(nw_eval > 0))
 
     adj_tensor = torch.tensor(adj, dtype=torch.float32)
     return train_loader, val_loader, test_loader, adj_tensor, scaler, F

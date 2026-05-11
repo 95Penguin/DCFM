@@ -191,7 +191,7 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.5,
+                lambda_mi=0.05,  #0.5->0.05
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 24, 84),
@@ -200,7 +200,7 @@ def get_config(preset: str = "solar") -> Config:
                 lr=5e-4, max_epochs=200,
                 patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
                 seed=42, grad_clip=1.0,
-                warmup_epochs=3,
+                warmup_epochs=10, #3->10
                 cfm_n_samples=50, cfm_n_samples_test=200,
                 cfm_n_steps=20, cfm_n_t_samples=4,
                 cfm_sigma_min=0.01,
