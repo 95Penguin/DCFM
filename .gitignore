@@ -19,3 +19,11 @@ venv/
 
 # 训练结果、日志、模型（重点！）
 result/**/*.json
+result0/
+*.log
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.json
+*.filepart

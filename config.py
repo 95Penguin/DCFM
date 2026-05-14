@@ -40,7 +40,7 @@ class TrainConfig:
     lr_decay_factor:     float        = 0.5
     lr_decay_patience:   int          = 10
     grad_clip:           float        = 1.0
-    weight_decay:        float        = 1e-5
+    weight_decay:        float        = 1e-5    
     save_path:           str          = "best_model.pt"
     seed:                int          = 42
     warmup_epochs:       int          = 3
@@ -103,7 +103,7 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.5,
+                lambda_mi=0.1, #0.5->0.1
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 24, 84),
@@ -111,14 +111,16 @@ def get_config(preset: str = "solar") -> Config:
             train=TrainConfig(
                 lr=5e-4, max_epochs=200,
                 patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
-                seed=42, grad_clip=1.0, warmup_epochs=3,
-                cfm_n_samples=50, cfm_n_samples_test=200,
-                cfm_n_steps=20, cfm_n_t_samples=4,
+                seed=42, grad_clip=1.0, warmup_epochs=5,
+                cfm_n_samples=100,  #50->100
+                cfm_n_samples_test=100, #200->100
+                cfm_n_steps=15,  #20->15
+                cfm_n_t_samples=4,
             ),
         )
 
     elif preset == "electricity":
-        T_out = 24   # Electricity 1h，T_out=24 → 预测未来 1 天
+        T_out = 12   # Electricity 1h，T_out=12 → 预测未来 12h
         return Config(
             data=DataConfig(
                 dataset="electricity",
@@ -132,7 +134,7 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.05,
+                lambda_mi=0.1,
                 cfm_hidden=384, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 12, 84),
@@ -140,14 +142,16 @@ def get_config(preset: str = "solar") -> Config:
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,
                 patience=25, lr_decay_factor=0.5, lr_decay_patience=12,
-                seed=42, grad_clip=1.0, warmup_epochs=3,
-                cfm_n_samples=50, cfm_n_samples_test=200,
-                cfm_n_steps=20, cfm_n_t_samples=4,
+                seed=42, grad_clip=1.0, warmup_epochs=5,
+                cfm_n_samples=100,  #50->100
+                cfm_n_samples_test=100, #200->100
+                cfm_n_steps=15,      #20->15
+                cfm_n_t_samples=4,
             ),
         )
 
     elif preset == "weather":
-        T_out = 24   # Weather 1h，T_out=24 → 预测未来 1 天
+        T_out = 12   # Weather 1h，T_out=12 → 预测未来 12h
         return Config(
             data=DataConfig(
                 dataset="weather",
@@ -191,7 +195,7 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.05,  #0.5->0.05
+                lambda_mi=0.1,  #0.5->0.1
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 24, 84),
@@ -200,9 +204,11 @@ def get_config(preset: str = "solar") -> Config:
                 lr=5e-4, max_epochs=200,
                 patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
                 seed=42, grad_clip=1.0,
-                warmup_epochs=10, #3->10
-                cfm_n_samples=50, cfm_n_samples_test=200,
-                cfm_n_steps=20, cfm_n_t_samples=4,
+                warmup_epochs=5, 
+                cfm_n_samples=100,  #50->100
+                cfm_n_samples_test=100, #200->100
+                cfm_n_steps=15,      #20->15
+                cfm_n_t_samples=4,
                 cfm_sigma_min=0.01,
                 cfm_x0_scale=1.0,
             ),

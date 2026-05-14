@@ -1,83 +1,49 @@
 """
-TSFlow Baseline — ICLR 2025
-"Flow Matching with Gaussian Process Priors for Probabilistic Time Series Forecasting"
-Kollovieh et al., 2025  https://github.com/marcelkollovieh/TSFlow
+baselines/tsflow.py
+TSFlow: Flow Matching with Gaussian Process Priors for Probabilistic
+Time Series Forecasting  — Kollovieh et al., ICLR 2025
 
-架构说明（按论文忠实复现核心设计）：
-  - 条件 CFM：历史序列 x_past → condition encoder → 向量场网络
-  - GP 先验（OU 核）：x0 ~ GP(0, K_OU)，比各向同性高斯更贴近时序结构
-  - OT-CFM 训练目标：L = ||u_theta(t, x_t) - (x1 - x0)||^2
-  - Euler 采样（论文默认 NFE=20）
+github:https://github.com/marcelkollovieh/TSFlow
 
-与 GridCFN 的关键区别（写进 baseline 注释，方便论文分析章节引用）：
-  1. 无图结构：N 个节点作为独立通道处理，不建模节点间空间依赖
-  2. 无因果解耦：无 He/Hs 分离，无 CLUB 互信息最小化
-  3. 无多尺度上下文：无 MultiScaleContext / SCGMP
-  4. GP 先验 vs 各向同性高斯先验（本文贡献）
-
-接口适配：与 GridCFN 共享 dataset.py / train.py 中的 load_data、Scaler、
-评估指标（MAE/RMSE/CRPS/PICP/PINAW），可直接替换 model 参数传入 run_tsflow()。
+多步预测版: T_out 支持，GP(OU) 先验 + OT-CFM + Euler 采样。
 """
-
 import math
+import os
 import time
-import logging
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
 
-# ---------------------------------------------------------------------------
-# 1. GP 先验采样（OU 核，即 Ornstein-Uhlenbeck）
-# ---------------------------------------------------------------------------
+# ── GP 先验（OU 核）────────────────────────────────────────────────────────
 
 class OUKernel:
-    """
-    Ornstein-Uhlenbeck 核：K(tau, tau') = exp(-|tau - tau'| / ell)
-    适合具有粗糙随机游走结构的时序数据（论文 Sec 3.1.1 推荐用于大多数数据集）。
-    """
+    """Ornstein-Uhlenbeck 核: K(τ, τ') = exp(-|τ - τ'| / ell)"""
     def __init__(self, ell: float = 1.0):
         self.ell = ell
 
     def matrix(self, T: int, device: torch.device) -> torch.Tensor:
-        """返回 [T, T] 核矩阵"""
         tau = torch.arange(T, dtype=torch.float32, device=device)
-        dist = (tau.unsqueeze(0) - tau.unsqueeze(1)).abs()        # [T, T]
+        dist = (tau.unsqueeze(0) - tau.unsqueeze(1)).abs()
         return torch.exp(-dist / self.ell)
 
 
 def sample_gp_prior(B: int, N: int, T: int, kernel: OUKernel,
                     device: torch.device) -> torch.Tensor:
-    """
-    从 GP(0, K) 采样。
-    返回 [B, N, T]，每个 (b, n) 是一条独立的 GP 样本。
-
-    实现：Cholesky 分解 + 标准正态映射
-        K = L L^T  →  x = L z, z ~ N(0, I)
-    """
-    K = kernel.matrix(T, device)                                   # [T, T]
+    """Cholesky 分解 + 标准正态 → [B, N, T]"""
+    K = kernel.matrix(T, device)
     jitter = 1e-5 * torch.eye(T, device=device)
-    L = torch.linalg.cholesky(K + jitter)                         # [T, T]
-    z = torch.randn(B, N, T, device=device)                        # [B, N, T]
-    # x = L z: [T, T] x [B*N, T, 1] → [B, N, T]
+    L = torch.linalg.cholesky(K + jitter)
+    z = torch.randn(B, N, T, device=device)
     x = (L @ z.reshape(B * N, T, 1)).reshape(B, N, T)
     return x
 
 
-# ---------------------------------------------------------------------------
-# 2. Condition Encoder：把历史窗口 x_past → context 向量
-# ---------------------------------------------------------------------------
+# ── Condition Encoder ──────────────────────────────────────────────────────
 
 class ConditionEncoder(nn.Module):
-    """
-    轻量 TCN 编码器，将历史 [B, N, T_in, F] 压缩为 context [B, N, hidden_dim]。
-
-    按论文附录：使用 WaveNet 风格的因果卷积 + 全局平均池化。
-    这里保持简洁（与 TSFlow 原版 transformer encoder 等效但更轻），
-    方便与 GridCFN backbone 做消融对比。
-    """
+    """TCN 编码器: [B, T_in, N, F] → [B, N, hidden_dim]"""
     def __init__(self, in_dim: int, hidden_dim: int, n_layers: int = 4,
                  T_in: int = 168):
         super().__init__()
@@ -94,53 +60,31 @@ class ConditionEncoder(nn.Module):
         self.out_proj = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, x_past: torch.Tensor) -> torch.Tensor:
-        """
-        x_past : [B, T_in, N, F]
-        return  : [B, N, hidden_dim]
-        """
         B, T_in, N, F = x_past.shape
-        # [B, N, T_in, F] → [B*N, T_in, F]
         h = x_past.permute(0, 2, 1, 3).reshape(B * N, T_in, F)
-        h = self.input_proj(h)                                     # [B*N, T_in, hidden]
-        h = h.permute(0, 2, 1)                                     # [B*N, hidden, T_in]
+        h = self.input_proj(h)
+        h = h.permute(0, 2, 1)
         for layer in self.layers:
-            h = h + layer(h)[..., :T_in]                           # residual + causal trim
-        h = h.mean(dim=-1)                                         # [B*N, hidden] 全局池化
+            h = h + layer(h)[..., :T_in]
+        h = h.mean(dim=-1)
         h = self.out_proj(h)
-        return h.reshape(B, N, -1)                                 # [B, N, hidden]
+        return h.reshape(B, N, -1)
 
 
-# ---------------------------------------------------------------------------
-# 3. TSFlow 向量场网络（条件版）
-# ---------------------------------------------------------------------------
+# ── 向量场网络 ─────────────────────────────────────────────────────────────
 
 class TSFlowVectorField(nn.Module):
-    """
-    向量场 u_theta(t, x_t | context)。
-
-    输入：
-      x_t     : [B, N, T_out * F]  — 当前流时刻的噪声样本（展平多步输出）
-      t       : [B]                — 流时间 t ∈ [0, 1]
-      context : [B, N, hidden_dim] — 历史编码
-
-    架构：
-      时间嵌入（正弦） + context 投影 → 三层 MLP + AdaLN 条件
-    """
+    """u_θ(t, x_t | context) — AdaLN 条件注入"""
     def __init__(self, out_dim: int, context_dim: int,
                  hidden_dim: int = 256, time_emb_dim: int = 16):
         super().__init__()
         self.out_dim = out_dim
 
-        # 时间嵌入
         half = time_emb_dim // 2
-        freqs = torch.exp(
-            -math.log(10000) * torch.arange(half) / max(half - 1, 1)
-        )
+        freqs = torch.exp(-math.log(10000) * torch.arange(half) / max(half - 1, 1))
         self.register_buffer("freqs", freqs)
-        self.time_proj = nn.Linear(time_emb_dim, 4 * hidden_dim)  # scale×2, bias×2
-
-        # context 投影 → shift/scale for AdaLN
-        self.ctx_proj = nn.Linear(context_dim, 4 * hidden_dim)
+        self.time_proj = nn.Linear(time_emb_dim, 4 * hidden_dim)
+        self.ctx_proj  = nn.Linear(context_dim, 4 * hidden_dim)
 
         self.input_proj = nn.Linear(out_dim, hidden_dim)
         self.layer1 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
@@ -157,200 +101,161 @@ class TSFlowVectorField(nn.Module):
     def forward(self, x_t: torch.Tensor, t: torch.Tensor,
                 context: torch.Tensor) -> torch.Tensor:
         B, N, _ = x_t.shape
-        t_emb = self._time_embed(t, B, N)                         # [B, N, time_emb]
-        t_out = self.time_proj(t_emb)                              # [B, N, 4H]
-        c_out = self.ctx_proj(context)                             # [B, N, 4H]
-
+        t_emb = self._time_embed(t, B, N)
+        t_out = self.time_proj(t_emb)
+        c_out = self.ctx_proj(context)
         ts1, tb1, ts2, tb2 = t_out.chunk(4, dim=-1)
         cs1, cb1, cs2, cb2 = c_out.chunk(4, dim=-1)
 
         h = self.input_proj(x_t)
-
         h_norm = F.layer_norm(h, [h.shape[-1]])
         h = h + self.layer1(h_norm * (1.0 + ts1 + cs1) + (tb1 + cb1))
-
         h_norm = F.layer_norm(h, [h.shape[-1]])
         h = h + self.layer2(h_norm * (1.0 + ts2 + cs2) + (tb2 + cb2))
-
         return self.out_proj(h)
 
 
-# ---------------------------------------------------------------------------
-# 4. TSFlow 主模型
-# ---------------------------------------------------------------------------
+# ── TSFlow 主模型 ──────────────────────────────────────────────────────────
 
 class TSFlow(nn.Module):
-    """
-    TSFlow — 条件 CFM + GP(OU) 先验，无图结构。
-
-    参数：
-      in_dim      : 输入特征维度（通常=1）
-      T_in        : 历史窗口长度
-      T_out       : 预测步长
-      hidden_dim  : 隐层宽度
-      n_enc_layers: Condition Encoder 的 TCN 层数
-      ell         : OU 核的长度尺度
-    """
+    """条件 CFM + GP(OU) 先验，无图结构"""
     def __init__(self, in_dim: int = 1, T_in: int = 168, T_out: int = 12,
                  hidden_dim: int = 256, n_enc_layers: int = 4,
                  time_emb_dim: int = 16, ell: float = 1.0):
         super().__init__()
-        self.T_out     = T_out
-        self.feat_dim  = in_dim
-        self.cfm_dim   = T_out * in_dim
+        self.T_out    = T_out
+        self.feat_dim = in_dim
+        self.cfm_dim  = T_out * in_dim
         self.ou_kernel = OUKernel(ell=ell)
 
         self.encoder = ConditionEncoder(in_dim, hidden_dim, n_enc_layers, T_in)
         self.vector_field = TSFlowVectorField(
-            out_dim=self.cfm_dim,
-            context_dim=hidden_dim,
-            hidden_dim=hidden_dim,
-            time_emb_dim=time_emb_dim,
-        )
-
-    # ------------------------------------------------------------------
-    # 训练损失（OT-CFM，GP 先验 x0）
-    # ------------------------------------------------------------------
+            out_dim=self.cfm_dim, context_dim=hidden_dim,
+            hidden_dim=hidden_dim, time_emb_dim=time_emb_dim)
 
     def cfm_loss(self, x_past: torch.Tensor, y_target: torch.Tensor,
                  n_t_samples: int = 4, sigma_min: float = 0.01) -> torch.Tensor:
-        """
-        OT-CFM 损失。
-
-        x_past   : [B, T_in, N, F]
-        y_target : [B, N, T_out*F]  (已展平)
-
-        分层 t 采样（与 GridCFN 保持一致）：
-          t_k ~ Uniform(k/n, (k+1)/n)，k = 0,...,n-1
-        """
+        """OT-CFM 损失。x_past: [B, T_in, N, F], y_target: [B, N, T_out*F]"""
         B, N, D = y_target.shape
         device  = y_target.device
-        context = self.encoder(x_past)                             # [B, N, hidden]
+        context = self.encoder(x_past)
         losses  = []
 
         for k in range(n_t_samples):
-            # GP(OU) 先验采样
             x0 = sample_gp_prior(B, N, self.T_out, self.ou_kernel, device)
-            # 展平为 [B, N, T_out*F]（F=1 时直接是 [B,N,T_out]）
+            x0 = x0.unsqueeze(-1).expand(-1, -1, -1, self.feat_dim)
             x0 = x0.reshape(B, N, self.cfm_dim)
 
-            # 分层 t 采样
             t = (k + torch.rand(B, device=device)) / n_t_samples
-            t_bc  = t.reshape(B, 1, 1)
+            t_bc = t.reshape(B, 1, 1)
 
-            # OT-CFM 插值：x_t = (1 - t)*x0 + t*x1  （sigma_min 噪声）
-            x_t   = (1.0 - (1.0 - sigma_min) * t_bc) * x0 + t_bc * y_target
-            u_t   = y_target - (1.0 - sigma_min) * x0            # 目标向量场
+            x_t = (1.0 - (1.0 - sigma_min) * t_bc) * x0 + t_bc * y_target
+            u_t = y_target - (1.0 - sigma_min) * x0
 
             v_pred = self.vector_field(x_t, t, context)
             losses.append(F.mse_loss(v_pred, u_t))
 
         return torch.stack(losses).mean()
 
-    # ------------------------------------------------------------------
-    # 采样（Euler，论文默认 NFE=20）
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
     def sample(self, x_past: torch.Tensor, n_samples: int = 50,
                n_steps: int = 20, sigma_min: float = 0.01) -> torch.Tensor:
-        """
-        x_past : [B, T_in, N, F]
-        return : [n_samples, B, N, T_out, feat_dim]  — 与 GridCFN.sample 接口一致
-        """
+        """Euler 采样，返回 [n_samples, B, N, T_out, feat_dim]"""
         B = x_past.shape[0]
         N = x_past.shape[2]
         S = n_samples
         device = x_past.device
         dt = 1.0 / n_steps
 
-        context = self.encoder(x_past)                             # [B, N, hidden]
-        # 复制 S 份
-        ctx = context.repeat_interleave(S, dim=0)                  # [B*S, N, hidden]
+        context = self.encoder(x_past)
+        ctx = context.repeat_interleave(S, dim=0)
 
-        # GP 先验初始样本
         x = sample_gp_prior(B * S, N, self.T_out, self.ou_kernel, device)
-        x = x.reshape(B * S, N, self.cfm_dim)                     # [B*S, N, cfm_dim]
+        x = x.unsqueeze(-1).expand(-1, -1, -1, self.feat_dim)
+        x = x.reshape(B * S, N, self.cfm_dim)
 
         for step in range(n_steps):
             t_val = step * dt
             t_vec = torch.full((B * S,), t_val, device=device)
             v = self.vector_field(x, t_vec, ctx)
-            x = x + dt * v                                         # Euler step
+            x = x + dt * v
 
-        # [B*S, N, T_out*F] → [S, B, N, T_out, F]
         x = x.reshape(B, S, N, self.T_out, self.feat_dim)
-        x = x.permute(1, 0, 2, 3, 4).contiguous()
-        return x
+        return x.permute(1, 0, 2, 3, 4).contiguous()
 
 
-# ---------------------------------------------------------------------------
-# 5. 训练 / 评估入口（与 GridCFN 接口对齐）
-# ---------------------------------------------------------------------------
+# ── 内部评估 ────────────────────────────────────────────────────────────────
 
-def run_tsflow(
-    train_loader: DataLoader,
-    val_loader:   DataLoader,
-    test_loader:  DataLoader,
-    scaler,
-    cfg,                     # 直接传入 GridCFN 的 Config 对象
-    device:       torch.device,
-    logger:       logging.Logger = None,
-) -> dict:
+def _evaluate_tsflow(model: TSFlow, loader, device, scaler,
+                     n_samples: int, n_steps: int, sigma_min: float,
+                     inverse_transform: bool = False,
+                     null_val: float = None) -> dict:
+    from baselines.utils import compute_prob_metrics
+
+    model.eval()
+    samples_list, y_list = [], []
+
+    for x, y in loader:
+        x = x.to(device)
+        raw = model.sample(x, n_samples=n_samples,
+                           n_steps=n_steps, sigma_min=sigma_min)
+        samples_list.append(raw.cpu().numpy())
+        y_list.append(y.permute(0, 2, 1, 3).numpy())
+
+    samples_all = np.concatenate(samples_list, axis=1)
+    y_all       = np.concatenate(y_list,       axis=0)
+
+    if inverse_transform and scaler is not None:
+        shape = samples_all.shape
+        samples_all = scaler.inverse_transform(
+            samples_all.reshape(-1)).reshape(shape)
+        y_all = scaler.inverse_transform(
+            y_all.reshape(-1)).reshape(y_all.shape)
+        null_val = 0.0 if null_val is not None else None
+
+    return compute_prob_metrics(samples_all, y_all, null_val)
+
+
+# ── 训练入口（baselines 统一签名）─────────────────────────────────────────
+
+def run_tsflow(loaders, adj, cfg, device, save_dir, logger,
+               in_dim=None, num_nodes=None, scaler=None, null_val=None):
     """
     TSFlow 训练 + 测试。
-
-    返回格式与 GridCFN 的 train() 完全一致：
-      {train_loss, val_crps, val_mae, val_rmse, test_metrics, ...}
-
-    注意：TSFlow 不使用 adj / edge_index（无图结构），
-          故意不传入，以凸显与 GridCFN 的架构差异。
+    loaders = (train_loader, val_loader, test_loader)
     """
-    if logger is None:
-        logger = logging.getLogger("tsflow")
-        if not logger.handlers:
-            h = logging.StreamHandler()
-            h.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-            logger.addHandler(h)
-            logger.setLevel(logging.DEBUG)
-
-    # ── 超参从 cfg 中读取，保持与 GridCFN 一致的训练条件 ──────────────
+    train_loader, val_loader, test_loader = loaders
     d, m, t_cfg = cfg.data, cfg.model, cfg.train
 
     model = TSFlow(
-        in_dim     = getattr(m, "in_dim", 1),
-        T_in       = d.T_in,
-        T_out      = d.T_out,
-        hidden_dim = getattr(m, "cfm_hidden", 256),
+        in_dim      = in_dim or 1,
+        T_in        = d.T_in,
+        T_out       = d.T_out,
+        hidden_dim  = getattr(m, "cfm_hidden", 256),
         n_enc_layers = getattr(m, "tcn_layers", 4),
         time_emb_dim = getattr(m, "cfm_time_emb_dim", 16),
-        ell        = 1.0,              # OU 核长度尺度（论文默认）
+        ell         = 1.0,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[TSFlow] Parameters: {n_params:,}")
 
     optimizer = torch.optim.Adam(
-        model.parameters(), lr=t_cfg.lr, weight_decay=t_cfg.weight_decay
-    )
+        model.parameters(), lr=t_cfg.lr, weight_decay=t_cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min",
-        factor=t_cfg.lr_decay_factor,
-        patience=t_cfg.lr_decay_patience,
-    )
+        optimizer, mode="min", factor=t_cfg.lr_decay_factor,
+        patience=t_cfg.lr_decay_patience)
 
     n_samples_val  = getattr(t_cfg, "cfm_n_samples",      50)
     n_samples_test = getattr(t_cfg, "cfm_n_samples_test", 200)
     n_steps        = getattr(t_cfg, "cfm_n_steps",        20)
     n_t_samples    = getattr(t_cfg, "cfm_n_t_samples",    4)
     sigma_min      = getattr(t_cfg, "cfm_sigma_min",      0.01)
-    save_path      = t_cfg.save_path.replace(".pt", "_tsflow.pt")
+    save_path      = os.path.join(save_dir, "tsflow_best.pt")
 
-    best_val_crps     = float("inf")
+    best_val_crps  = float("inf")
     epochs_no_improve = 0
-    history = {
-        "train_loss": [], "val_crps": [], "val_mae": [], "val_rmse": []
-    }
+    history = {"train_loss": [], "val_crps": [], "val_mae": [], "val_rmse": []}
 
     logger.info("[TSFlow] 开始训练 (无图结构, GP-OU 先验)")
     logger.info(f"{'Epoch':>6} | {'Loss':>8} | {'Val MAE':>8} | "
@@ -363,8 +268,8 @@ def run_tsflow(
         n_batches  = 0
 
         for x, y in train_loader:
-            x = x.to(device)                                       # [B, T_in, N, F]
-            y = y.to(device)                                       # [B, T_out, N, F]
+            x = x.to(device)
+            y = y.to(device)
             B, T_out, N, F = y.shape
             y_flat = y.permute(0, 2, 1, 3).reshape(B, N, T_out * F)
 
@@ -379,10 +284,10 @@ def run_tsflow(
 
         avg_loss = epoch_loss / max(n_batches, 1)
 
-        # ── 验证（归一化域）──────────────────────────────────────────
-        val_m = _evaluate(model, val_loader, device, scaler,
-                          n_samples_val, n_steps, sigma_min,
-                          inverse_transform=False)
+        val_m = _evaluate_tsflow(model, val_loader, device, scaler,
+                                 n_samples_val, n_steps, sigma_min,
+                                 inverse_transform=False,
+                                 null_val=null_val)
         scheduler.step(val_m["CRPS"])
         cur_lr  = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
@@ -395,8 +300,7 @@ def run_tsflow(
         logger.info(
             f"{epoch:>6} | {avg_loss:>8.4f} | {val_m['MAE']:>8.4f} | "
             f"{val_m['RMSE']:>9.4f} | {val_m['CRPS']:>9.4f} | "
-            f"{cur_lr:>8.2e} | {elapsed:>5.1f}s"
-        )
+            f"{cur_lr:>8.2e} | {elapsed:>5.1f}s")
 
         if val_m["CRPS"] < best_val_crps:
             best_val_crps     = val_m["CRPS"]
@@ -408,13 +312,12 @@ def run_tsflow(
                 logger.info(f"[TSFlow] 早停于 epoch {epoch}")
                 break
 
-    # ── 最终测试（反归一化域）────────────────────────────────────────
     model.load_state_dict(
-        torch.load(save_path, map_location=device, weights_only=True)
-    )
-    test_m = _evaluate(model, test_loader, device, scaler,
-                       n_samples_test, n_steps, sigma_min,
-                       inverse_transform=True)
+        torch.load(save_path, map_location=device, weights_only=True))
+    test_m = _evaluate_tsflow(model, test_loader, device, scaler,
+                              n_samples_test, n_steps, sigma_min,
+                              inverse_transform=True,
+                              null_val=null_val)
 
     sep = "=" * 55
     logger.info(f"\n{sep}")
@@ -425,89 +328,7 @@ def run_tsflow(
     logger.info(sep)
 
     history["test_metrics"] = test_m
+    history["test_mae"]  = test_m["MAE"]
+    history["test_rmse"] = test_m["RMSE"]
+    history["test_mape"] = test_m["MAPE"]
     return history
-
-
-# ---------------------------------------------------------------------------
-# 6. 内部评估函数
-# ---------------------------------------------------------------------------
-
-def _evaluate(model: TSFlow, loader: DataLoader, device: torch.device,
-              scaler, n_samples: int, n_steps: int, sigma_min: float,
-              inverse_transform: bool = False) -> dict:
-    """与 train.py 中的 evaluate() 返回同样结构的 dict。"""
-    model.eval()
-    samples_list, y_list = [], []
-
-    for x, y in loader:
-        x = x.to(device)
-        raw = model.sample(x, n_samples=n_samples,
-                           n_steps=n_steps, sigma_min=sigma_min)
-        # raw: [S, B, N, T_out, F]
-        samples_list.append(raw.cpu().numpy())
-        # y: [B, T_out, N, F] → [B, N, T_out, F]
-        y_list.append(y.permute(0, 2, 1, 3).numpy())
-
-    samples_all = np.concatenate(samples_list, axis=1)  # [S, total, N, T_out, F]
-    y_all       = np.concatenate(y_list,       axis=0)  # [total, N, T_out, F]
-
-    if inverse_transform and scaler is not None:
-        shape = samples_all.shape
-        samples_all = scaler.inverse_transform(
-            samples_all.reshape(-1)).reshape(shape)
-        y_all = scaler.inverse_transform(
-            y_all.reshape(-1)).reshape(y_all.shape)
-
-    return _compute_metrics(samples_all, y_all)
-
-
-def _compute_metrics(samples: np.ndarray, y: np.ndarray) -> dict:
-    """samples: [S,...], y: [...]"""
-    mu = samples.mean(axis=0)
-
-    def mae(p, t):  return float(np.abs(p - t).mean())
-    def rmse(p, t): return float(np.sqrt(((p - t) ** 2).mean()))
-
-    def crps(s, t):
-        S = s.shape[0]
-        mae_term = np.abs(s - t[None]).mean(axis=0)
-        n_perm = min(10, S - 1)
-        if n_perm <= 0:
-            return float(mae_term.mean())
-        rng = np.random.default_rng(0)
-        spreads = []
-        for _ in range(n_perm):
-            perm = rng.permutation(S)
-            clash = np.where(perm == np.arange(S))[0]
-            for idx in clash:
-                swap = (idx + 1) % S
-                perm[idx], perm[swap] = perm[swap], perm[idx]
-            spreads.append(np.abs(s - s[perm]).mean(axis=0))
-        return float((mae_term - 0.5 * np.mean(spreads, axis=0)).mean())
-
-    def picp(s, t, conf=0.95):
-        lo = np.quantile(s, (1 - conf) / 2,     axis=0)
-        hi = np.quantile(s, 1 - (1 - conf) / 2, axis=0)
-        return float(((t >= lo) & (t <= hi)).astype(float).mean())
-
-    def pinaw(s, t, conf=0.95):
-        lo = np.quantile(s, (1 - conf) / 2,     axis=0)
-        hi = np.quantile(s, 1 - (1 - conf) / 2, axis=0)
-        return float(((hi - lo) / (t.max() - t.min() + 1e-8)).mean())
-
-    metrics = {
-        "MAE":   mae(mu, y),
-        "RMSE":  rmse(mu, y),
-        "CRPS":  crps(samples, y),
-        "PICP":  picp(samples, y),
-        "PINAW": pinaw(samples, y),
-    }
-    T_out = y.shape[2]
-    for h in range(T_out):
-        sh = samples[:, :, :, h, :]
-        yh = y[:, :, h, :]
-        mh = sh.mean(axis=0)
-        metrics[f"MAE_h{h+1}"]  = mae(mh, yh)
-        metrics[f"RMSE_h{h+1}"] = rmse(mh, yh)
-        metrics[f"CRPS_h{h+1}"] = crps(sh, yh)
-    return metrics

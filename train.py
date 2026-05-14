@@ -28,6 +28,11 @@ from torch.utils.data import DataLoader
 from model import GridCFN
 
 
+def _set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad_(requires_grad)
+
+
 # ---------------------------------------------------------------------------
 # 评估指标（逐元素，支持任意形状末尾维度）
 # ---------------------------------------------------------------------------
@@ -170,13 +175,14 @@ def train_one_epoch(
     edge_index:      torch.Tensor,
     device:          torch.device,
     epoch:           int,
+    main_params,
     grad_clip:       float = 1.0,
     warmup_epochs:   int = 5,
     cfm_n_t_samples: int = 4,
     sigma_min:       float = 0.01,
 ) -> Dict[str, float]:
     model.train()
-    total_loss = total_cfm = total_mi = total_var = total_gnorm = 0.0
+    total_loss = total_cfm = total_mi = total_mi_prime = total_var = total_gnorm = 0.0
     n_batches  = 0
 
     adj_norm_ = adj_norm.to(device)
@@ -221,26 +227,35 @@ def train_one_epoch(
                                sigma_min=sigma_min)
 
         if train_club:
-            mi_loss = model.club(He, Hs)
-            mi_val  = mi_loss.item()
-            # clamp 到 -1.0：CLUB 在变分网络未收敛时可能给出很负的估计，
-            # 直接加入 loss 会产生过大负梯度。clamp 提供下界保护。
-            # 不能用 relu：relu 在 MI 为负时完全截断梯度，
-            # 导致正则项长期失效（即日志中 MI 列始终为 0 的根本原因）。
-            mi_loss_clamped = mi_loss.clamp(min=-1.0)
-            loss = cfm_l + model.lambda_mi * ramp_factor * mi_loss_clamped
+            _set_requires_grad(model.club, False)
+            try:
+                mi_loss = model.club(He, Hs)
+                mi_val  = mi_loss.item()
+                # 只惩罚正的 MI 估计；负估计不再作为奖励项降低主损失。
+                mi_penalty = mi_loss.clamp(min=0.0)
+                loss = cfm_l + model.lambda_mi * ramp_factor * mi_penalty
+
+                with torch.no_grad():
+                    if He_prime.shape[-1] == He.shape[-1] and Hs_prime.shape[-1] == Hs.shape[-1]:
+                        mi_prime_val = model.club(He_prime.detach(), Hs_prime.detach()).item()
+                    else:
+                        mi_prime_val = float("nan")
+            finally:
+                _set_requires_grad(model.club, True)
         else:
             loss   = cfm_l
             mi_val = 0.0
+            mi_prime_val = 0.0
 
         optimizer.zero_grad()
         loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(main_params, max_norm=grad_clip)
         optimizer.step()
 
         total_loss  += loss.item()
         total_cfm   += cfm_l.item()
         total_mi    += mi_val
+        total_mi_prime += mi_prime_val
         total_var   += var_loss_val
         total_gnorm += grad_norm.item()
         n_batches   += 1
@@ -249,6 +264,7 @@ def train_one_epoch(
         "loss":      total_loss  / n_batches,
         "cfm":       total_cfm   / n_batches,
         "mi":        total_mi    / n_batches,
+        "mi_prime":  total_mi_prime / n_batches,
         "var_loss":  total_var   / n_batches,
         "grad_norm": total_gnorm / n_batches,
     }
@@ -339,8 +355,11 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
             logger.addHandler(h)
             logger.setLevel(logging.DEBUG)
 
+    club_param_ids = {id(p) for p in model.club.parameters()}
+    main_params = [p for p in model.parameters() if id(p) not in club_param_ids]
+
     optimizer = torch.optim.Adam(
-        model.parameters(),
+        main_params,
         lr=cfg_train.lr,
         weight_decay=cfg_train.weight_decay,
     )
@@ -368,14 +387,14 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     best_val_crps     = float("inf")
     epochs_no_improve = 0
     history = {
-        "train_loss": [], "train_cfm": [], "train_mi": [], "train_var_loss": [],
+        "train_loss": [], "train_cfm": [], "train_mi": [], "train_mi_prime": [], "train_var_loss": [],
         "val_crps": [], "val_mae": [], "val_rmse": [],
     }
 
     logger.info("Val 指标在归一化域（用于早停），Test 指标在反归一化域（实际量纲）")
     logger.info(f"多步预测 T_out={model.T_out}")
     logger.info(f"CLUB warmup: {warmup_epochs} epochs，club_lr={cfg_train.lr * 0.5:.2e}")
-    header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | "
+    header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | {'MIp':>8} | "
               f"{'VarLoss':>9} | {'GradNorm':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
               f"{'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
     logger.info(header)
@@ -387,7 +406,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         train_m = train_one_epoch(
             model, train_loader, optimizer, club_optimizer,
             adj_norm, edge_index, device, epoch,
-            cfg_train.grad_clip, warmup_epochs,
+            main_params, cfg_train.grad_clip, warmup_epochs,
             cfm_n_t_samples=cfm_n_t_samples,
             sigma_min=sigma_min,
         )
@@ -409,6 +428,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         history["train_loss"].append(train_m["loss"])
         history["train_cfm"].append(train_m["cfm"])
         history["train_mi"].append(train_m["mi"])
+        history["train_mi_prime"].append(train_m["mi_prime"])
         history["train_var_loss"].append(train_m["var_loss"])
         history["val_crps"].append(val_crps_avg)
         history["val_mae"].append(val_m["MAE"])
@@ -416,7 +436,8 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
 
         logger.info(
             f"{epoch:>6} | {train_m['loss']:>8.4f} | {train_m['cfm']:>8.4f} | "
-            f"{train_m['mi']:>8.4f} | {train_m['var_loss']:>9.4f} | "
+            f"{train_m['mi']:>8.4f} | {train_m['mi_prime']:>8.4f} | "
+            f"{train_m['var_loss']:>9.4f} | "
             f"{train_m['grad_norm']:>9.3f} | "
             f"{val_m['MAE']:>8.4f} | {val_m['RMSE']:>9.4f} | "
             f"{val_crps_avg:>9.4f} | {cur_lr:>8.2e} | {elapsed:>5.1f}s"
