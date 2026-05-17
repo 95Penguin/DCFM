@@ -292,6 +292,13 @@ def _load_sdwpf_csv(data_path: str) -> np.ndarray:
         # 0 会被模型误学为停机状态，引入系统性偏差；
         # 列均值是最保守的中性填充，不引入额外分布偏移。
         col_means = np.nanmean(raw, axis=0)          # [N]
+        # 若某列全为 NaN，np.nanmean 返回 NaN，fallback 到全局均值或 0
+        nan_cols = np.isnan(col_means)
+        if nan_cols.any():
+            global_mean = np.nanmean(raw) if not np.all(nan_cols) else 0.0
+            col_means[nan_cols] = global_mean
+            print(f"  [SDWPF] {nan_cols.sum()} 台风机整列无有效数据，已用全局均值 "
+                  f"({global_mean:.2f} kW) 填充")
         nan_mask  = np.isnan(raw)
         raw[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
         print(f"  [SDWPF] 插值后仍有 {remaining_nan} 个 NaN，已用各风机列均值填充")

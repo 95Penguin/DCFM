@@ -142,9 +142,9 @@ class TSFlow(nn.Module):
         losses  = []
 
         for k in range(n_t_samples):
-            x0 = sample_gp_prior(B, N, self.T_out, self.ou_kernel, device)
-            x0 = x0.unsqueeze(-1).expand(-1, -1, -1, self.feat_dim)
-            x0 = x0.reshape(B, N, self.cfm_dim)
+            x0 = sample_gp_prior(B, N, self.T_out, self.ou_kernel, device)  # [B, N, T_out]
+            x0 = x0.unsqueeze(-1).expand(-1, -1, -1, self.feat_dim)          # [B, N, T_out, feat_dim]
+            x0 = x0.contiguous().reshape(B, N, self.cfm_dim)                 # [B, N, T_out*feat_dim]
 
             t = (k + torch.rand(B, device=device)) / n_t_samples
             t_bc = t.reshape(B, 1, 1)
@@ -170,9 +170,9 @@ class TSFlow(nn.Module):
         context = self.encoder(x_past)
         ctx = context.repeat_interleave(S, dim=0)
 
-        x = sample_gp_prior(B * S, N, self.T_out, self.ou_kernel, device)
-        x = x.unsqueeze(-1).expand(-1, -1, -1, self.feat_dim)
-        x = x.reshape(B * S, N, self.cfm_dim)
+        x = sample_gp_prior(B * S, N, self.T_out, self.ou_kernel, device)  # [B*S, N, T_out]
+        x = x.unsqueeze(-1).expand(-1, -1, -1, self.feat_dim)               # [B*S, N, T_out, feat_dim]
+        x = x.contiguous().reshape(B * S, N, self.cfm_dim)                  # [B*S, N, T_out*feat_dim]
 
         for step in range(n_steps):
             t_val = step * dt
@@ -188,7 +188,6 @@ class TSFlow(nn.Module):
 
 def _evaluate_tsflow(model: TSFlow, loader, device, scaler,
                      n_samples: int, n_steps: int, sigma_min: float,
-                     inverse_transform: bool = False,
                      null_val: float = None) -> dict:
     from baselines.utils import compute_prob_metrics
 
@@ -205,15 +204,19 @@ def _evaluate_tsflow(model: TSFlow, loader, device, scaler,
     samples_all = np.concatenate(samples_list, axis=1)
     y_all       = np.concatenate(y_list,       axis=0)
 
-    if inverse_transform and scaler is not None:
+    metrics_norm = compute_prob_metrics(samples_all, y_all)
+
+    if scaler is not None:
         shape = samples_all.shape
         samples_all = scaler.inverse_transform(
             samples_all.reshape(-1)).reshape(shape)
         y_all = scaler.inverse_transform(
             y_all.reshape(-1)).reshape(y_all.shape)
-        null_val = 0.0 if null_val is not None else None
 
-    return compute_prob_metrics(samples_all, y_all, null_val)
+    metrics = compute_prob_metrics(samples_all, y_all)
+    for k, v in metrics_norm.items():
+        metrics[f"{k}_norm"] = v
+    return metrics
 
 
 # ── 训练入口（baselines 统一签名）─────────────────────────────────────────
@@ -286,7 +289,6 @@ def run_tsflow(loaders, adj, cfg, device, save_dir, logger,
 
         val_m = _evaluate_tsflow(model, val_loader, device, scaler,
                                  n_samples_val, n_steps, sigma_min,
-                                 inverse_transform=False,
                                  null_val=null_val)
         scheduler.step(val_m["CRPS"])
         cur_lr  = optimizer.param_groups[0]["lr"]
@@ -316,15 +318,25 @@ def run_tsflow(loaders, adj, cfg, device, save_dir, logger,
         torch.load(save_path, map_location=device, weights_only=True))
     test_m = _evaluate_tsflow(model, test_loader, device, scaler,
                               n_samples_test, n_steps, sigma_min,
-                              inverse_transform=True,
                               null_val=null_val)
 
     sep = "=" * 55
     logger.info(f"\n{sep}")
+    logger.info(f"[TSFlow] TEST SET RESULTS (归一化域, T_out={d.T_out})")
+    logger.info(sep)
+    for k in ["MAE", "RMSE", "CRPS", "PICP", "PINAW"]:
+        logger.info(f"  {k:<8}: {test_m[f'{k}_norm']:.4f}")
+    logger.info(sep)
     logger.info(f"[TSFlow] TEST SET RESULTS (反归一化域, T_out={d.T_out})")
     logger.info(sep)
     for k in ["MAE", "RMSE", "CRPS", "PICP", "PINAW"]:
         logger.info(f"  {k:<8}: {test_m[k]:.4f}")
+    logger.info(f"\n  {'Step':<6}  {'MAE':>8}  {'RMSE':>8}  {'CRPS':>8}")
+    for h in range(d.T_out):
+        mae_h  = test_m.get(f"MAE_h{h+1}",  float("nan"))
+        rmse_h = test_m.get(f"RMSE_h{h+1}", float("nan"))
+        crps_h = test_m.get(f"CRPS_h{h+1}", float("nan"))
+        logger.info(f"  h={h+1:<4}  {mae_h:>8.4f}  {rmse_h:>8.4f}  {crps_h:>8.4f}")
     logger.info(sep)
 
     history["test_metrics"] = test_m

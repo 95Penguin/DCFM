@@ -88,15 +88,17 @@ def run_var(train_loader, test_loader, T_in: int, T_out: int,
     pred = torch.cat(preds, dim=0)     # [total, T_out, N, 1]
     true = torch.cat(trues, dim=0)     # [total, T_out, N, 1]
 
+    mae_norm, rmse_norm, mape_norm = compute_metrics(pred, true)
+
     if scaler is not None:
         pred = scaler.inverse_transform(pred.numpy().reshape(-1)).reshape(pred.shape)
         pred = torch.from_numpy(pred).float()
         true_np = scaler.inverse_transform(true.numpy().reshape(-1)).reshape(true.shape)
         true = torch.from_numpy(true_np).float()
-        null_val_orig = 0.0 if null_val is not None else None
-    else:
-        null_val_orig = null_val
 
-    mae, rmse, mape = compute_metrics(pred, true, null_val_orig)
-    _log(f"[VAR] MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
-    return {"test_mae": mae, "test_rmse": rmse, "test_mape": mape}
+    mae, rmse, mape = compute_metrics(pred, true)
+    _log(f"[VAR] 归一化域   MAE={mae_norm:.4f}  RMSE={rmse_norm:.4f}  MAPE={mape_norm:.2f}%")
+    _log(f"[VAR] 反归一化域 MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
+    return {"test_mae": mae, "test_rmse": rmse, "test_mape": mape,
+            "test_mae_norm": mae_norm, "test_rmse_norm": rmse_norm,
+            "test_mape_norm": mape_norm}

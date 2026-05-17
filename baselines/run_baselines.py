@@ -12,9 +12,8 @@ baselines/run_baselines.py
 
 修复：
   [1] load_weather 调用补全 feature_idx 参数
-  [2] null_val 按数据集语义分别传入：
-      Solar / SDWPF  → 传归一化零值（夜间/停机功率为 0 应 mask）
-      Electricity / Weather → 传 None（无真实物理零值约束，不应 mask）
+  [2] null_val 统一传 None：全量无 mask 评估，与 GridCFN 主模型对齐，
+      方便与文献直接对比。
 """
 
 import argparse
@@ -94,21 +93,12 @@ def load_data(cfg):
         raise ValueError(d.dataset)
 
 
-def _get_null_val(dataset: str, scaler) -> float | None:
+def _get_null_val(dataset: str, scaler) -> None:
     """
-    修复 [2]：按数据集语义决定是否 mask 零值。
-
-    Solar / SDWPF：目标变量为功率，夜间或停机时物理值为 0，
-                   与"缺失值"含义不同但通常不计入误差统计（论文惯例）。
-                   传归一化后的零值作为 null_val。
-
-    Electricity / Weather：用电量 / 气象变量无真实零值约束，
-                            零值是合法观测值，不应 mask。传 None。
+    统一返回 None：所有数据集均无 mask，全量评估，与 GridCFN 主模型对齐。
+    null_val 参数在各函数中保留接口但不使用。
     """
-    if dataset in ("solar", "sdwpf"):
-        return float(scaler.transform(np.array([0.0], dtype=np.float32))[0])
-    else:
-        return None
+    return None
 
 
 # ── 各 baseline 工厂函数 ──────────────────────────────────────────────────
@@ -406,17 +396,30 @@ def run_csdi(loaders, adj, cfg, device, save_dir, logger,
 
     samples_all = torch.cat(samples_list, dim=1).numpy()  # [S, total, N, T_out, F]
     true_all = torch.cat(trues, dim=0).numpy()            # [total, N, T_out, F]
-    null_val_eval = null_val
+
+    test_m_norm = compute_prob_metrics(samples_all, true_all)
+
+    null_val_eval = None
     if scaler is not None:
         shape = samples_all.shape
         samples_all = scaler.inverse_transform(samples_all.reshape(-1)).reshape(shape)
         true_all = scaler.inverse_transform(true_all.reshape(-1)).reshape(true_all.shape)
-        null_val_eval = 0.0 if null_val is not None else None
 
     test_m = compute_prob_metrics(samples_all, true_all, null_val_eval)
+    for k, v in test_m_norm.items():
+        test_m[f"{k}_norm"] = v
     mae, rmse, mape = test_m["MAE"], test_m["RMSE"], test_m["MAPE"]
-    logger.info(f"  [Test] MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%  "
+    logger.info(f"  [Test] 归一化域   MAE={test_m['MAE_norm']:.4f}  RMSE={test_m['RMSE_norm']:.4f}  "
+                f"MAPE={test_m['MAPE_norm']:.2f}%  CRPS={test_m['CRPS_norm']:.4f}")
+    logger.info(f"  [Test] 反归一化域 MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%  "
                 f"CRPS={test_m['CRPS']:.4f}")
+    T_out = cfg.data.T_out
+    logger.info(f"\n  {'Step':<6}  {'MAE':>8}  {'RMSE':>8}  {'CRPS':>8}")
+    for h in range(T_out):
+        mae_h  = test_m.get(f"MAE_h{h+1}",  float("nan"))
+        rmse_h = test_m.get(f"RMSE_h{h+1}", float("nan"))
+        crps_h = test_m.get(f"CRPS_h{h+1}", float("nan"))
+        logger.info(f"  h={h+1:<4}  {mae_h:>8.4f}  {rmse_h:>8.4f}  {crps_h:>8.4f}")
     history.update({"test_metrics": test_m, "test_mae": mae,
                     "test_rmse": rmse, "test_mape": mape,
                     "test_crps": test_m["CRPS"]})
@@ -493,13 +496,9 @@ def main():
     loaders   = (train_loader, val_loader, test_loader)
     logger.info(f"Nodes={num_nodes}, in_dim={in_dim}, T_in={cfg.data.T_in}")
 
-    # 修复 [2]：按数据集语义决定 null_val
+    # 统一无 mask：null_val=None，全量评估，与 GridCFN 对齐
     null_val = _get_null_val(dataset, scaler)
-    if null_val is not None:
-        logger.info(f"null_val (normalized zero): {null_val:.4f}  "
-                    f"(scaler mean={scaler.mean:.4f}, std={scaler.std:.4f})")
-    else:
-        logger.info(f"null_val: None (dataset={dataset}, no zero-masking)")
+    logger.info(f"null_val: None (无 mask，全量评估，与 GridCFN 统一)")
 
     all_results = {}
 
@@ -515,9 +514,10 @@ def main():
             all_results[model_name] = {"error": str(e)}
 
     # ── 汇总表 ────────────────────────────────────────────────────────────
-    logger.info("\n" + "=" * 60)
-    logger.info(f"{'Model':<12} {'MAE':>10} {'RMSE':>10} {'MAPE(%)':>10}")
-    logger.info("-" * 60)
+    W = 84
+    logger.info("\n" + "=" * W)
+    logger.info(f"{'Model':<12} {'MAE':>10} {'RMSE':>10} {'MAPE(%)':>10} {'CRPS':>10}  (反归一化域)")
+    logger.info("-" * W)
     for name, res in all_results.items():
         if "error" in res:
             logger.info(f"{name:<12}  ERROR: {res['error']}")
@@ -526,8 +526,23 @@ def main():
             mae  = res.get("test_mae",  metrics.get("MAE",  float("nan")))
             rmse = res.get("test_rmse", metrics.get("RMSE", float("nan")))
             mape = res.get("test_mape", metrics.get("MAPE", float("nan")))
-            logger.info(f"{name:<12} {mae:>10.4f} {rmse:>10.4f} {mape:>10.2f}")
-    logger.info("=" * 60)
+            crps = res.get("test_crps", metrics.get("CRPS", float("nan")))
+            logger.info(f"{name:<12} {mae:>10.4f} {rmse:>10.4f} {mape:>10.2f} {crps:>10.4f}")
+    logger.info("=" * W)
+
+    logger.info(f"{'Model':<12} {'MAE':>10} {'RMSE':>10} {'MAPE(%)':>10} {'CRPS':>10}  (归一化域)")
+    logger.info("-" * W)
+    for name, res in all_results.items():
+        if "error" in res:
+            logger.info(f"{name:<12}  ERROR: {res['error']}")
+        else:
+            metrics = res.get("test_metrics", {}) if isinstance(res, dict) else {}
+            mae  = res.get("test_mae_norm",  metrics.get("MAE_norm",  float("nan")))
+            rmse = res.get("test_rmse_norm", metrics.get("RMSE_norm", float("nan")))
+            mape = res.get("test_mape_norm", metrics.get("MAPE_norm", float("nan")))
+            crps = res.get("test_crps_norm", metrics.get("CRPS_norm", float("nan")))
+            logger.info(f"{name:<12} {mae:>10.4f} {rmse:>10.4f} {mape:>10.2f} {crps:>10.4f}")
+    logger.info("=" * W)
 
     # 保存 JSON
     result_path = os.path.join(save_dir,

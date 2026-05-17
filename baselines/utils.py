@@ -7,9 +7,9 @@ baselines/utils.py
   - 损失和指标在所有维度上计算（时间维也参与平均）
   - 支持 prob 模式（输出 mu/sigma 双通道）
 
-null_val 说明：
-  传入归一化后的零值（如 Solar 的 -0.648）时，用 true > null_val 做 mask，
-  只保留原始值 > 0 的时间点，与论文口径一致。
+评估策略（2025-05 修订）：
+  统一无 mask 全量评估，与 GridCFN 主模型对齐，方便与文献直接比较。
+  所有函数保留 null_val 参数接口，但传入任何值均不做 mask。
 """
 import time
 import numpy as np
@@ -19,42 +19,30 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# 指标（null_val=None 时不 mask）
+# 指标（无 mask，全量计算；null_val 参数保留接口兼容性，不使用）
 # ---------------------------------------------------------------------------
 
-def _get_mask(true, null_val):
-    if null_val is None:
-        return torch.ones_like(true)
-    return (true > null_val).float()
-
-
 def masked_mae(pred, true, null_val=None):
-    mask = _get_mask(true, null_val)
-    mask = mask / mask.mean().clamp(min=1e-5)
-    return (torch.abs(pred - true) * mask).mean()
+    return torch.abs(pred - true).mean()
 
 
 def masked_mse(pred, true, null_val=None):
-    mask = _get_mask(true, null_val)
-    mask = mask / mask.mean().clamp(min=1e-5)
-    return (((pred - true) ** 2) * mask).mean()
+    return ((pred - true) ** 2).mean()
 
 
 def masked_rmse(pred, true, null_val=None):
-    return torch.sqrt(masked_mse(pred, true, null_val))
+    return torch.sqrt(masked_mse(pred, true))
 
 
 def masked_mape(pred, true, null_val=None, eps=1e-8):
-    mask = _get_mask(true, null_val)
-    mask = mask / mask.mean().clamp(min=1e-5)
-    return (torch.abs((pred - true) / (true.abs() + eps)) * mask).mean()
+    return (torch.abs((pred - true) / (true.abs() + eps))).mean()
 
 
 def compute_metrics(pred, true, null_val=None):
-    """返回 (MAE, RMSE, MAPE%)，支持任意维度广播"""
-    return (masked_mae(pred, true, null_val).item(),
-            masked_rmse(pred, true, null_val).item(),
-            masked_mape(pred, true, null_val).item() * 100.0)
+    """返回 (MAE, RMSE, MAPE%)，无 mask 全量计算。"""
+    return (masked_mae(pred, true).item(),
+            masked_rmse(pred, true).item(),
+            masked_mape(pred, true).item() * 100.0)
 
 
 def inverse_torch(tensor: torch.Tensor, scaler):
@@ -65,55 +53,45 @@ def inverse_torch(tensor: torch.Tensor, scaler):
 
 
 def gaussian_nll_loss(mu, sigma_raw, target, null_val=None):
-    """高斯 NLL loss，支持 null_val mask"""
+    """高斯 NLL loss，无 mask 全量计算。"""
     sigma = F.softplus(sigma_raw) + 1e-4
     nll = 0.5 * ((target - mu) ** 2) / (sigma ** 2) + sigma.log()
-    mask = _get_mask(target, null_val)
-    mask = mask / mask.mean().clamp(min=1e-5)
-    return (nll * mask).mean()
+    return nll.mean()
 
 
 def compute_crps_gaussian(mu, sigma_raw, target, null_val=None, n_samples: int = 100):
-    """蒙特卡洛估计 CRPS"""
+    """蒙特卡洛估计 CRPS，无 mask 全量计算。"""
     sigma = F.softplus(sigma_raw) + 1e-4
     eps = torch.randn(n_samples, *mu.shape, device=mu.device)
     samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
     mae_term  = (samples - target.unsqueeze(0)).abs().mean(0)
     diff_term = (samples.unsqueeze(0) - samples.unsqueeze(1)).abs().mean([0, 1])
     crps_per_point = mae_term - 0.5 * diff_term
-    mask = _get_mask(target, null_val)
-    mask = mask / mask.mean().clamp(min=1e-5)
-    return (crps_per_point * mask).mean().item()
+    return crps_per_point.mean().item()
 
 
 def compute_prob_metrics(samples: np.ndarray, y: np.ndarray,
                          null_val: float = None) -> dict:
     """
-    概率预测指标（多步版）。
-    samples : [S, total, N, T_out, F]  或  [S, ...]
-    y       : [total, N, T_out, F]
-    null_val: 若不为 None，mask 掉 true <= null_val 的位置（原始量纲）
-    返回 dict 包含 MAE/RMSE/CRPS/PICP/PINAW + per-step MAE_h1 RMSE_h1 等。
-    """
-    if null_val is not None:
-        mask = (y > null_val).astype(np.float32)
-        mask = mask / (mask.mean() + 1e-8)
-    else:
-        mask = np.ones_like(y)
+    概率预测指标（多步版），无 mask 全量计算。
 
+    samples  : [S, total, N, T_out, F]
+    y        : [total, N, T_out, F]
+    null_val : 保留接口兼容性，不使用。
+    """
     mu = samples.mean(axis=0)
 
-    def _mae(p, t, m=mask):  return float((np.abs(p - t) * m).mean())
-    def _rmse(p, t, m=mask): return float(np.sqrt(((p - t) ** 2 * m).mean()))
-    def _mape(p, t, m=mask): return float((np.abs((p - t) / (np.abs(t) + 1e-8)) * m).mean() * 100.0)
+    def _mae(p, t):  return float(np.abs(p - t).mean())
+    def _rmse(p, t): return float(np.sqrt(((p - t) ** 2).mean()))
+    def _mape(p, t): return float((np.abs((p - t) / (np.abs(t) + 1e-8))).mean() * 100.0)
 
-    def _crps(s, t, m=mask):
+    def _crps(s, t):
         S = s.shape[0]
         mae_term = np.abs(s - t[None]).mean(axis=0)
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed=0)
         n_perm = min(10, S - 1)
         if n_perm <= 0:
-            return float((mae_term * m).mean())
+            return float(mae_term.mean())
         spreads = []
         indices = np.arange(S)
         for _ in range(n_perm):
@@ -126,25 +104,24 @@ def compute_prob_metrics(samples: np.ndarray, y: np.ndarray,
                 perm[clash[0]], perm[other] = perm[other], perm[clash[0]]
             spreads.append(np.abs(s - s[perm]).mean(axis=0))
         crps_pt = mae_term - 0.5 * np.mean(spreads, axis=0)
-        return float((crps_pt * m).mean())
+        return float(crps_pt.mean())
 
     def _picp(s, t, conf=0.95):
         lo = np.quantile(s, (1 - conf) / 2,     axis=0)
         hi = np.quantile(s, 1 - (1 - conf) / 2, axis=0)
-        covered = ((t >= lo) & (t <= hi)).astype(np.float32)
-        return float((covered * mask).mean())
+        return float(((t >= lo) & (t <= hi)).astype(np.float32).mean())
 
     def _pinaw(s, t, conf=0.95):
         lo = np.quantile(s, (1 - conf) / 2,     axis=0)
         hi = np.quantile(s, 1 - (1 - conf) / 2, axis=0)
         rng = t.max() - t.min() + 1e-8
-        return float((((hi - lo) / rng) * mask).mean())
+        return float(((hi - lo) / rng).mean())
 
     metrics = {
         "MAE":   _mae(mu, y),
         "RMSE":  _rmse(mu, y),
         "MAPE":  _mape(mu, y),
-        "CRPS":  _crps(samples, y, mask),
+        "CRPS":  _crps(samples, y),
         "PICP":  _picp(samples, y),
         "PINAW": _pinaw(samples, y),
     }
@@ -153,11 +130,10 @@ def compute_prob_metrics(samples: np.ndarray, y: np.ndarray,
         sh = samples[:, :, :, h, :]
         yh = y[:, :, h, :]
         mh = sh.mean(axis=0)
-        mh_mask = mask[:, :, h, :]
-        metrics[f"MAE_h{h+1}"]  = _mae(mh, yh, mh_mask)
-        metrics[f"RMSE_h{h+1}"] = _rmse(mh, yh, mh_mask)
-        metrics[f"MAPE_h{h+1}"] = _mape(mh, yh, mh_mask)
-        metrics[f"CRPS_h{h+1}"] = _crps(sh, yh, mh_mask)
+        metrics[f"MAE_h{h+1}"]  = _mae(mh, yh)
+        metrics[f"RMSE_h{h+1}"] = _rmse(mh, yh)
+        metrics[f"MAPE_h{h+1}"] = _mape(mh, yh)
+        metrics[f"CRPS_h{h+1}"] = _crps(sh, yh)
     return metrics
 
 
@@ -180,7 +156,7 @@ def train_model(model, train_loader, val_loader, test_loader,
     y: [B, T_out, N, F]
     model(x) → [B, T_out, N, out_dim]
 
-    null_val : None（不 mask）或归一化后的零值
+    null_val : 保留接口兼容性，不使用，统一无 mask 全量评估。
     prob     : True 时输出 [B, T_out, N, 2*F]，用 NLL loss，测试额外报告 CRPS
     """
     def _log(msg):
@@ -206,9 +182,9 @@ def train_model(model, train_loader, val_loader, test_loader,
             if prob:
                 F_dim = y.shape[-1]
                 mu, sigma_raw = out[..., :F_dim], out[..., F_dim:]
-                loss = gaussian_nll_loss(mu, sigma_raw, y, null_val)
+                loss = gaussian_nll_loss(mu, sigma_raw, y)
             else:
-                loss = masked_mae(out, y, null_val)
+                loss = masked_mae(out, y)
 
             loss.backward()
             if grad_clip > 0:
@@ -233,7 +209,7 @@ def train_model(model, train_loader, val_loader, test_loader,
                 x, y = x.to(device), y.to(device)
                 out = model(x, **ekw)                       # [B, T_out, N, out_dim]
                 mu = out[..., :y.shape[-1]] if prob else out
-                vm.append(masked_mae(mu, y, null_val).item())
+                vm.append(masked_mae(mu, y).item())
         val_mae = float(np.mean(vm))
         history["val_mae"].append(val_mae)
 
@@ -270,24 +246,42 @@ def train_model(model, train_loader, val_loader, test_loader,
                 all_mu.append(out.cpu())
             all_true.append(y.cpu())
 
-    pred_mu  = torch.cat(all_mu)     # [total, T_out, N, F]
+    pred_mu  = torch.cat(all_mu)
     true_cat = torch.cat(all_true)
-    null_val_eval = null_val
-    if scaler is not None:
-        pred_mu = inverse_torch(pred_mu, scaler)
-        true_cat = inverse_torch(true_cat, scaler)
-        null_val_eval = 0.0 if null_val is not None else None
-
-    mae, rmse, mape = compute_metrics(pred_mu, true_cat, null_val_eval)
 
     if prob:
-        pred_sigma = torch.cat(all_sigma_raw)
-        crps = compute_crps_gaussian(pred_mu, pred_sigma, true_cat, null_val_eval)
-        _log(f"  [Test] MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%  CRPS={crps:.4f}")
-        history.update({"test_mae": mae, "test_rmse": rmse,
-                         "test_mape": mape, "test_crps": crps})
+        pred_sigma_norm = torch.cat(all_sigma_raw)
+        mae_norm, rmse_norm, mape_norm = compute_metrics(pred_mu, true_cat)
+        crps_norm = compute_crps_gaussian(pred_mu, pred_sigma_norm, true_cat)
     else:
-        _log(f"  [Test] MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
-        history.update({"test_mae": mae, "test_rmse": rmse, "test_mape": mape})
+        mae_norm, rmse_norm, mape_norm = compute_metrics(pred_mu, true_cat)
+
+    if scaler is not None:
+        pred_mu  = inverse_torch(pred_mu,  scaler)
+        true_cat = inverse_torch(true_cat, scaler)
+
+    mae, rmse, mape = compute_metrics(pred_mu, true_cat)
+
+    if prob:
+        pred_sigma_raw = torch.cat(all_sigma_raw)
+        if scaler is not None and hasattr(scaler, "scale_"):
+            # sigma 只需除以 std（scale），不减 mean
+            scale = torch.tensor(scaler.scale_, dtype=torch.float32)
+            pred_sigma = F.softplus(pred_sigma_raw) * scale
+        else:
+            pred_sigma = F.softplus(pred_sigma_raw)
+        crps = compute_crps_gaussian(pred_mu, pred_sigma, true_cat)
+        _log(f"  [Test] 归一化域   MAE={mae_norm:.4f}  RMSE={rmse_norm:.4f}  MAPE={mape_norm:.2f}%  CRPS={crps_norm:.4f}")
+        _log(f"  [Test] 反归一化域 MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%  CRPS={crps:.4f}")
+        history.update({"test_mae": mae, "test_rmse": rmse,
+                         "test_mape": mape, "test_crps": crps,
+                         "test_mae_norm": mae_norm, "test_rmse_norm": rmse_norm,
+                         "test_mape_norm": mape_norm, "test_crps_norm": crps_norm})
+    else:
+        _log(f"  [Test] 归一化域   MAE={mae_norm:.4f}  RMSE={rmse_norm:.4f}  MAPE={mape_norm:.2f}%")
+        _log(f"  [Test] 反归一化域 MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
+        history.update({"test_mae": mae, "test_rmse": rmse, "test_mape": mape,
+                         "test_mae_norm": mae_norm, "test_rmse_norm": rmse_norm,
+                         "test_mape_norm": mape_norm})
 
     return history

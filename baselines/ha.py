@@ -28,12 +28,15 @@ def run_ha(test_loader, device, logger=None, scaler=None, null_val=None):
     pred = torch.cat(preds, dim=0)
     true = torch.cat(trues, dim=0)
 
-    null_val_eval = null_val
+    mae_norm, rmse_norm, mape_norm = compute_metrics(pred, true)
+
     if scaler is not None:
         pred = inverse_torch(pred, scaler)
         true = inverse_torch(true, scaler)
-        null_val_eval = 0.0 if null_val is not None else None
 
-    mae, rmse, mape = compute_metrics(pred, true, null_val_eval)
-    _log(f"[HA] MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
-    return {"test_mae": mae, "test_rmse": rmse, "test_mape": mape}
+    mae, rmse, mape = compute_metrics(pred, true)
+    _log(f"[HA] 归一化域   MAE={mae_norm:.4f}  RMSE={rmse_norm:.4f}  MAPE={mape_norm:.2f}%")
+    _log(f"[HA] 反归一化域 MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")
+    return {"test_mae": mae, "test_rmse": rmse, "test_mape": mape,
+            "test_mae_norm": mae_norm, "test_rmse_norm": rmse_norm,
+            "test_mape_norm": mape_norm}

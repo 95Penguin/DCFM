@@ -5,6 +5,12 @@ for Probabilistic Time Series Forecasting  — Wu et al., ICML 2025 Spotlight
 github:https://github.com/decisionintelligence/K2VAE
 
 多步预测版: T_out 支持，VAE 单步生成（无 ODE/SDE 迭代）。
+
+修复:
+  [3] PatchEmbedding.forward 中 unfold → permute → reshape 链条缺少
+      .contiguous()，导致 reshape 在非连续内存上操作，某些 PyTorch
+      版本下静默返回错误视图（内存布局依赖 stride=0 的 expand 轴）。
+      在 permute 后、reshape 前插入 .contiguous() 保证内存连续。
 """
 import math
 import os
@@ -28,10 +34,12 @@ class PatchEmbedding(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, N, F = x.shape
-        patches = x.unfold(1, self.patch_len, self.stride)
+        patches = x.unfold(1, self.patch_len, self.stride)  # [B, n_p, N, F, patch_len]
         n_p = patches.shape[1]
-        patches = patches.permute(0, 2, 1, 3, 4)
-        patches = patches.reshape(B, N, n_p, F * self.patch_len)
+        patches = patches.permute(0, 2, 1, 4, 3)            # [B, N, n_p, patch_len, F]
+        # 修复 [3]：permute 后内存非连续，reshape 前必须 contiguous()，
+        # 否则在某些 PyTorch 版本下 reshape 会基于错误的内存步长生成视图。
+        patches = patches.contiguous().reshape(B, N, n_p, self.patch_len * F)
         return self.proj(patches)
 
 
@@ -158,8 +166,7 @@ class K2VAE(nn.Module):
 # ── 内部评估 ────────────────────────────────────────────────────────────────
 
 def _evaluate_k2vae(model: K2VAE, loader, device, scaler,
-                    n_samples: int, inverse_transform: bool = False,
-                    null_val: float = None) -> dict:
+                    n_samples: int, null_val: float = None) -> dict:
     from baselines.utils import compute_prob_metrics
 
     model.eval()
@@ -174,15 +181,19 @@ def _evaluate_k2vae(model: K2VAE, loader, device, scaler,
     samples_all = np.concatenate(samples_list, axis=1)
     y_all       = np.concatenate(y_list,       axis=0)
 
-    if inverse_transform and scaler is not None:
+    metrics_norm = compute_prob_metrics(samples_all, y_all)
+
+    if scaler is not None:
         shape = samples_all.shape
         samples_all = scaler.inverse_transform(
             samples_all.reshape(-1)).reshape(shape)
         y_all = scaler.inverse_transform(
             y_all.reshape(-1)).reshape(y_all.shape)
-        null_val = 0.0 if null_val is not None else None
 
-    return compute_prob_metrics(samples_all, y_all, null_val)
+    metrics = compute_prob_metrics(samples_all, y_all)
+    for k, v in metrics_norm.items():
+        metrics[f"{k}_norm"] = v
+    return metrics
 
 
 # ── 训练入口（baselines 统一签名）─────────────────────────────────────────
@@ -200,7 +211,7 @@ def run_k2vae(loaders, adj, cfg, device, save_dir, logger,
     stride    = patch_len // 2
 
     model = K2VAE(
-        in_dim      = in_dim or 1,
+        in_dim      = in_dim if in_dim is not None else 1,
         T_in        = d.T_in,
         T_out       = d.T_out,
         patch_len   = patch_len,
@@ -258,8 +269,7 @@ def run_k2vae(loaders, adj, cfg, device, save_dir, logger,
         avg_loss = epoch_loss / max(n_batches, 1)
 
         val_m = _evaluate_k2vae(model, val_loader, device, scaler,
-                                n_samples_val, inverse_transform=False,
-                                null_val=null_val)
+                                n_samples_val, null_val=null_val)
         scheduler.step(val_m["CRPS"])
         cur_lr  = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - t0
@@ -287,15 +297,25 @@ def run_k2vae(loaders, adj, cfg, device, save_dir, logger,
     model.load_state_dict(
         torch.load(save_path, map_location=device, weights_only=True))
     test_m = _evaluate_k2vae(model, test_loader, device, scaler,
-                             n_samples_test, inverse_transform=True,
-                             null_val=null_val)
+                             n_samples_test, null_val=null_val)
 
     sep = "=" * 55
     logger.info(f"\n{sep}")
+    logger.info(f"[K2VAE] TEST SET RESULTS (归一化域, T_out={d.T_out})")
+    logger.info(sep)
+    for k in ["MAE", "RMSE", "CRPS", "PICP", "PINAW"]:
+        logger.info(f"  {k:<8}: {test_m[f'{k}_norm']:.4f}")
+    logger.info(sep)
     logger.info(f"[K2VAE] TEST SET RESULTS (反归一化域, T_out={d.T_out})")
     logger.info(sep)
     for k in ["MAE", "RMSE", "CRPS", "PICP", "PINAW"]:
         logger.info(f"  {k:<8}: {test_m[k]:.4f}")
+    logger.info(f"\n  {'Step':<6}  {'MAE':>8}  {'RMSE':>8}  {'CRPS':>8}")
+    for h in range(d.T_out):
+        mae_h  = test_m.get(f"MAE_h{h+1}",  float("nan"))
+        rmse_h = test_m.get(f"RMSE_h{h+1}", float("nan"))
+        crps_h = test_m.get(f"CRPS_h{h+1}", float("nan"))
+        logger.info(f"  h={h+1:<4}  {mae_h:>8.4f}  {rmse_h:>8.4f}  {crps_h:>8.4f}")
     logger.info(sep)
 
     history["test_metrics"] = test_m

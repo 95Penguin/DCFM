@@ -101,7 +101,7 @@ def load_data(cfg):
 def build_model(cfg, in_dim=None, n_nodes=None):
     m = cfg.model
     return GridCFN(
-        n_nodes=n_nodes,                              # ← AdaptiveGCN 需要节点数
+        n_nodes=n_nodes,
         in_dim=in_dim if in_dim is not None else m.in_dim,
         gcn_hidden=m.gcn_hidden, gcn_layers=m.gcn_layers,
         tcn_hidden=m.tcn_hidden, tcn_layers=m.tcn_layers,
@@ -112,7 +112,8 @@ def build_model(cfg, in_dim=None, n_nodes=None):
         chunk_size=getattr(m, "chunk_size", 16384),
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
         T_out=cfg.data.T_out,
-        adap_dim=getattr(m, "adap_dim", 16),          # ← 自适应邻接嵌入维度
+        T_in=cfg.data.T_in,            # ← 传入 T_in，供 MultiScaleContext 裁剪 dilations
+        adap_dim=getattr(m, "adap_dim", 16),
     )
 
 

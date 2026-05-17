@@ -155,7 +155,8 @@ class Backbone(nn.Module):
         super().__init__()
         self.gcn = AdaptiveGCN(n_nodes, in_dim, gcn_hidden, gcn_hidden,
                                gcn_layers, adap_dim)
-        self.tcn = TCN(gcn_hidden, tcn_hidden, tcn_layers)
+        # tcn_input_dim = gcn_hidden：GCN 输出维即 TCN 输入维
+        self.tcn = TCN(in_dim=gcn_hidden, hidden_dim=tcn_hidden, n_layers=tcn_layers)
 
     def forward(self, x, adj_norm):
         """x: [B,T,N,F] → H: [B,T,N,D]"""
@@ -216,23 +217,32 @@ class CausalDisentangler(nn.Module):
           He     : [B, N, env_dim]    注意力加权的环境表征
           Hs     : [B, N, stoch_dim]  注意力加权的随机表征
           He_seq : [B, T, N, env_dim] 全序列环境表征（供 MultiScaleContext 使用）
+
+        stop-gradient：两个投影头各自接收 H.detach()，使 backbone 的梯度
+        不再被两个分支同时拉扯，迫使 backbone 学习对两者都有用的中性表征，
+        解耦压力落在投影头而非 backbone。
         """
         B, T, N, D = H.shape
+        H_flat = H.reshape(B * T * N, D)
+        H_sg   = H.detach()                                  # stop-gradient
+        H_sg_flat = H_sg.reshape(B * T * N, D)
 
-        # ── 环境分支 ──────────────────────────────────────────────────────
-        He_seq = self.env_proj(H.reshape(B * T * N, D)).reshape(B, T, N, -1)
-        # 注意力分数 [B, T, N, 1] → softmax over T → [B, T, N, 1]
+        # ── 环境分支（stop-gradient 输入）────────────────────────────────
+        He_seq = self.env_proj(H_sg_flat).reshape(B, T, N, -1)
         env_score  = self.attn_env(He_seq)                   # [B, T, N, 1]
-        env_weight = F.softmax(env_score, dim=1)             # [B, T, N, 1]
+        env_weight = F.softmax(env_score, dim=1)
         He = (env_weight * He_seq).sum(dim=1)                # [B, N, env_dim]
 
-        # ── 随机分支 ──────────────────────────────────────────────────────
-        Hs_seq = self.stoch_proj(H.reshape(B * T * N, D)).reshape(B, T, N, -1)
+        # ── 随机分支（stop-gradient 输入）────────────────────────────────
+        Hs_seq = self.stoch_proj(H_sg_flat).reshape(B, T, N, -1)
         stoch_score  = self.attn_stoch(Hs_seq)               # [B, T, N, 1]
-        stoch_weight = F.softmax(stoch_score, dim=1)         # [B, T, N, 1]
+        stoch_weight = F.softmax(stoch_score, dim=1)
         Hs = (stoch_weight * Hs_seq).sum(dim=1)              # [B, N, stoch_dim]
 
-        return He, Hs, He_seq
+        # He_seq 供 MultiScaleContext 使用，保留梯度（从 H_flat 重新投影）
+        He_seq_grad = self.env_proj(H_flat).reshape(B, T, N, -1)
+
+        return He, Hs, He_seq_grad
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +316,14 @@ class CLUBEstimator(nn.Module):
 class MultiScaleContext(nn.Module):
     """多尺度时间上下文提取。"""
 
-    def __init__(self, env_dim, ms_out_dim, dilations=(1, 7, 30)):
+    def __init__(self, env_dim, ms_out_dim, dilations=(1, 7, 30), T_in: int = None):
         super().__init__()
+        # 感受野 = (kernel_size-1)*dilation = 2*dilation，需满足 2*d < T_in
+        if T_in is not None:
+            valid = [d for d in dilations if 2 * d < T_in]
+            if not valid:
+                valid = [1]   # 至少保留 dilation=1
+            dilations = valid
         self.dilations = list(dilations)
         self.convs = nn.ModuleList([
             CausalConv1d(env_dim, env_dim, kernel_size=3, dilation=d)
@@ -515,7 +531,7 @@ class GridCFN(nn.Module):
 
     def __init__(
         self,
-        n_nodes: int,                   # ← 新增：节点数，用于 AdaptiveGCN
+        n_nodes: int,
         in_dim=1, gcn_hidden=64, tcn_hidden=64,
         env_dim=32, stoch_dim=32, ms_out_dim=32,
         n_scg_layers=3, out_dim=1, lambda_mi=0.5,
@@ -524,7 +540,8 @@ class GridCFN(nn.Module):
         chunk_size=8192,
         ms_dilations=(1, 7, 30),
         T_out=1,
-        adap_dim=16,                    # ← 新增：自适应邻接嵌入维度
+        T_in=None,                  # ← 新增：传给 MultiScaleContext 做 dilation 裁剪
+        adap_dim=16,
     ):
         super().__init__()
         self.lambda_mi = lambda_mi
@@ -538,7 +555,8 @@ class GridCFN(nn.Module):
                                      gcn_layers, tcn_layers, adap_dim)
         self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
         self.club         = CLUBEstimator(env_dim, stoch_dim)
-        self.ms_context   = MultiScaleContext(env_dim, ms_out_dim, dilations=ms_dilations)
+        self.ms_context   = MultiScaleContext(env_dim, ms_out_dim, dilations=ms_dilations,
+                                              T_in=T_in)
         self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers, chunk_size=chunk_size)
         self.vector_field = CFMVectorField(
             out_dim=self.cfm_dim,

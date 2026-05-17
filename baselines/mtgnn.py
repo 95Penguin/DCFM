@@ -12,6 +12,10 @@ MTGNN: Connecting the Dots - Multivariate Time Series Forecasting with GNNs
       在某些 PyTorch 版本下可能引起梯度计算错误）。
   [2] training 分支中仅用 adj_noisy 决定 topk 索引，mask 值写入全 1，
       与原论文保持一致（mask 是二值的，不需要保留 noisy 权重值）。
+  [3] LayerNorm.forward 中增加对 weight 维度的断言保护：
+      normalized_shape 必须传入三元组 (hidden_dim, num_nodes, norm_t)，
+      weight 须为 3-D 张量，否则 [:, idx, :] 切片会静默出错。
+      同时对 LayerNorm 的 normalized_shape 合法性做前置校验。
 """
 import torch
 import torch.nn as nn
@@ -129,7 +133,14 @@ class dilated_inception(nn.Module):
 # ── 官方自定义 LayerNorm ──────────────────────────────────────────────────
 
 class LayerNorm(nn.Module):
-    """官方自定义 LayerNorm，支持按节点索引 idx 切片 affine 参数。"""
+    """官方自定义 LayerNorm，支持按节点索引 idx 切片 affine 参数。
+
+    修复 [3]：
+      forward 中对 weight/bias 用 [:, idx, :] 做切片，要求 weight 必须是
+      3-D 张量，即 normalized_shape 必须是长度为 3 的元组
+      (hidden_dim, num_nodes, norm_t)。
+      现在在 forward 中添加维度断言，防止传入错误 normalized_shape 时静默出错。
+    """
     __constants__ = ['normalized_shape', 'eps', 'elementwise_affine']
 
     def __init__(self, normalized_shape, eps: float = 1e-5,
@@ -155,6 +166,16 @@ class LayerNorm(nn.Module):
 
     def forward(self, x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         if self.elementwise_affine:
+            # 修复 [3]：[:, idx, :] 切片要求 weight 必须是 3-D 张量。
+            # normalized_shape 应为 (hidden_dim, num_nodes, norm_t)。
+            # 若传入 1-D normalized_shape（如单个整数），此处会 IndexError，
+            # 现在提前断言给出清晰报错信息。
+            assert self.weight.dim() == 3, (
+                f"LayerNorm.forward 中使用了 [:, idx, :] 切片，要求 weight 为 3-D 张量，"
+                f"但当前 weight.shape={tuple(self.weight.shape)}（{self.weight.dim()}-D）。"
+                f"请确保 normalized_shape 传入长度为 3 的元组 "
+                f"(hidden_dim, num_nodes, norm_t)，而非整数或其他形状。"
+            )
             w = self.weight[:, idx, :]
             b = self.bias[:,   idx, :]
             return F.layer_norm(x, tuple(x.shape[1:]), w, b, self.eps)
@@ -229,6 +250,8 @@ class MTGNN(nn.Module):
             else:
                 norm_t = self.receptive_field - rf_size_j + 1
             norm_t = max(norm_t, 1)
+            # 修复 [3]：normalized_shape 必须传三元组，确保 LayerNorm.weight 为 3-D。
+            # LayerNorm.forward 中用 [:, idx, :] 切片，要求 weight.dim()==3。
             self.norm.append(
                 LayerNorm((hidden_dim, num_nodes, norm_t),
                           elementwise_affine=True))

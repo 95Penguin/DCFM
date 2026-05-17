@@ -45,6 +45,10 @@ def rmse(pred, true):
     return float(np.sqrt(((pred - true) ** 2).mean()))
 
 
+def mape(pred, true, eps=1e-8):
+    return float((np.abs((pred - true) / (np.abs(true) + eps))).mean() * 100.0)
+
+
 def crps_empirical(samples: np.ndarray, y: np.ndarray) -> float:
     """
     经验 CRPS。
@@ -101,6 +105,7 @@ def evaluate_all(samples: np.ndarray, y_all: np.ndarray) -> dict:
     metrics = {
         "MAE":   mae(mu_all, y_all),
         "RMSE":  rmse(mu_all, y_all),
+        "MAPE":  mape(mu_all, y_all),
         "CRPS":  crps_empirical(samples, y_all),
         "PICP":  picp_empirical(samples, y_all),
         "PINAW": pinaw_empirical(samples, y_all),
@@ -180,6 +185,7 @@ def train_one_epoch(
     warmup_epochs:   int = 5,
     cfm_n_t_samples: int = 4,
     sigma_min:       float = 0.01,
+    club_inner_steps: int = 3,       # D: CLUB 每步内循环更新次数
 ) -> Dict[str, float]:
     model.train()
     total_loss = total_cfm = total_mi = total_mi_prime = total_var = total_gnorm = 0.0
@@ -206,14 +212,16 @@ def train_one_epoch(
 
         He_prime, Hs_prime, He, Hs, _ = model(x, adj_norm_, edge_idx_)
 
-        # Step 1: 更新 CLUB 变分网络
+        # Step 1: 更新 CLUB 变分网络（内循环多次，降低 MI 估计方差）
         if train_club:
-            var_loss = model.club.variational_loss(He.detach(), Hs.detach())
-            club_optimizer.zero_grad()
-            var_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.club.parameters(), max_norm=1.0)
-            club_optimizer.step()
-            var_loss_val = var_loss.item()
+            var_loss_val = 0.0
+            for _ in range(club_inner_steps):
+                var_loss = model.club.variational_loss(He.detach(), Hs.detach())
+                club_optimizer.zero_grad()
+                var_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.club.parameters(), max_norm=1.0)
+                club_optimizer.step()
+                var_loss_val = var_loss.item()
         else:
             var_loss_val = 0.0
 
@@ -376,13 +384,14 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
 
     # 训练阶段 val 只需相对排序准确，减半采样数可显著加速每 epoch 时间。
     # 最终 test 评估仍使用 cfm_n_samples_test（默认 200），不受影响。
-    n_samples_val   = max(20, getattr(cfg_train, "cfm_n_samples",      50) // 2)
-    n_steps         = getattr(cfg_train, "cfm_n_steps",        20)
-    cfm_n_t_samples = getattr(cfg_train, "cfm_n_t_samples",     4)
-    n_samples_test  = getattr(cfg_train, "cfm_n_samples_test", 200)
-    warmup_epochs   = getattr(cfg_train, "warmup_epochs",        5)
-    sigma_min       = getattr(cfg_train, "cfm_sigma_min",      0.01)
-    x0_scale        = getattr(cfg_train, "cfm_x0_scale",       1.0)
+    n_samples_val    = max(20, getattr(cfg_train, "cfm_n_samples",      50) // 2)
+    n_steps          = getattr(cfg_train, "cfm_n_steps",        20)
+    cfm_n_t_samples  = getattr(cfg_train, "cfm_n_t_samples",     4)
+    n_samples_test   = getattr(cfg_train, "cfm_n_samples_test", 200)
+    warmup_epochs    = getattr(cfg_train, "warmup_epochs",        5)
+    sigma_min        = getattr(cfg_train, "cfm_sigma_min",      0.01)
+    x0_scale         = getattr(cfg_train, "cfm_x0_scale",       1.0)
+    club_inner_steps = getattr(cfg_train, "club_inner_steps",     3)
 
     best_val_crps     = float("inf")
     epochs_no_improve = 0
@@ -409,6 +418,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
             main_params, cfg_train.grad_clip, warmup_epochs,
             cfm_n_t_samples=cfm_n_t_samples,
             sigma_min=sigma_min,
+            club_inner_steps=club_inner_steps,
         )
         val_m = evaluate(
             model, val_loader, adj_norm, edge_index, device,
@@ -478,33 +488,47 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         f"（验证集 PICP@T=1.0: {picp_before:.4f} → PICP@T={best_T:.2f}: {picp_after:.4f}）"
     )
 
-    # 测试集最终评估
-    test_m, samples_test, y_test = evaluate(
+    # 测试集：只跑一次采样，复用 samples 计算三套指标
+    _, samples_test, y_test = evaluate(
         model, test_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
         n_samples=n_samples_test, n_steps=n_steps,
-        temperature=best_T, inverse_transform=True,
+        temperature=1.0, inverse_transform=True,   # 先拿未校准的反归一化样本
         sigma_min=sigma_min, x0_scale=x0_scale,
     )
-    test_m_norm, _, _ = evaluate(
+    _, samples_test_norm, y_test_norm = evaluate(
         model, test_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
         n_samples=n_samples_test, n_steps=n_steps,
-        temperature=best_T, inverse_transform=False,
+        temperature=1.0, inverse_transform=False,  # 归一化域
         sigma_min=sigma_min, x0_scale=x0_scale,
     )
 
+    # 从同一批 samples 派生四套指标，不重复跑 ODE
+    # 1. 未校准反归一化（与 baselines 对比用）
+    test_m_raw = evaluate_all(samples_test, y_test)
+
+    # 2. 校准后反归一化
+    mu_test = samples_test.mean(axis=0, keepdims=True)
+    samples_calibrated = mu_test + best_T * (samples_test - mu_test)
+    test_m = evaluate_all(samples_calibrated, y_test)
+
+    # 3. 校准后归一化域
+    mu_norm = samples_test_norm.mean(axis=0, keepdims=True)
+    samples_calibrated_norm = mu_norm + best_T * (samples_test_norm - mu_norm)
+    test_m_norm = evaluate_all(samples_calibrated_norm, y_test_norm)
+
+    # 4. 未校准归一化域
+    test_m_raw_norm = evaluate_all(samples_test_norm, y_test_norm)
+
     sep = "=" * 60
+    avg_keys = ["MAE", "RMSE", "MAPE", "CRPS", "PICP", "PINAW"]
+
     logger.info(f"\n{sep}")
     logger.info(f"TEST SET RESULTS — 反归一化域 (Temperature={best_T:.3f}, T_out={model.T_out})")
     logger.info(sep)
-
-    # 先打 avg 指标
-    avg_keys = ["MAE", "RMSE", "CRPS", "PICP", "PINAW"]
     for k in avg_keys:
         logger.info(f"  {k:<8}: {test_m[k]:.4f}")
-
-    # 再打各步 MAE / CRPS
     logger.info(f"\n  {'Step':<6}  {'MAE':>8}  {'RMSE':>8}  {'CRPS':>8}")
     for h in range(model.T_out):
         mae_h  = test_m.get(f"MAE_h{h+1}",  float("nan"))
@@ -513,14 +537,28 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         logger.info(f"  h={h+1:<4}  {mae_h:>8.4f}  {rmse_h:>8.4f}  {crps_h:>8.4f}")
 
     logger.info(f"\n{sep}")
-    logger.info(f"TEST SET RESULTS — 归一化域 (T_out={model.T_out})")
+    logger.info(f"TEST SET RESULTS — 归一化域 (Temperature={best_T:.3f}, T_out={model.T_out})")
     logger.info(sep)
     for k in avg_keys:
         logger.info(f"  {k:<8}: {test_m_norm[k]:.4f}")
+
+    logger.info(f"\n{sep}")
+    logger.info(f"TEST SET RESULTS — 未校准反归一化 / 与 baselines 对比用 (Temperature=1.0)")
+    logger.info(sep)
+    for k in avg_keys:
+        logger.info(f"  {k:<8}: {test_m_raw[k]:.4f}")
+
+    logger.info(f"\n{sep}")
+    logger.info(f"TEST SET RESULTS — 未校准归一化域 (Temperature=1.0)")
+    logger.info(sep)
+    for k in avg_keys:
+        logger.info(f"  {k:<8}: {test_m_raw_norm[k]:.4f}")
     logger.info(sep)
 
-    history["test_metrics"]      = test_m
-    history["test_metrics_norm"] = test_m_norm
-    history["best_temperature"]  = best_T
-    history["test_shape"]        = list(samples_test.shape)
+    history["test_metrics"]          = test_m
+    history["test_metrics_norm"]     = test_m_norm
+    history["test_metrics_raw"]      = test_m_raw       # 未校准反归一化，供与 baselines 对比
+    history["test_metrics_raw_norm"] = test_m_raw_norm  # 未校准归一化域
+    history["best_temperature"]      = best_T
+    history["test_shape"]            = list(samples_test.shape)
     return history

@@ -11,6 +11,10 @@ CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series
       避免 out_dim>1 时多个输出维度共享同一内存块，
       导致下游对不同特征维度的修改互相干扰。
   [2] CSDI.to() 正确调用父类并返回 self，确保 scheduler 随模型迁移到指定设备。
+  [4] sample() 中删除语义错误的 out_dim>1 repeat 分支：
+      denoiser.output_projection2 固定输出 1 通道，无法产出真实的多特征预测，
+      原先 repeat 只是把同一数值复制 out_dim 次，结果在语义上是错的。
+      现在统一强制 out_dim=1（__init__ 中 assert），接口保持向后兼容。
 """
 import math
 import torch
@@ -127,7 +131,7 @@ class DDPMScheduler:
                         eps_pred: torch.Tensor) -> tuple:
         def _b(tensor):
             v = tensor[t]
-            for _ in range(x_t.dim() - 1):
+            for _ in range(x_t.dim() - v.dim()):
                 v = v.unsqueeze(-1)
             return v
 
@@ -160,8 +164,11 @@ class diff_CSDI(nn.Module):
 
         self.input_projection   = nn.Conv2d(inputdim,  channels, kernel_size=1)
         self.output_projection1 = nn.Conv2d(channels, channels,  kernel_size=1)
+        # 修复 [4]：output_projection2 固定输出 1 通道，
+        # 与 sample() 中只处理第一个特征维一致，不支持 out_dim>1 的多通道输出。
         self.output_projection2 = nn.Conv2d(channels, 1,         kernel_size=1)
         nn.init.zeros_(self.output_projection2.weight)
+        nn.init.zeros_(self.output_projection2.bias)   # 修复 [5]：bias 也零初始化，
 
         self.node_emb = nn.Embedding(num_nodes, side_dim // 2)
         self.time_emb = nn.Embedding(T_total,   side_dim // 2)
@@ -219,6 +226,8 @@ class CSDI(nn.Module):
     CSDI 多步预测版本: T_total = T_in + T_out。
     训练: compute_loss(x, y) — DDPM 在目标区域加噪去噪
     推理: forward(x) — n_samples 次 DDPM 逆向采样
+
+    注意: 仅支持 out_dim=1（去噪网络输出固定为单通道）。
     """
     def __init__(self,
                  num_nodes:       int,
@@ -232,6 +241,12 @@ class CSDI(nn.Module):
                  n_samples:       int = 10,
                  out_dim:         int = 1):
         super().__init__()
+        # 修复 [4]：denoiser 固定输出 1 通道，out_dim>1 时语义上只是复制，
+        # 使用 assert 明确限制，避免误导性调用。
+        assert out_dim == 1, (
+            "CSDI 的去噪网络 output_projection2 固定输出 1 通道，"
+            "不支持 out_dim>1。如需多特征输出，请修改 output_projection2 输出通道数。"
+        )
         self.T_in      = T_in
         self.T_out     = T_out
         self.T_total   = T_in + T_out
@@ -288,7 +303,7 @@ class CSDI(nn.Module):
 
     @torch.no_grad()
     def sample(self, x: torch.Tensor, return_samples: bool = False) -> torch.Tensor:
-        """DDPM 逆向采样，返回 [B, T_out, N, out_dim]"""
+        """DDPM 逆向采样，返回 [B, T_out, N, 1] 或 [S, B, N, T_out, 1]"""
         B, T, N, F = x.shape
         device = x.device
         x_c = x[..., 0].permute(0, 2, 1)              # [B, N, T_in]
@@ -319,17 +334,16 @@ class CSDI(nn.Module):
         sample_stack = torch.stack(preds, dim=0)                 # [S, B, N, T_out]
 
         if return_samples:
-            # 修复 [1]：使用 repeat 而非 expand，保证每个 out_dim 维度有独立内存，
-            # 避免 out_dim>1 时多维度共享同一底层存储导致的意外修改。
-            # [S, B, N, T_out] → [S, B, N, T_out, 1] → [S, B, N, T_out, out_dim]
-            return sample_stack.unsqueeze(-1).repeat(1, 1, 1, 1, self.out_dim)
+            # 修复 [1]：使用 .unsqueeze(-1) 后 .contiguous()，保证各 sample
+            # 有独立内存，避免下游修改时意外共享底层存储。
+            # 修复 [4]：out_dim 固定为 1，不再有 repeat 填充分支。
+            # shape: [S, B, N, T_out, 1]
+            return sample_stack.unsqueeze(-1).contiguous()
 
-        # [n_samples, B, N, T_out] → mean → [B, N, T_out] → [B, T_out, N, out_dim]
+        # [S, B, N, T_out] → mean → [B, N, T_out] → [B, T_out, N, 1]
         out = sample_stack.mean(dim=0)                           # [B, N, T_out]
         out = out.permute(0, 2, 1).unsqueeze(-1)                 # [B, T_out, N, 1]
-        if self.out_dim > 1:
-            out = out.repeat(1, 1, 1, self.out_dim)
-        return out                                               # [B, T_out, N, out_dim]
+        return out
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.sample(x)
