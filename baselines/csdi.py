@@ -51,6 +51,39 @@ class DiffusionEmbedding(nn.Module):
         return self.projection(self.embedding[diffusion_step])
 
 
+# ── Memory-Efficient Multi-Head Attention ──────────────────────────────────
+
+class MemoryEfficientMHA(nn.Module):
+    """使用 F.scaled_dot_product_attention 替代 nn.MultiheadAttention，
+    避免在 B*K 的大 batch 维度上显存爆炸（flash / memory-efficient backend）。"""
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim  = embed_dim // num_heads
+        self.dropout   = dropout
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor,
+                value: torch.Tensor, **kwargs):
+        B, L, E = query.shape
+        q = self.q_proj(query).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, L, E)
+        return self.out_proj(attn_out), None
+
+
 # ── ResidualBlock ─────────────────────────────────────────────────────────
 
 class ResidualBlock(nn.Module):
@@ -60,8 +93,8 @@ class ResidualBlock(nn.Module):
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
         self.cond_projection      = nn.Conv2d(side_dim, 2 * channels, kernel_size=1)
         self.mid_projection       = nn.Conv2d(channels, 2 * channels, kernel_size=1)
-        self.time_layer    = nn.MultiheadAttention(channels, nheads, batch_first=True)
-        self.feature_layer = nn.MultiheadAttention(channels, nheads, batch_first=True)
+        self.time_layer    = MemoryEfficientMHA(channels, nheads)
+        self.feature_layer = MemoryEfficientMHA(channels, nheads)
         self.output_projection = nn.Conv2d(channels, 2 * channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor,

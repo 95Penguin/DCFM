@@ -91,7 +91,7 @@ class PatchTST(nn.Module):
                  d_ff:          int   = 256,
                  dropout:       float = 0.1,
                  attn_dropout:  float = 0.0,
-                 out_dim:       int   = 1,
+                 out_dim:       int   = 2,
                  padding_patch: bool  = True):
         super().__init__()
         self.T_out        = T_out
@@ -228,7 +228,7 @@ def run_patchtst(loaders, adj, cfg, device, save_dir, logger,
         d_ff          = d_ff,
         dropout       = dropout,
         attn_dropout  = attn_dropout,
-        out_dim       = 1,
+        out_dim       = 2,          # mu + log_sigma (Gaussian head)
         padding_patch = True,
     ).to(device)
 
@@ -236,6 +236,7 @@ def run_patchtst(loaders, adj, cfg, device, save_dir, logger,
     logger.info(f"[PatchTST] Parameters: {n_params:,}")
     logger.info(f"[PatchTST] n_patches={model.n_patches}, "
                 f"patch_len={model.patch_len}, stride={model.stride}")
+    logger.info(f"[PatchTST] Gaussian head: out_dim=2 (mu, log_sigma)")
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=t_cfg.lr, weight_decay=t_cfg.weight_decay)
@@ -253,4 +254,5 @@ def run_patchtst(loaders, adj, cfg, device, save_dir, logger,
         grad_clip  = t_cfg.grad_clip,
         save_path  = os.path.join(save_dir, "patchtst_best.pt"),
         logger     = logger,
+        prob       = True,
     )

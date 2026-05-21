@@ -282,10 +282,11 @@ def run_stid(loaders, adj, cfg, device, save_dir, logger,
         hidden_dim = 32,
         n_layers   = 3,
         embed_dim  = 32,
-        out_dim    = 1,
+        out_dim    = 2,          # mu + log_sigma (Gaussian head)
         T_out      = cfg.data.T_out,
     ).to(device)
     logger.info(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"  Gaussian head: out_dim=2 (mu, log_sigma)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -301,6 +302,7 @@ def run_stid(loaders, adj, cfg, device, save_dir, logger,
         grad_clip  = cfg.train.grad_clip,
         save_path  = os.path.join(save_dir, "stid_best.pt"),
         logger     = logger,
+        prob       = True,
     )
 
 
@@ -341,7 +343,9 @@ def run_csdi(loaders, adj, cfg, device, save_dir, logger,
         model.train()
         t0 = time.time()
         losses = []
-        for x, y in train_loader:
+        n_batches = len(train_loader)
+        log_every = max(1, n_batches // 10)
+        for i, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             loss = model.compute_loss(x, y)
@@ -349,21 +353,25 @@ def run_csdi(loaders, adj, cfg, device, save_dir, logger,
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             losses.append(loss.item())
+            if (i + 1) % log_every == 0 or i == 0:
+                logger.info(f"  [CSDI] Epoch {epoch:3d} | batch {i+1:4d}/{n_batches} | "
+                            f"loss={loss.item():.4f} | {time.time() - t0:.1f}s")
 
         tl = float(np.mean(losses))
         history["train_loss"].append(tl)
+        train_time = time.time() - t0
 
-        old_n = model.n_samples
-        model.n_samples = 5
+        model.n_samples = 1
         model.eval()
         vm = []
+        t_val = time.time()
         with torch.no_grad():
             for x, y in val_loader:
                 x, y = x.to(device), y.to(device)
-                pred = model(x)                    # [B, T_out, N, out_dim]
+                pred = model(x)
                 vm.append(masked_mae(pred, y, null_val).item())
         val_mae = float(np.mean(vm))
-        model.n_samples = old_n
+        model.n_samples = 10
         history["val_mae"].append(val_mae)
 
         try:
@@ -377,9 +385,9 @@ def run_csdi(loaders, adj, cfg, device, save_dir, logger,
         else:
             no_improve += 1
 
-        if epoch % 10 == 0 or epoch == 1:
-            logger.info(f"  Epoch {epoch:3d} | train={tl:.4f} | val={val_mae:.4f} | "
-                        f"best={best_val:.4f} | {time.time() - t0:.1f}s")
+        logger.info(f"  Epoch {epoch:3d} | train={tl:.4f} | val={val_mae:.4f} | "
+                    f"best={best_val:.4f} | train={train_time:.1f}s | "
+                    f"val={time.time() - t_val:.1f}s")
         if no_improve >= patience:
             logger.info(f"  Early stop @ epoch {epoch}")
             break
@@ -444,19 +452,39 @@ def run_k2vae(loaders, adj, cfg, device, save_dir, logger,
                   scaler=scaler, null_val=null_val)
 
 
+def run_patchtst(loaders, adj, cfg, device, save_dir, logger,
+                 in_dim=1, num_nodes=1, scaler=None, null_val=None):
+    from baselines.patchtst import run_patchtst as _patchtst
+    logger.info("=" * 52 + "\n[PatchTST] Patch Time Series Transformer (no graph)")
+    return _patchtst(loaders, adj, cfg, device, save_dir, logger,
+                     in_dim=in_dim, num_nodes=num_nodes,
+                     scaler=scaler, null_val=null_val)
+
+
+def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
+               in_dim=1, num_nodes=1, scaler=None, null_val=None):
+    from baselines.tsdiff import run_tsdiff as _tsdiff
+    logger.info("=" * 52 + "\n[TSDiff] Unconditional Diffusion + Replacement Guidance (no graph)")
+    return _tsdiff(loaders, adj, cfg, device, save_dir, logger,
+                   in_dim=in_dim, num_nodes=num_nodes,
+                   scaler=scaler, null_val=null_val)
+
+
 # ── 模型注册表 ────────────────────────────────────────────────────────────
 
 MODEL_REGISTRY = {
-    "ha":     run_ha,
-    "var":    run_var,
-    "dcrnn":  run_dcrnn,
-    "stgcn":  run_stgcn,
-    "mtgnn":  run_mtgnn,
-    "agcrn":  run_agcrn,
-    "stid":   run_stid,
-    "csdi":   run_csdi,
-    "tsflow": run_tsflow,
-    "k2vae":  run_k2vae,
+    "ha":       run_ha,
+    "var":      run_var,
+    "dcrnn":    run_dcrnn,
+    "stgcn":    run_stgcn,
+    "mtgnn":    run_mtgnn,
+    "agcrn":    run_agcrn,
+    "stid":     run_stid,
+    "tsflow":   run_tsflow, 
+    "patchtst": run_patchtst,
+    "k2vae":    run_k2vae,
+    "tsdiff":   run_tsdiff,
+    "csdi":     run_csdi,
 }
 
 

@@ -60,10 +60,10 @@ class KoopmanNet(nn.Module):
         z = self.g(tokens)
         B, N, n_p, K = z.shape
         z_flat = z.reshape(B * N, n_p, K)
-        z_evolved = torch.zeros_like(z_flat)
-        z_evolved[:, 0] = z_flat[:, 0]
+        evolved = [z_flat[:, 0]]
         for t in range(1, n_p):
-            z_evolved[:, t] = z_evolved[:, t - 1] @ self.K.T
+            evolved.append(evolved[-1] @ self.K.T)
+        z_evolved = torch.stack(evolved, dim=1)
         return z_evolved.reshape(B, N, n_p, K)
 
 

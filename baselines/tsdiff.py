@@ -439,7 +439,7 @@ class TSDiff(nn.Module):
 # ── 内部评估（概率指标）──────────────────────────────────────────────────
 
 def _evaluate_tsdiff(model: "TSDiff", loader, device, scaler,
-                     null_val: float = None) -> dict:
+                     null_val: float = None, logger=None) -> dict:
     """
     评估概率预测指标。
     model.n_samples 已由调用方在调用前设置好，此处不重复覆盖。
@@ -448,13 +448,18 @@ def _evaluate_tsdiff(model: "TSDiff", loader, device, scaler,
 
     model.eval()
     samples_list, y_list = [], []
+    total = len(loader)
 
     with torch.no_grad():
-        for x, y in loader:
+        for i, (x, y) in enumerate(loader):
             x = x.to(device)
+            t0 = time.time()
             raw = model.sample(x, return_samples=True)   # [S, B, N, T_out, 1]
             samples_list.append(raw.cpu().numpy())
             y_list.append(y.permute(0, 2, 1, 3).numpy())  # [B, N, T_out, F]
+            if logger and (i == 0 or (i + 1) % max(1, total // 5) == 0):
+                logger.info(f"  [TSDiff eval] batch {i+1:4d}/{total} | "
+                            f"{time.time() - t0:.1f}s/batch")
 
     samples_all = np.concatenate(samples_list, axis=1)  # [S, total, N, T_out, 1]
     y_all       = np.concatenate(y_list,       axis=0)  # [total, N, T_out, F]
@@ -532,8 +537,10 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
         model.train()
         epoch_loss = 0.0
         n_batches  = 0
+        total_batches = len(train_loader)
+        log_every = max(1, total_batches // 10)
 
-        for x, y in train_loader:
+        for i, (x, y) in enumerate(train_loader):
             x = x.to(device)
             y = y.to(device)
 
@@ -546,12 +553,16 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
             epoch_loss += loss.item()
             n_batches  += 1
 
+            if (i + 1) % log_every == 0 or i == 0:
+                logger.info(f"  [TSDiff] Epoch {epoch:3d} | batch {i+1:4d}/{total_batches} | "
+                            f"loss={loss.item():.4f} | {time.time() - t0:.1f}s")
+
         avg_loss = epoch_loss / max(n_batches, 1)
 
-        # 验证：设置小 n_samples 快速评估
-        model.n_samples = n_samples_val
+        # 验证：n_samples=1 大幅加速（100步×1样本 vs 100步×10样本）
+        model.n_samples = 1
         val_m = _evaluate_tsdiff(model, val_loader, device, scaler,
-                                 null_val=null_val)
+                                 null_val=null_val, logger=logger)
 
         scheduler.step(val_m["CRPS"])
         cur_lr  = optimizer.param_groups[0]["lr"]
@@ -582,7 +593,7 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
         torch.load(save_path, map_location=device, weights_only=True))
     model.n_samples = n_samples_test
     test_m = _evaluate_tsdiff(model, test_loader, device, scaler,
-                              null_val=null_val)
+                              null_val=null_val, logger=logger)
 
     sep = "=" * 55
     logger.info(f"\n{sep}")

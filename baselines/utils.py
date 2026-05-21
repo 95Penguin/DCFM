@@ -11,6 +11,7 @@ baselines/utils.py
   统一无 mask 全量评估，与 GridCFN 主模型对齐，方便与文献直接比较。
   所有函数保留 null_val 参数接口，但传入任何值均不做 mask。
 """
+import math
 import time
 import numpy as np
 import torch
@@ -59,15 +60,19 @@ def gaussian_nll_loss(mu, sigma_raw, target, null_val=None):
     return nll.mean()
 
 
-def compute_crps_gaussian(mu, sigma_raw, target, null_val=None, n_samples: int = 100):
-    """蒙特卡洛估计 CRPS，无 mask 全量计算。"""
-    sigma = F.softplus(sigma_raw) + 1e-4
-    eps = torch.randn(n_samples, *mu.shape, device=mu.device)
-    samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
-    mae_term  = (samples - target.unsqueeze(0)).abs().mean(0)
-    diff_term = (samples.unsqueeze(0) - samples.unsqueeze(1)).abs().mean([0, 1])
-    crps_per_point = mae_term - 0.5 * diff_term
-    return crps_per_point.mean().item()
+def compute_crps_gaussian(mu, sigma, target, null_val=None):
+    """解析高斯 CRPS（闭式解），O(1) 内存，无采样。
+    公式: CRPS = σ · [z · (2Φ(z)-1) + 2φ(z) − 1/√π]
+    其中 z = (target − mu) / σ, Φ=标准正态 CDF, φ=标准正态 PDF。
+    sigma 应为已处理好的标准差（调用方负责 softplus + 数值稳定）。"""
+    sigma = sigma + 1e-6
+    z = (target - mu) / sigma
+    # 标准正态 PDF: φ(z) = exp(-z²/2) / √(2π)
+    phi = torch.exp(-0.5 * z ** 2) / math.sqrt(2 * math.pi)
+    # 标准正态 CDF: Φ(z) = 0.5 · (1 + erf(z/√2))
+    Phi = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+    crps = sigma * (z * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+    return crps.mean().item()
 
 
 def compute_prob_metrics(samples: np.ndarray, y: np.ndarray,
@@ -252,7 +257,7 @@ def train_model(model, train_loader, val_loader, test_loader,
     if prob:
         pred_sigma_norm = torch.cat(all_sigma_raw)
         mae_norm, rmse_norm, mape_norm = compute_metrics(pred_mu, true_cat)
-        crps_norm = compute_crps_gaussian(pred_mu, pred_sigma_norm, true_cat)
+        crps_norm = compute_crps_gaussian(pred_mu, F.softplus(pred_sigma_norm), true_cat)
     else:
         mae_norm, rmse_norm, mape_norm = compute_metrics(pred_mu, true_cat)
 

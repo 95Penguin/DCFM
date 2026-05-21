@@ -18,7 +18,7 @@ class STID(nn.Module):
                  hidden_dim: int = 32,
                  n_layers:   int = 3,
                  embed_dim:  int = 32,
-                 out_dim:    int = 1,
+                 out_dim:    int = 2,
                  T_out:      int = 1):
         super().__init__()
         self.T_in     = T_in
@@ -65,4 +65,5 @@ class STID(nn.Module):
             h = layer(h)                                        # [B, N, hidden]
 
         out = self.regression_layer(h)                          # [B, N, T_out*out_dim]
-        return out.reshape(B, self.T_out, N, self.out_dim)
+        out = out.reshape(B, N, self.T_out, self.out_dim)      # [B, N, T_out, out_dim]
+        return out.permute(0, 2, 1, 3)                          # [B, T_out, N, out_dim]
