@@ -112,8 +112,13 @@ def build_model(cfg, in_dim=None, n_nodes=None):
         chunk_size=getattr(m, "chunk_size", 16384),
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
         T_out=cfg.data.T_out,
-        T_in=cfg.data.T_in,            # ← 传入 T_in，供 MultiScaleContext 裁剪 dilations
+        T_in=cfg.data.T_in,
         adap_dim=getattr(m, "adap_dim", 16),
+        # ── DMSD 新增参数 ──────────────────────────────────────────────
+        rank_r=getattr(m, "rank_r", 8),
+        lambda_rank=getattr(m, "lambda_rank", 0.01),
+        freq_candidates=getattr(m, "freq_candidates", (12, 24, 48, 96)),
+        wind_mask=None,   # SDWPF 风向掩码：如有元数据可在此传入 [N,N] tensor
     )
 
 

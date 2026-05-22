@@ -1,25 +1,27 @@
 """
-GridCFN – 训练循环（多步预测版）
+GridCFN-DMSD – 训练循环
 
-多步改动说明：
-  - y 形状从 [B, N, 1] 变为 [B, T_out, N, F]，内部 reshape 为 [B, N, T_out*F]
-    再传给 cfm_loss。
-  - evaluate 中 sample 返回 [S, B, N, T_out, F]，按步分解指标
-    (MAE/RMSE/CRPS/PICP/PINAW)，并汇报 avg 及各步数值。
-  - 早停监控 val_crps_avg（所有步平均 CRPS）。
-  - calibrate_temperature 在展平的 [S, total*T_out, N, F] 上搜索，
-    保持与原版一致的后验校准逻辑。
-
-训练策略（不变）：
-  - warmup 期间跳过 CLUB
-  - MI loss clamp(-1, +∞)，< -1 时跳过
-  - Val 在归一化域评估；Test 在反归一化域报告
+相对原版的改动：
+  1. model.forward 新签名：返回 6 个值
+       He_prime, Hs_prime, He, Hs, X_low_pooled, X_high_pooled
+  2. CLUB 分为两个实例 club_e / club_s：
+       club_e: MI(He, X_low_pooled)   — 环境表征不应含残差信息
+       club_s: MI(Hs, X_high_pooled)  — 因果表征不应含趋势信息
+     相应地：
+       - club_param_ids 同时覆盖 model.club_e 和 model.club_s
+       - club_optimizer 管理两个 CLUB 模块的参数
+       - variational_loss 分别对两个实例调用
+       - MI 损失 = club_e(He, X_low_pooled) + club_s(Hs, X_high_pooled)
+  3. 新增 L_rank = model.rank_loss()，从 warmup 第一个 epoch 起就加入总损失
+     （秩正则不依赖 CLUB 的一致性约束，可以更早起效）。
+  4. 日志列名调整：MI 列监控新 CLUB 目标；MIp 列改为监控 L_rank。
+  5. 其余逻辑（早停、温度校准、评估、历史记录）完全不变。
 """
 
 import logging
 import math
 import time
-from typing import Dict, List, Optional
+from typing import Dict
 
 import numpy as np
 import torch
@@ -34,7 +36,7 @@ def _set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 评估指标（逐元素，支持任意形状末尾维度）
+# 评估指标（不变）
 # ---------------------------------------------------------------------------
 
 def mae(pred, true):
@@ -50,14 +52,8 @@ def mape(pred, true, eps=1e-8):
 
 
 def crps_empirical(samples: np.ndarray, y: np.ndarray) -> float:
-    """
-    经验 CRPS。
-    samples : [S, ...]   S 个粒子
-    y       : [...]      真实值
-    """
     S        = samples.shape[0]
     mae_term = np.abs(samples - y[None]).mean(axis=0)
-
     n_rep   = min(10, S - 1)
     spreads = []
     rng     = np.random.default_rng(seed=0)
@@ -68,7 +64,6 @@ def crps_empirical(samples: np.ndarray, y: np.ndarray) -> float:
             swap = (idx + 1) % S
             perm[idx], perm[swap] = perm[swap], perm[idx]
         spreads.append(np.abs(samples - samples[perm]).mean(axis=0))
-
     spread = np.mean(spreads, axis=0)
     return float((mae_term - 0.5 * spread).mean())
 
@@ -91,17 +86,8 @@ def pinaw_empirical(samples: np.ndarray, y: np.ndarray, confidence: float = 0.95
 
 
 def evaluate_all(samples: np.ndarray, y_all: np.ndarray) -> dict:
-    """
-    统一评估入口（多步版）。
-
-    samples : [S, total, N, T_out, F]
-    y_all   : [total, N, T_out, F]
-
-    返回 avg 指标 + 各预测步指标（key 格式: MAE_h1, MAE_h2, ...）
-    """
-    mu_all = samples.mean(axis=0)   # [total, N, T_out, F]
+    mu_all = samples.mean(axis=0)
     T_out  = y_all.shape[2]
-
     metrics = {
         "MAE":   mae(mu_all, y_all),
         "RMSE":  rmse(mu_all, y_all),
@@ -110,25 +96,21 @@ def evaluate_all(samples: np.ndarray, y_all: np.ndarray) -> dict:
         "PICP":  picp_empirical(samples, y_all),
         "PINAW": pinaw_empirical(samples, y_all),
     }
-
-    # 按预测步分解
     for h in range(T_out):
-        s_h = samples[:, :, :, h, :]   # [S, total, N, F]
-        y_h = y_all[:, :, h, :]        # [total, N, F]
+        s_h  = samples[:, :, :, h, :]
+        y_h  = y_all[:, :, h, :]
         mu_h = s_h.mean(axis=0)
         metrics[f"MAE_h{h+1}"]  = mae(mu_h, y_h)
         metrics[f"RMSE_h{h+1}"] = rmse(mu_h, y_h)
         metrics[f"CRPS_h{h+1}"] = crps_empirical(s_h, y_h)
-
     return metrics
 
 
 # ---------------------------------------------------------------------------
-# 反归一化辅助
+# 反归一化辅助（不变）
 # ---------------------------------------------------------------------------
 
 def _inverse_samples(samples: np.ndarray, scaler) -> np.ndarray:
-    """samples: [S, ...] → 反归一化"""
     shape = samples.shape
     return scaler.inverse_transform(samples.reshape(-1)).reshape(shape)
 
@@ -138,24 +120,17 @@ def _inverse_y(y: np.ndarray, scaler) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Temperature Calibration（展平后搜索，与原版逻辑一致）
+# Temperature Calibration（不变）
 # ---------------------------------------------------------------------------
 
 def calibrate_temperature(samples: np.ndarray, y_all: np.ndarray,
                            target_coverage: float = 0.95,
                            grid: np.ndarray = None) -> float:
-    """
-    后验温度缩放。
-    samples : [S, total, N, T_out, F]
-    y_all   : [total, N, T_out, F]
-    """
     if grid is None:
         grid = np.linspace(0.5, 5.0, 91)
-
     mu       = samples.mean(axis=0)
     best_T   = 1.0
     best_gap = float("inf")
-
     for T in grid:
         samples_scaled = mu[None] + T * (samples - mu[None])
         coverage = picp_empirical(samples_scaled, y_all, target_coverage)
@@ -163,7 +138,6 @@ def calibrate_temperature(samples: np.ndarray, y_all: np.ndarray,
         if gap < best_gap:
             best_gap = gap
             best_T   = float(T)
-
     return best_T
 
 
@@ -172,23 +146,23 @@ def calibrate_temperature(samples: np.ndarray, y_all: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
-    model:           GridCFN,
-    loader:          DataLoader,
-    optimizer:       torch.optim.Optimizer,
-    club_optimizer:  torch.optim.Optimizer,
-    adj_norm:        torch.Tensor,
-    edge_index:      torch.Tensor,
-    device:          torch.device,
-    epoch:           int,
+    model:            GridCFN,
+    loader:           DataLoader,
+    optimizer:        torch.optim.Optimizer,
+    club_optimizer:   torch.optim.Optimizer,
+    adj_norm:         torch.Tensor,
+    edge_index:       torch.Tensor,
+    device:           torch.device,
+    epoch:            int,
     main_params,
-    grad_clip:       float = 1.0,
-    warmup_epochs:   int = 5,
-    cfm_n_t_samples: int = 4,
-    sigma_min:       float = 0.01,
-    club_inner_steps: int = 3,       # D: CLUB 每步内循环更新次数
+    grad_clip:        float = 1.0,
+    warmup_epochs:    int = 5,
+    cfm_n_t_samples:  int = 4,
+    sigma_min:        float = 0.01,
+    club_inner_steps: int = 3,
 ) -> Dict[str, float]:
     model.train()
-    total_loss = total_cfm = total_mi = total_mi_prime = total_var = total_gnorm = 0.0
+    total_loss = total_cfm = total_mi = total_rank = total_var = total_gnorm = 0.0
     n_batches  = 0
 
     adj_norm_ = adj_norm.to(device)
@@ -196,64 +170,78 @@ def train_one_epoch(
 
     train_club = (epoch > warmup_epochs)
 
-    # CLUB 激活后前 3 个 epoch 线性升温 lambda_mi，避免突然引入大正则导致不稳定
+    # CLUB 激活后前 3 个 epoch 线性升温，避免突然引入大正则导致不稳定
     if train_club:
         ramp_epochs  = 3
-        epochs_since = epoch - warmup_epochs          # 1, 2, 3, 4, ...
+        epochs_since = epoch - warmup_epochs
         ramp_factor  = min(1.0, epochs_since / ramp_epochs)
     else:
         ramp_factor  = 0.0
 
     for x, y in loader:
-        # x: [B, T_in, N, F]
-        # y: [B, T_out, N, F]  ← 多步版，保留时间维
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device)   # [B, T_in, N, F]
+        y = y.to(device)   # [B, T_out, N, F]
 
-        He_prime, Hs_prime, He, Hs, _ = model(x, adj_norm_, edge_idx_)
+        # ── Forward ──────────────────────────────────────────────────────
+        He_prime, Hs_prime, He, Hs, X_low_pooled, X_high_pooled = \
+            model(x, adj_norm_, edge_idx_)
 
-        # Step 1: 更新 CLUB 变分网络（内循环多次，降低 MI 估计方差）
+        # ── Step 1：更新 CLUB 变分网络（内循环，降低 MI 估计方差）────────
+        # 新目标：club_e(He, X_low_pooled) + club_s(Hs, X_high_pooled)
         if train_club:
             var_loss_val = 0.0
             for _ in range(club_inner_steps):
-                var_loss = model.club.variational_loss(He.detach(), Hs.detach())
+                var_e = model.club_e.variational_loss(
+                    He.detach(), X_low_pooled.detach()
+                )
+                var_s = model.club_s.variational_loss(
+                    Hs.detach(), X_high_pooled.detach()
+                )
+                var_loss = var_e + var_s
                 club_optimizer.zero_grad()
                 var_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.club.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    list(model.club_e.parameters()) + list(model.club_s.parameters()),
+                    max_norm=1.0,
+                )
                 club_optimizer.step()
                 var_loss_val = var_loss.item()
         else:
             var_loss_val = 0.0
 
-        # Step 2: 更新主网络
-        # y: [B, T_out, N, F] → [B, N, T_out*F]（CFM 期望的格式）
-        B, T_out, N, F = y.shape
-        y_target = y.permute(0, 2, 1, 3).reshape(B, N, T_out * F)
+        # ── Step 2：更新主网络 ─────────────────────────────────────────
+        B, T_out, N, Fy = y.shape
+        y_target = y.permute(0, 2, 1, 3).reshape(B, N, T_out * Fy)
 
         cfm_l = model.cfm_loss(He_prime, Hs_prime, y_target,
                                n_t_samples=cfm_n_t_samples,
                                sigma_min=sigma_min)
 
-        if train_club:
-            _set_requires_grad(model.club, False)
-            try:
-                mi_loss = model.club(He, Hs)
-                mi_val  = mi_loss.item()
-                # 只惩罚正的 MI 估计；负估计不再作为奖励项降低主损失。
-                mi_penalty = mi_loss.clamp(min=0.0)
-                loss = cfm_l + model.lambda_mi * ramp_factor * mi_penalty
+        # L_rank：从 warmup 第一个 epoch 起就加入（不依赖 CLUB）
+        rank_l     = model.rank_loss()
+        rank_val   = rank_l.item()
 
-                with torch.no_grad():
-                    if He_prime.shape[-1] == He.shape[-1] and Hs_prime.shape[-1] == Hs.shape[-1]:
-                        mi_prime_val = model.club(He_prime.detach(), Hs_prime.detach()).item()
-                    else:
-                        mi_prime_val = float("nan")
+        # 默认 loss（train_club=True 时在 try 块内覆盖；异常时退回纯 CFM+rank 损失）
+        loss   = cfm_l + model.lambda_rank * rank_l
+        mi_val = 0.0
+
+        if train_club:
+            _set_requires_grad(model.club_e, False)
+            _set_requires_grad(model.club_s, False)
+            try:
+                mi_e    = model.club_e(He, X_low_pooled)
+                mi_s    = model.club_s(Hs, X_high_pooled)
+                mi_loss = mi_e + mi_s
+                mi_val  = mi_loss.item()
+                # 只惩罚正的 MI 估计
+                mi_penalty = mi_loss.clamp(min=0.0)
+                loss = (cfm_l
+                        + model.lambda_rank * rank_l
+                        + model.lambda_club * ramp_factor * mi_penalty)
             finally:
-                _set_requires_grad(model.club, True)
-        else:
-            loss   = cfm_l
-            mi_val = 0.0
-            mi_prime_val = 0.0
+                # 无论是否异常，都恢复 CLUB 参数梯度
+                _set_requires_grad(model.club_e, True)
+                _set_requires_grad(model.club_s, True)
 
         optimizer.zero_grad()
         loss.backward()
@@ -263,7 +251,7 @@ def train_one_epoch(
         total_loss  += loss.item()
         total_cfm   += cfm_l.item()
         total_mi    += mi_val
-        total_mi_prime += mi_prime_val
+        total_rank  += rank_val
         total_var   += var_loss_val
         total_gnorm += grad_norm.item()
         n_batches   += 1
@@ -272,14 +260,14 @@ def train_one_epoch(
         "loss":      total_loss  / n_batches,
         "cfm":       total_cfm   / n_batches,
         "mi":        total_mi    / n_batches,
-        "mi_prime":  total_mi_prime / n_batches,
+        "rank":      total_rank  / n_batches,   # 原 mi_prime 列，现在记录 L_rank
         "var_loss":  total_var   / n_batches,
         "grad_norm": total_gnorm / n_batches,
     }
 
 
 # ---------------------------------------------------------------------------
-# 评估（多步版）
+# 评估（多步版，不变）
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -292,14 +280,6 @@ def evaluate(model: GridCFN, loader: DataLoader,
              inverse_transform: bool = True,
              sigma_min: float = 0.01,
              x0_scale: float = 1.0):
-    """
-    CFM 推断评估（多步版）。
-
-    返回 metrics dict，key 含 avg 指标 + 各步指标（MAE_h1, ..., CRPS_h1, ...）。
-
-    samples_all : [S, total, N, T_out, feat_dim]
-    y_all       : [total, N, T_out, feat_dim]
-    """
     model.eval()
     samples_list, y_list = [], []
 
@@ -307,12 +287,10 @@ def evaluate(model: GridCFN, loader: DataLoader,
     edge_idx_ = edge_index.to(device)
 
     for x, y in loader:
-        # x: [B, T_in, N, F]
-        # y: [B, T_out, N, F]
         x = x.to(device)
-        He_prime, Hs_prime, _, _, _ = model(x, adj_norm_, edge_idx_)
+        # forward 现在返回 6 个值，只取前两个供采样使用
+        He_prime, Hs_prime, *_ = model(x, adj_norm_, edge_idx_)
 
-        # raw_samples: [S, B, N, T_out, feat_dim]
         raw_samples = model.sample(
             He_prime, Hs_prime,
             n_samples=n_samples,
@@ -322,13 +300,10 @@ def evaluate(model: GridCFN, loader: DataLoader,
         ).cpu().numpy()
 
         samples_list.append(raw_samples)
-        # y: [B, T_out, N, F] → [B, N, T_out, F]
         y_np = y.permute(0, 2, 1, 3).numpy()
         y_list.append(y_np)
 
-    # samples_all: [S, total, N, T_out, feat_dim]
     samples_all = np.concatenate(samples_list, axis=1)
-    # y_all:       [total, N, T_out, feat_dim]
     y_all       = np.concatenate(y_list, axis=0)
 
     if inverse_transform and scaler is not None:
@@ -363,7 +338,11 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
             logger.addHandler(h)
             logger.setLevel(logging.DEBUG)
 
-    club_param_ids = {id(p) for p in model.club.parameters()}
+    # CLUB 参数：同时覆盖 club_e 和 club_s
+    club_param_ids = (
+        {id(p) for p in model.club_e.parameters()} |
+        {id(p) for p in model.club_s.parameters()}
+    )
     main_params = [p for p in model.parameters() if id(p) not in club_param_ids]
 
     optimizer = torch.optim.Adam(
@@ -372,9 +351,9 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         weight_decay=cfg_train.weight_decay,
     )
     club_optimizer = torch.optim.Adam(
-        model.club.parameters(),
+        list(model.club_e.parameters()) + list(model.club_s.parameters()),
         lr=cfg_train.lr * 0.5,
-        weight_decay=cfg_train.weight_decay,   # 防止 CLUB 网络在小图数据集上过拟合
+        weight_decay=cfg_train.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min",
@@ -382,8 +361,6 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         patience=cfg_train.lr_decay_patience,
     )
 
-    # 训练阶段 val 只需相对排序准确，减半采样数可显著加速每 epoch 时间。
-    # 最终 test 评估仍使用 cfm_n_samples_test（默认 200），不受影响。
     n_samples_val    = max(20, getattr(cfg_train, "cfm_n_samples",      50) // 2)
     n_steps          = getattr(cfg_train, "cfm_n_steps",        20)
     cfm_n_t_samples  = getattr(cfg_train, "cfm_n_t_samples",     4)
@@ -396,14 +373,17 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     best_val_crps     = float("inf")
     epochs_no_improve = 0
     history = {
-        "train_loss": [], "train_cfm": [], "train_mi": [], "train_mi_prime": [], "train_var_loss": [],
+        "train_loss": [], "train_cfm": [], "train_mi": [],
+        "train_rank": [], "train_var_loss": [],
         "val_crps": [], "val_mae": [], "val_rmse": [],
     }
 
     logger.info("Val 指标在归一化域（用于早停），Test 指标在反归一化域（实际量纲）")
     logger.info(f"多步预测 T_out={model.T_out}")
-    logger.info(f"CLUB warmup: {warmup_epochs} epochs，club_lr={cfg_train.lr * 0.5:.2e}")
-    header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | {'MIp':>8} | "
+    logger.info(f"DMSD CLUB warmup: {warmup_epochs} epochs，目标: MI(He,X_low)+MI(Hs,X_high)")
+    logger.info(f"lambda_rank={model.lambda_rank}，lambda_club={model.lambda_club}")
+    # 日志列：MI 监控新 CLUB 目标；Rank 监控 L_rank
+    header = (f"{'Epoch':>6} | {'Loss':>8} | {'CFM':>8} | {'MI':>8} | {'Rank':>8} | "
               f"{'VarLoss':>9} | {'GradNorm':>9} | {'Val MAE':>8} | {'Val RMSE':>9} | "
               f"{'Val CRPS':>9} | {'LR':>8} | {'Time':>6}")
     logger.info(header)
@@ -428,7 +408,6 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
             inverse_transform=False,
             sigma_min=sigma_min, x0_scale=x0_scale,
         )
-        # 早停监控：所有步平均 CRPS
         val_crps_avg = val_m["CRPS"]
         scheduler.step(val_crps_avg)
 
@@ -438,7 +417,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         history["train_loss"].append(train_m["loss"])
         history["train_cfm"].append(train_m["cfm"])
         history["train_mi"].append(train_m["mi"])
-        history["train_mi_prime"].append(train_m["mi_prime"])
+        history["train_rank"].append(train_m["rank"])
         history["train_var_loss"].append(train_m["var_loss"])
         history["val_crps"].append(val_crps_avg)
         history["val_mae"].append(val_m["MAE"])
@@ -446,7 +425,7 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
 
         logger.info(
             f"{epoch:>6} | {train_m['loss']:>8.4f} | {train_m['cfm']:>8.4f} | "
-            f"{train_m['mi']:>8.4f} | {train_m['mi_prime']:>8.4f} | "
+            f"{train_m['mi']:>8.4f} | {train_m['rank']:>8.4f} | "
             f"{train_m['var_loss']:>9.4f} | "
             f"{train_m['grad_norm']:>9.3f} | "
             f"{val_m['MAE']:>8.4f} | {val_m['RMSE']:>9.4f} | "
@@ -488,40 +467,30 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         f"（验证集 PICP@T=1.0: {picp_before:.4f} → PICP@T={best_T:.2f}: {picp_after:.4f}）"
     )
 
-    # 测试集：只跑一次采样，复用 samples 计算三套指标
+    # 测试集评估
     _, samples_test, y_test = evaluate(
         model, test_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
         n_samples=n_samples_test, n_steps=n_steps,
-        temperature=1.0, inverse_transform=True,   # 先拿未校准的反归一化样本
+        temperature=1.0, inverse_transform=True,
         sigma_min=sigma_min, x0_scale=x0_scale,
     )
     _, samples_test_norm, y_test_norm = evaluate(
         model, test_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
         n_samples=n_samples_test, n_steps=n_steps,
-        temperature=1.0, inverse_transform=False,  # 归一化域
+        temperature=1.0, inverse_transform=False,
         sigma_min=sigma_min, x0_scale=x0_scale,
     )
 
-    # 从同一批 samples 派生四套指标，不重复跑 ODE
-    # 1. 未校准反归一化（与 baselines 对比用）
-    test_m_raw = evaluate_all(samples_test, y_test)
-
-    # 2. 校准后反归一化
-    mu_test = samples_test.mean(axis=0, keepdims=True)
-    samples_calibrated = mu_test + best_T * (samples_test - mu_test)
-    test_m = evaluate_all(samples_calibrated, y_test)
-
-    # 3. 校准后归一化域
-    mu_norm = samples_test_norm.mean(axis=0, keepdims=True)
-    samples_calibrated_norm = mu_norm + best_T * (samples_test_norm - mu_norm)
-    test_m_norm = evaluate_all(samples_calibrated_norm, y_test_norm)
-
-    # 4. 未校准归一化域
+    test_m_raw  = evaluate_all(samples_test, y_test)
+    mu_test     = samples_test.mean(axis=0, keepdims=True)
+    test_m      = evaluate_all(mu_test + best_T * (samples_test - mu_test), y_test)
+    mu_norm     = samples_test_norm.mean(axis=0, keepdims=True)
+    test_m_norm = evaluate_all(mu_norm + best_T * (samples_test_norm - mu_norm), y_test_norm)
     test_m_raw_norm = evaluate_all(samples_test_norm, y_test_norm)
 
-    sep = "=" * 60
+    sep      = "=" * 60
     avg_keys = ["MAE", "RMSE", "MAPE", "CRPS", "PICP", "PINAW"]
 
     logger.info(f"\n{sep}")
@@ -557,8 +526,8 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
 
     history["test_metrics"]          = test_m
     history["test_metrics_norm"]     = test_m_norm
-    history["test_metrics_raw"]      = test_m_raw       # 未校准反归一化，供与 baselines 对比
-    history["test_metrics_raw_norm"] = test_m_raw_norm  # 未校准归一化域
+    history["test_metrics_raw"]      = test_m_raw
+    history["test_metrics_raw_norm"] = test_m_raw_norm
     history["best_temperature"]      = best_T
     history["test_shape"]            = list(samples_test.shape)
     return history

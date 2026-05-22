@@ -1,25 +1,32 @@
 """
-GridCFN: Causal Spatio-Temporal Framework for Power Flow Uncertainty Prediction
-（多步预测版，Direct Multi-Output）
+GridCFN-DMSD: Dual-track Multi-Scale Disentanglement
+（在多步预测版基础上引入 DMSD 架构改进）
 
-改进说明（相对原版）：
-  1. AdaptiveGCN：在固定皮尔逊图基础上叠加可学习自适应邻接矩阵（参考 GWN），
-     图结构随训练更新，不再依赖固定阈值。
-  2. CausalDisentangler：He/Hs 改为注意力时间池化，不再只取最后一个时间步，
-     充分利用整个序列的上下文信息。
-  3. CFMVectorField：输入 x_t 增加可学习时序位置编码，让网络感知各预测步的
-     相对位置，而不是把 T_out 步完全展平处理。
-  4. GridCFN.sample：Euler → Heun 二阶 ODE 求解器，推理质量更好，
-     相同 n_steps 下误差更低。
-  5. GridCFN.cfm_loss：t 改为分层随机采样（stratified sampling），
-     覆盖更均匀，收敛更快。
+改进说明（相对多步版）：
+  1. FrequencyDecomposer：可学习多尺度移动平均，将输入分解为趋势支路（X_low）
+     和残差支路（X_high），截止频率由数据自适应决定。
+  2. LowRankGCN：邻接矩阵参数化为 U@U^T（rank-r），强制只学习全局同步模式。
+     配合显式秩正则 L_rank 防止退化。
+  3. SparseGCN：可微稀疏化（软阈值 sigmoid）替代硬 Top-K，梯度稳定。
+     SDWPF 可选叠加风向先验掩码。
+  4. DualTrackBackbone：X_low → LowRankGCN+TCN_e → He_seq/He；
+     X_high → SparseGCN+TCN_s → Hs。各自独立 LayerNorm，独立 TCN 参数。
+  5. 移除 CausalDisentangler：解耦职责提前到前端架构，不再依赖后端线性层拆分。
+  6. CLUBEstimator 改为两个独立实例：
+       club_e: MI(He, X_low_pooled)  — 环境表征不应含高频残差信息
+       club_s: MI(Hs, X_high_pooled) — 因果表征不应含低频趋势信息
+  7. MultiScaleContext / SCGMP / CFMVectorField 接口完全不变。
 
-架构概览：
-  Backbone (AdaptiveGCN+TCN) → CausalDisentangler → He（环境）/ Hs（随机）
-  He → MultiScaleContext → He_prime（多尺度环境背景）
-  Hs → SCGMP            → Hs_prime（图传播后随机表征）
-  CFMVectorField(x_t + temporal_pe, t, He_prime, Hs_prime) → 双流 AdaLN 条件向量场
-  向量场输出维度 = T_out * feat_dim（直接多步输出）
+架构数据流：
+  X → FrequencyDecomposer → X_low, X_high
+  X_low  → LowRankGCN + TCN_e → He_seq [B,T,N,env_dim]
+                               → He     [B,N,env_dim]   (注意力时间池化)
+  X_high → SparseGCN  + TCN_s → Hs     [B,N,stoch_dim] (注意力时间池化)
+  He_seq → MultiScaleContext   → He_prime [B,N,ms_out_dim]
+  Hs,He  → SCGMP               → Hs_prime [B,N,stoch_dim]
+  He_prime, Hs_prime → CFMVectorField → 速度场
+  CLUB: MI(He, X_low_pooled) + MI(Hs, X_high_pooled)  (一致性惩罚)
+  L_rank: -log det(U^T U + εI)  (低秩正则)
 """
 
 import torch
@@ -29,74 +36,214 @@ import math
 
 
 # ---------------------------------------------------------------------------
-# 1. GCN → AdaptiveGCN
+# 1. FrequencyDecomposer — 可学习多尺度趋势/残差分解
 # ---------------------------------------------------------------------------
 
-class GCNLayer(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim, bias=False)
-
-    def forward(self, x, adj_norm):
-        return F.relu(torch.matmul(adj_norm, self.linear(x)))
-
-
-class AdaptiveGCN(nn.Module):
+class FrequencyDecomposer(nn.Module):
     """
-    自适应图卷积网络。
+    将输入序列分解为趋势支路（X_low）和残差支路（X_high）。
 
-    在固定的归一化邻接矩阵 adj_norm 基础上，叠加一个数据驱动的自适应邻接矩阵：
-        A_adap = softmax(ReLU(E1 @ E2^T))
-        A_total = α * A_adap + (1-α) * adj_norm
+    做法：
+      - 提供 4 个候选移动平均窗口（由 candidates 指定）
+      - 权重由输入全局均值经线性层 + softmax 动态生成
+      - X_low  = sum_k(w_k * MA_k(X))
+      - X_high = X - X_low
 
-    E1, E2 是可学习节点嵌入，维度为 adap_dim。
-    α 为可学习的混合系数（初始化为 0.5）。
+    候选窗口建议：
+      Solar/SDWPF (10min 粒度): candidates=[12, 24, 48, 96]
+      Electricity (1h 粒度):    candidates=[6, 12, 24, 48]
 
-    优点：
-      - 不依赖预计算的皮尔逊阈值图（固定图的邻接矩阵不参与梯度）
-      - 能捕捉静态图结构无法表达的隐式依赖关系
-      - 参数量增加很少（2 * N * adap_dim + 1）
+    填充方式用反射填充（reflect），避免边缘趋势估计偏低。
     """
-    def __init__(self, n_nodes: int, in_dim: int, hidden_dim: int,
-                 out_dim: int, n_layers: int = 2, adap_dim: int = 16):
+
+    def __init__(self, in_dim: int, candidates=(12, 24, 48, 96)):
         super().__init__()
+        self.candidates = list(candidates)
+        n = len(candidates)
+        # 权重生成：全局 mean → Linear → softmax
+        self.weight_net = nn.Linear(in_dim, n)
+        # 独立 LayerNorm，不共享参数
+        self.norm_low  = nn.LayerNorm(in_dim)
+        self.norm_high = nn.LayerNorm(in_dim)
+
+    def _moving_avg(self, x: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        x: [B*N, T, F]，对时间维做 kernel=k 的均值池化（反射填充）。
+        返回同形状。
+        """
+        if k <= 1:
+            return x
+        # 需要 padding = k-1，左右各 (k-1)//2，奇数 kernel 时左边多一格
+        pad_l = (k - 1) // 2
+        pad_r = k - 1 - pad_l
+        # reflect 模式要求 padding < input_size，做保护性截断
+        T_len = x.shape[1]   # x: [B*N, T, F]
+        pad_l = min(pad_l, T_len - 1)
+        pad_r = min(pad_r, T_len - 1)
+        # F.pad 作用在最后一维；把 T 移到最后
+        x_t = x.permute(0, 2, 1)           # [B*N, F, T]
+        x_t = F.pad(x_t, (pad_l, pad_r), mode="reflect")
+        # kernel 跟随实际 padding 大小，保证输出长度 == 输入 T
+        k_eff = pad_l + pad_r + 1
+        k_eff = min(k_eff, x_t.shape[-1])
+        x_t = F.avg_pool1d(x_t, kernel_size=k_eff, stride=1, padding=0)
+        # 输出长度 = padded_T - k_eff + 1，可能不等于原 T，裁剪对齐
+        if x_t.shape[-1] > T_len:
+            x_t = x_t[:, :, :T_len]
+        elif x_t.shape[-1] < T_len:
+            x_t = F.pad(x_t, (0, T_len - x_t.shape[-1]), mode="replicate")
+        return x_t.permute(0, 2, 1)        # [B*N, T, F]
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, T, N, F]
+        返回: X_low_norm [B,T,N,F], X_high_norm [B,T,N,F]
+        """
+        B, T, N, Fin = x.shape
+        x_bn = x.permute(0, 2, 1, 3).reshape(B * N, T, Fin)  # [B*N, T, Fin]
+
+        # 全局均值生成候选权重
+        ctx = x_bn.mean(dim=1)                                # [B*N, Fin]
+        w   = F.softmax(self.weight_net(ctx), dim=-1)         # [B*N, n_cand]
+
+        # 加权融合各候选 MA
+        ma_list = [self._moving_avg(x_bn, k) for k in self.candidates]
+        ma_stack = torch.stack(ma_list, dim=-1)              # [B*N, T, F, n_cand]
+        w_bc     = w.unsqueeze(1).unsqueeze(2)               # [B*N, 1, 1, n_cand]
+        x_low_bn = (ma_stack * w_bc).sum(dim=-1)             # [B*N, T, F]
+
+        x_high_bn = x_bn - x_low_bn                         # [B*N, T, F]
+
+        # reshape 回 [B, T, N, Fin]
+        x_low  = x_low_bn.reshape(B, N, T, Fin).permute(0, 2, 1, 3)
+        x_high = x_high_bn.reshape(B, N, T, Fin).permute(0, 2, 1, 3)
+
+        # 独立 LayerNorm（防止两路能量差异导致梯度不平衡）
+        return self.norm_low(x_low), self.norm_high(x_high)
+
+
+# ---------------------------------------------------------------------------
+# 2. LowRankGCN — 低秩邻接矩阵图卷积（环境支路）
+# ---------------------------------------------------------------------------
+
+class LowRankGCN(nn.Module):
+    """
+    邻接矩阵参数化为 A = softmax(U @ U^T / sqrt(r))，rank = r。
+    强制只能表达 r 个独立扩散模式，天然捕捉全局同步集群。
+
+    秩正则项由 rank_loss() 方法返回，需在训练损失中加入：
+        L_rank = -log(det(U^T @ U + ε·I))
+    """
+
+    def __init__(self, n_nodes: int, in_dim: int, hidden_dim: int, out_dim: int,
+                 rank_r: int = 8, n_layers: int = 2):
+        super().__init__()
+        self.rank_r   = rank_r
         self.n_nodes  = n_nodes
-        self.adap_dim = adap_dim
+        self.U = nn.Parameter(torch.randn(n_nodes, rank_r) * 0.1)
 
-        # 可学习节点嵌入，用于生成自适应邻接矩阵
-        self.E1 = nn.Embedding(n_nodes, adap_dim)
-        self.E2 = nn.Embedding(n_nodes, adap_dim)
-
-        # 混合系数：α∈(0,1)，初始 0.5
-        self.alpha = nn.Parameter(torch.tensor(0.5))
-
+        # in → hidden（中间层）→ out（最后层）
         dims = [in_dim] + [hidden_dim] * (n_layers - 1) + [out_dim]
-        self.layers = nn.ModuleList(
-            [GCNLayer(dims[i], dims[i + 1]) for i in range(n_layers)]
-        )
+        self.layers = nn.ModuleList([
+            nn.Linear(dims[i], dims[i + 1], bias=False) for i in range(n_layers)
+        ])
 
-    def _adaptive_adj(self, device):
-        """计算归一化自适应邻接矩阵 A_adap: [N, N]"""
-        idx = torch.arange(self.n_nodes, device=device)
-        A   = F.relu(self.E1(idx) @ self.E2(idx).T)        # [N, N]，非负
-        A   = F.softmax(A, dim=-1)                          # 行归一化
-        return A
+    def _adj(self) -> torch.Tensor:
+        """计算低秩邻接矩阵 [N, N]，行 softmax 归一化。"""
+        A = self.U @ self.U.T / math.sqrt(self.rank_r)  # [N, N]
+        return F.softmax(A, dim=-1)
 
-    def forward(self, x, adj_norm):
+    def rank_loss(self) -> torch.Tensor:
+        """秩正则：鼓励 U 的列向量线性独立，防止低秩退化为秩-1。"""
+        G   = self.U.T @ self.U                           # [r, r]
+        eps = 1e-4 * torch.eye(self.rank_r, device=self.U.device)
+        # log det(G + εI)，det 通过 Cholesky 计算更稳定
+        try:
+            L   = torch.linalg.cholesky(G + eps)
+            logdet = 2.0 * L.diagonal().log().sum()
+        except Exception:
+            logdet = torch.logdet(G + eps)
+        return -logdet
+
+    def forward(self, x: torch.Tensor, wind_mask=None) -> torch.Tensor:
         """
-        x        : [B*T, N, F] 或 [B, N, F]
-        adj_norm : [N, N]  固定归一化邻接矩阵（不参与梯度）
+        x: [B*T, N, F]
+        返回: [B*T, N, out_dim]
+        wind_mask 参数保留接口一致性，低秩通道不使用。
         """
-        A_adap  = self._adaptive_adj(x.device)              # [N, N]
-        alpha   = torch.sigmoid(self.alpha)                  # 约束到 (0,1)
-        A_mix   = alpha * A_adap + (1.0 - alpha) * adj_norm # [N, N]
-        for layer in self.layers:
-            x = layer(x, A_mix)
+        A = self._adj()
+        for i, layer in enumerate(self.layers):
+            x = torch.matmul(A, layer(x))
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
         return x
 
 
 # ---------------------------------------------------------------------------
-# 2. TCN（不变）
+# 3. SparseGCN — 可微稀疏邻接矩阵图卷积（因果支路）
+# ---------------------------------------------------------------------------
+
+class SparseGCN(nn.Module):
+    """
+    可微稀疏化替代硬 Top-K，梯度连续。
+
+    A_sparse = A_raw * sigmoid((A_raw - threshold) / temperature)
+    行归一化后做图卷积。
+
+    threshold 和 temperature 均为可学习标量：
+      - threshold 初始化为 0（中性），训练中自适应
+      - temperature 初始化为 1.0，训练中自然衰减趋向稀疏
+
+    SDWPF 可选传入 wind_mask [N, N]（上风向为 1，下风向为 0.1），
+    叠加物理先验；其他数据集不传，默认 None（等价于全 1 mask）。
+    """
+
+    def __init__(self, n_nodes: int, in_dim: int, hidden_dim: int, out_dim: int,
+                 n_layers: int = 2, emb_dim: int = 32):
+        super().__init__()
+        self.n_nodes   = n_nodes
+        # 节点 embedding 用独立 emb_dim，不与 out_dim 耦合
+        self.emb       = nn.Embedding(n_nodes, emb_dim)
+        self.threshold   = nn.Parameter(torch.zeros(1))
+        self.temperature = nn.Parameter(torch.ones(1))
+
+        # in → hidden（中间层）→ out（最后层）
+        dims = [in_dim] + [hidden_dim] * (n_layers - 1) + [out_dim]
+        self.layers = nn.ModuleList([
+            nn.Linear(dims[i], dims[i + 1], bias=False) for i in range(n_layers)
+        ])
+
+    def _adj(self, device, wind_mask=None) -> torch.Tensor:
+        """计算可微稀疏邻接矩阵 [N, N]。"""
+        idx   = torch.arange(self.n_nodes, device=device)
+        E     = self.emb(idx)                                    # [N, emb_dim]
+        A_raw = E @ E.T / math.sqrt(E.shape[-1])                 # [N, N]
+
+        temp = self.temperature.abs().clamp(min=1e-3)            # 防止除零
+        A    = A_raw * torch.sigmoid((A_raw - self.threshold) / temp)
+
+        if wind_mask is not None:
+            A = A * wind_mask.to(device)
+
+        # 行归一化
+        row_sum = A.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        return A / row_sum
+
+    def forward(self, x: torch.Tensor, wind_mask=None) -> torch.Tensor:
+        """
+        x: [B*T, N, F]
+        返回: [B*T, N, out_dim]
+        """
+        A = self._adj(x.device, wind_mask)
+        for i, layer in enumerate(self.layers):
+            x = torch.matmul(A, layer(x))
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# 4. TCN（保留，不变）
 # ---------------------------------------------------------------------------
 
 class CausalConv1d(nn.Module):
@@ -144,141 +291,161 @@ class TCN(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 3. Backbone（使用 AdaptiveGCN）
+# 5. AttentionPool — 可学习注意力时间池化（供双轨共用）
 # ---------------------------------------------------------------------------
 
-class Backbone(nn.Module):
+class AttentionPool(nn.Module):
+    """
+    对 [B, T, N, D] 的时间维做注意力加权池化，输出 [B, N, D]。
+    与原 CausalDisentangler 中的池化逻辑一致，抽出为独立模块供复用。
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        hidden = max(1, dim // 2)
+        self.attn = nn.Sequential(
+            nn.Linear(dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, N, D] → [B, N, D]"""
+        score  = self.attn(x)                      # [B, T, N, 1]
+        weight = F.softmax(score, dim=1)
+        return (weight * x).sum(dim=1)             # [B, N, D]
+
+
+# ---------------------------------------------------------------------------
+# 6. DualTrackBackbone — 双轨 Backbone（替换原 Backbone + CausalDisentangler）
+# ---------------------------------------------------------------------------
+
+class DualTrackBackbone(nn.Module):
+    """
+    完整的双轨特征提取，输出与原 Backbone+Disentangler 接口等价：
+      He_seq : [B, T, N, env_dim]   — 供 MultiScaleContext（带梯度）
+      He     : [B, N, env_dim]      — 供 SCGMP 和 CLUB_e（注意力池化）
+      Hs     : [B, N, stoch_dim]    — 供 SCGMP 和 CLUB_s（注意力池化）
+
+    同时返回 X_low/X_high 的时间均值池化 + 线性投影，供 CLUB 一致性约束使用：
+      X_low_pooled  : [B, N, env_dim]
+      X_high_pooled : [B, N, stoch_dim]
+    """
+
     def __init__(self, n_nodes: int, in_dim: int,
-                 gcn_hidden: int, tcn_hidden: int,
+                 env_dim: int, stoch_dim: int,
+                 gcn_hidden: int = 64, tcn_hidden: int = 64,
                  gcn_layers: int = 2, tcn_layers: int = 4,
-                 adap_dim: int = 16):
+                 rank_r: int = 8,
+                 freq_candidates: tuple = (12, 24, 48, 96),
+                 wind_mask=None):
         super().__init__()
-        self.gcn = AdaptiveGCN(n_nodes, in_dim, gcn_hidden, gcn_hidden,
-                               gcn_layers, adap_dim)
-        # tcn_input_dim = gcn_hidden：GCN 输出维即 TCN 输入维
-        self.tcn = TCN(in_dim=gcn_hidden, hidden_dim=tcn_hidden, n_layers=tcn_layers)
 
-    def forward(self, x, adj_norm):
-        """x: [B,T,N,F] → H: [B,T,N,D]"""
-        B, T, N, F = x.shape
-        g = self.gcn(x.reshape(B * T, N, F), adj_norm).reshape(B, T, N, -1)
-        H = self.tcn(g.permute(0, 2, 1, 3))
-        return H.permute(0, 2, 1, 3)
+        # 频率分流
+        self.decomposer = FrequencyDecomposer(in_dim, candidates=freq_candidates)
 
+        # 环境支路：LowRankGCN 内部经过 gcn_hidden 再投影到 env_dim，TCN 在 tcn_hidden 宽度运行
+        self.gcn_e   = LowRankGCN(n_nodes, in_dim, gcn_hidden, env_dim,
+                                   rank_r=rank_r, n_layers=gcn_layers)
+        self.tcn_e   = TCN(in_dim=env_dim, hidden_dim=tcn_hidden, n_layers=tcn_layers)
+        # TCN 输出是 tcn_hidden，需要投影回 env_dim 供下游使用
+        self.proj_tcn_e = nn.Linear(tcn_hidden, env_dim) if tcn_hidden != env_dim else nn.Identity()
+        self.pool_e  = AttentionPool(env_dim)
 
-# ---------------------------------------------------------------------------
-# 4. CausalDisentangler（改为注意力时间池化）
-# ---------------------------------------------------------------------------
+        # 因果支路：SparseGCN 内部经过 gcn_hidden 再投影到 stoch_dim
+        self.gcn_s   = SparseGCN(n_nodes, in_dim, gcn_hidden, stoch_dim, n_layers=gcn_layers)
+        self.tcn_s   = TCN(in_dim=stoch_dim, hidden_dim=tcn_hidden, n_layers=tcn_layers)
+        self.proj_tcn_s = nn.Linear(tcn_hidden, stoch_dim) if tcn_hidden != stoch_dim else nn.Identity()
+        self.pool_s  = AttentionPool(stoch_dim)
 
-class CausalDisentangler(nn.Module):
-    """
-    将 Backbone 输出 H 分解为 He（环境）和 Hs（随机）表征。
+        # X_low / X_high 的时间均值池化后的线性投影，供 CLUB 使用
+        self.proj_low  = nn.Linear(in_dim, env_dim)
+        self.proj_high = nn.Linear(in_dim, stoch_dim)
 
-    改进：He 和 Hs 均通过可学习注意力时间池化聚合全序列，不再只取最后一步。
+        # 风向掩码（仅 SDWPF 非 None）
+        if wind_mask is not None:
+            self.register_buffer("wind_mask", wind_mask)
+        else:
+            self.wind_mask = None
 
-    注意力池化：
-        score_t = w^T * tanh(W * H_t)      (标量分数，逐节点)
-        weight  = softmax(score, dim=T)
-        He      = sum_t(weight_t * env_proj(H_t))
+    def rank_loss(self) -> torch.Tensor:
+        """代理 LowRankGCN 的秩正则，由 GridCFN.rank_loss() 调用。"""
+        return self.gcn_e.rank_loss()
 
-    这样网络可以根据任务自适应地关注不同时间步，
-    而不是强制使用最近的时间步作为唯一代理。
-
-    He_seq 保留用于 MultiScaleContext（全序列多尺度卷积不受影响）。
-    """
-
-    def __init__(self, in_dim: int, env_dim: int, stoch_dim: int):
-        super().__init__()
-        # 环境表征投影
-        self.env_proj = nn.Sequential(
-            nn.Linear(in_dim, in_dim), nn.ReLU(),
-            nn.Linear(in_dim, env_dim), nn.Tanh()
-        )
-        # 随机表征投影
-        self.stoch_proj = nn.Sequential(
-            nn.Linear(in_dim, in_dim), nn.ReLU(),
-            nn.Linear(in_dim, stoch_dim), nn.Tanh()
-        )
-        # 时间注意力评分（用于 He 的池化）
-        self.attn_env = nn.Sequential(
-            nn.Linear(env_dim, env_dim // 2), nn.Tanh(),
-            nn.Linear(env_dim // 2, 1)        # → [B, T, N, 1]
-        )
-        # 时间注意力评分（用于 Hs 的池化）
-        self.attn_stoch = nn.Sequential(
-            nn.Linear(stoch_dim, stoch_dim // 2), nn.Tanh(),
-            nn.Linear(stoch_dim // 2, 1)
-        )
-
-    def forward(self, H):
+    def forward(self, x: torch.Tensor):
         """
-        H : [B, T, N, D]
+        x: [B, T_in, N, F]
         返回:
-          He     : [B, N, env_dim]    注意力加权的环境表征
-          Hs     : [B, N, stoch_dim]  注意力加权的随机表征
-          He_seq : [B, T, N, env_dim] 全序列环境表征（供 MultiScaleContext 使用）
-
-        stop-gradient：两个投影头各自接收 H.detach()，使 backbone 的梯度
-        不再被两个分支同时拉扯，迫使 backbone 学习对两者都有用的中性表征，
-        解耦压力落在投影头而非 backbone。
+          He_seq        : [B, T, N, env_dim]
+          He            : [B, N, env_dim]
+          Hs            : [B, N, stoch_dim]
+          X_low_pooled  : [B, N, env_dim]
+          X_high_pooled : [B, N, stoch_dim]
         """
-        B, T, N, D = H.shape
-        H_flat = H.reshape(B * T * N, D)
-        H_sg   = H.detach()                                  # stop-gradient
-        H_sg_flat = H_sg.reshape(B * T * N, D)
+        B, T, N, Fin = x.shape
 
-        # ── 环境分支（stop-gradient 输入）────────────────────────────────
-        He_seq = self.env_proj(H_sg_flat).reshape(B, T, N, -1)
-        env_score  = self.attn_env(He_seq)                   # [B, T, N, 1]
-        env_weight = F.softmax(env_score, dim=1)
-        He = (env_weight * He_seq).sum(dim=1)                # [B, N, env_dim]
+        # ── 频率分流 ──────────────────────────────────────────────────────
+        X_low, X_high = self.decomposer(x)       # [B,T,N,Fin] × 2，已 LayerNorm
 
-        # ── 随机分支（stop-gradient 输入）────────────────────────────────
-        Hs_seq = self.stoch_proj(H_sg_flat).reshape(B, T, N, -1)
-        stoch_score  = self.attn_stoch(Hs_seq)               # [B, T, N, 1]
-        stoch_weight = F.softmax(stoch_score, dim=1)
-        Hs = (stoch_weight * Hs_seq).sum(dim=1)              # [B, N, stoch_dim]
+        # ── CLUB 用的参考表征：时间均值池化 + 线性投影 ────────────────────
+        X_low_pooled  = self.proj_low(X_low.mean(dim=1))    # [B, N, env_dim]
+        X_high_pooled = self.proj_high(X_high.mean(dim=1))  # [B, N, stoch_dim]
 
-        # He_seq 供 MultiScaleContext 使用，保留梯度（从 H_flat 重新投影）
-        He_seq_grad = self.env_proj(H_flat).reshape(B, T, N, -1)
+        # ── 环境支路：LowRankGCN → TCN_e → proj_tcn_e → He_seq / He ──────
+        e_gcn = self.gcn_e(
+            X_low.reshape(B * T, N, Fin), wind_mask=None
+        ).reshape(B, T, N, -1)                              # [B,T,N,env_dim]
+        # TCN 输出是 tcn_hidden，proj_tcn_e 投影回 env_dim
+        He_seq_raw = self.tcn_e(e_gcn.permute(0, 2, 1, 3)  # [B,N,T,env_dim]
+                                ).permute(0, 2, 1, 3)       # [B,T,N,tcn_hidden]
+        He_seq = self.proj_tcn_e(He_seq_raw)                # [B,T,N,env_dim]
+        He = self.pool_e(He_seq)                            # [B,N,env_dim]
 
-        return He, Hs, He_seq_grad
+        # ── 因果支路：SparseGCN → TCN_s → proj_tcn_s → Hs ──────────────
+        s_gcn = self.gcn_s(
+            X_high.reshape(B * T, N, Fin), wind_mask=self.wind_mask
+        ).reshape(B, T, N, -1)                              # [B,T,N,stoch_dim]
+        Hs_seq_raw = self.tcn_s(s_gcn.permute(0, 2, 1, 3)
+                                ).permute(0, 2, 1, 3)       # [B,T,N,tcn_hidden]
+        Hs_seq = self.proj_tcn_s(Hs_seq_raw)                # [B,T,N,stoch_dim]
+        Hs = self.pool_s(Hs_seq)                            # [B,N,stoch_dim]
+
+        return He_seq, He, Hs, X_low_pooled, X_high_pooled
 
 
 # ---------------------------------------------------------------------------
-# 5. CLUB Mutual Information Estimator（不变）
+# 7. CLUBEstimator（保留，接口不变，实例化两个）
 # ---------------------------------------------------------------------------
 
 class CLUBEstimator(nn.Module):
-    """CLUB 互信息上界估计器（Cheng et al., 2020）。"""
+    """
+    CLUB 互信息上界估计器（Cheng et al., 2020）。
+    接口不变，由 GridCFN 实例化两个：
+      club_e: MI(He, X_low_pooled)   — env 表征不应含高频残差
+      club_s: MI(Hs, X_high_pooled)  — stoch 表征不应含低频趋势
+    输入维度分别为 (env_dim, env_dim) 和 (stoch_dim, stoch_dim)。
+    """
 
-    def __init__(self, env_dim, stoch_dim, hidden_dim=64):
+    def __init__(self, x_dim: int, y_dim: int, hidden_dim: int = 64):
         super().__init__()
         self.var_net_mu = nn.Sequential(
-            nn.Linear(env_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(x_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, stoch_dim),
+            nn.Linear(hidden_dim, y_dim),
         )
-        # 末尾加 Tanh 将原始输出压到 (-1, 1)，配合 _log_prob 内的 clamp(-6, 4)，
-        # 避免训练初期 log_var 跑到极端值导致数值不稳定。
         self.var_net_logvar = nn.Sequential(
-            nn.Linear(env_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(x_dim, hidden_dim), nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, stoch_dim),
+            nn.Linear(hidden_dim, y_dim),
             nn.Tanh(),
         )
 
-    def _get_params(self, He_flat):
-        return self.var_net_mu(He_flat), self.var_net_logvar(He_flat)
+    def _get_params(self, x_flat):
+        return self.var_net_mu(x_flat), self.var_net_logvar(x_flat)
 
-    def _log_prob(self, Hs, mu_q, logvar_raw):
-        # 直接将网络输出视为 log σ²，用 clamp 限制范围。
-        # 原来的 log(softplus(x)+1e-2) 是双重非线性：softplus 已保证正数，
-        # 再取 log 得到 log(log(1+e^x)+1e-2)，语义不对且梯度路径混乱。
+    def _log_prob(self, y, mu_q, logvar_raw):
         log_var  = logvar_raw.clamp(-6.0, 4.0)
         log_prob = -0.5 * (
             math.log(2 * math.pi) + log_var
-            + (Hs - mu_q).pow(2) / log_var.exp()
+            + (y - mu_q).pow(2) / log_var.exp()
         )
         return log_prob.mean(dim=-1)
 
@@ -291,26 +458,30 @@ class CLUBEstimator(nn.Module):
             perm[idx], perm[swap] = perm[swap].clone(), perm[idx].clone()
         return perm
 
-    def forward(self, He, Hs):
-        M                = He.shape[0] * He.shape[1]
-        He_flat          = He.reshape(M, -1)
-        Hs_flat          = Hs.reshape(M, -1)
-        mu_q, logvar_raw = self._get_params(He_flat)
-        pos = self._log_prob(Hs_flat, mu_q, logvar_raw).mean()
-        neg = self._log_prob(Hs_flat[self._neg_perm(M, He.device)],
-                             mu_q, logvar_raw).mean()
+    def forward(self, x, y):
+        """
+        x: [B, N, x_dim]，y: [B, N, y_dim]
+        返回 CLUB 互信息上界估计（标量）。
+        """
+        M            = x.shape[0] * x.shape[1]
+        x_flat       = x.reshape(M, -1)
+        y_flat       = y.reshape(M, -1)
+        mu_q, lv_raw = self._get_params(x_flat)
+        pos = self._log_prob(y_flat, mu_q, lv_raw).mean()
+        neg = self._log_prob(y_flat[self._neg_perm(M, x.device)],
+                             mu_q, lv_raw).mean()
         return pos - neg
 
-    def variational_loss(self, He, Hs):
-        M                = He.shape[0] * He.shape[1]
-        He_flat          = He.reshape(M, -1)
-        Hs_flat          = Hs.reshape(M, -1)
-        mu_q, logvar_raw = self._get_params(He_flat)
-        return -self._log_prob(Hs_flat, mu_q, logvar_raw).mean()
+    def variational_loss(self, x, y):
+        M            = x.shape[0] * x.shape[1]
+        x_flat       = x.reshape(M, -1)
+        y_flat       = y.reshape(M, -1)
+        mu_q, lv_raw = self._get_params(x_flat)
+        return -self._log_prob(y_flat, mu_q, lv_raw).mean()
 
 
 # ---------------------------------------------------------------------------
-# 6. Multi-Scale Context（不变）
+# 8. MultiScaleContext（保留，不变）
 # ---------------------------------------------------------------------------
 
 class MultiScaleContext(nn.Module):
@@ -318,11 +489,10 @@ class MultiScaleContext(nn.Module):
 
     def __init__(self, env_dim, ms_out_dim, dilations=(1, 7, 30), T_in: int = None):
         super().__init__()
-        # 感受野 = (kernel_size-1)*dilation = 2*dilation，需满足 2*d < T_in
         if T_in is not None:
             valid = [d for d in dilations if 2 * d < T_in]
             if not valid:
-                valid = [1]   # 至少保留 dilation=1
+                valid = [1]
             dilations = valid
         self.dilations = list(dilations)
         self.convs = nn.ModuleList([
@@ -340,7 +510,7 @@ class MultiScaleContext(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 7. SCG Message Passing（不变）
+# 9. SCG Message Passing（保留，不变）
 # ---------------------------------------------------------------------------
 
 class CausalGateUnit(nn.Module):
@@ -356,8 +526,6 @@ class CausalGateUnit(nn.Module):
 
 
 class SCGMessagePassingLayer(nn.Module):
-    """门控图消息传递层，分块处理避免 OOM。"""
-
     def __init__(self, stoch_dim, env_dim, hidden_dim=64, chunk_size: int = 8192):
         super().__init__()
         self.gate       = CausalGateUnit(stoch_dim, env_dim, hidden_dim)
@@ -399,19 +567,13 @@ class SCGMP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 8. CFM Vector Field（双流 AdaLN + 时序位置编码）
+# 10. CFM Vector Field（保留，不变）
 # ---------------------------------------------------------------------------
 
 class CFMVectorField(nn.Module):
     """
     条件向量场 v_θ(x_t, t | He_prime, Hs_prime)。
-
-    改进：输入 x_t 在进入 input_proj 之前，加上可学习时序位置编码。
-    x_t 形状为 [B, N, T_out * feat_dim]，先 reshape 为 [B, N, T_out, feat_dim]，
-    对 T_out 维度加位置编码，再 reshape 回来。这让网络知道每个预测步的相对位置，
-    而不是把所有步完全对称地展平处理。
-
-    双流 AdaLN：He_prime 控制 shift，Hs_prime 控制 scale。
+    双流 AdaLN + 时序位置编码，接口和实现完全不变。
     """
 
     def __init__(self, out_dim: int, env_dim: int, stoch_dim: int,
@@ -431,7 +593,6 @@ class CFMVectorField(nn.Module):
         ) * math.pi
         self.register_buffer("freqs", freqs)
 
-        # 可学习时序位置编码：[T_out, feat_dim]，加到 x_t 的各预测步上
         self.temporal_pe = nn.Parameter(torch.zeros(T_out, feat_dim))
         nn.init.trunc_normal_(self.temporal_pe, std=0.02)
 
@@ -440,23 +601,19 @@ class CFMVectorField(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim * 6),
         )
-
         self.env_proj = nn.Sequential(
             nn.LayerNorm(env_dim),
             nn.Linear(env_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim * 3),
         )
-
         self.stoch_proj = nn.Sequential(
             nn.LayerNorm(stoch_dim),
             nn.Linear(stoch_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim * 3),
         )
-
         self.input_proj = nn.Linear(out_dim, hidden_dim)
-
         self.layer1 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
         self.layer2 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
         self.layer3 = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
@@ -471,62 +628,44 @@ class CFMVectorField(nn.Module):
         return emb.unsqueeze(1).expand(B, N, -1)
 
     def _add_temporal_pe(self, x_t: torch.Tensor) -> torch.Tensor:
-        """
-        x_t : [B, N, T_out * feat_dim]
-        时序位置编码 temporal_pe : [T_out, feat_dim]
-        广播加到各步，返回同形状 tensor。
-        """
         B, N, _ = x_t.shape
-        # reshape → 加 pe → reshape 回
         x_3d = x_t.reshape(B, N, self.T_out, self.feat_dim)
-        x_3d = x_3d + self.temporal_pe.unsqueeze(0).unsqueeze(0)  # 广播 [B,N,T_out,feat_dim]
+        x_3d = x_3d + self.temporal_pe.unsqueeze(0).unsqueeze(0)
         return x_3d.reshape(B, N, self.out_dim)
 
     def forward(self, x_t, t, He_prime, Hs_prime):
-        """
-        x_t      : [B, N, out_dim]   out_dim = T_out * feat_dim
-        t        : [B]
-        He_prime : [B, N, env_dim]
-        Hs_prime : [B, N, stoch_dim]
-        """
         B, N, _ = x_t.shape
-
-        # 加时序位置编码
-        x_t = self._add_temporal_pe(x_t)
-
+        x_t   = self._add_temporal_pe(x_t)
         t_emb = self._time_embed(t, B, N)
         t_s1, t_b1, t_s2, t_b2, t_s3, t_b3 = \
             self.time_proj(t_emb).chunk(6, dim=-1)
-
         b1_env, b2_env, b3_env = self.env_proj(He_prime).chunk(3, dim=-1)
         s1_st,  s2_st,  s3_st  = self.stoch_proj(Hs_prime).chunk(3, dim=-1)
 
         h = self.input_proj(x_t)
-
         h_norm = F.layer_norm(h, [h.shape[-1]])
         h = h + self.layer1(h_norm * (1.0 + t_s1 + s1_st) + (t_b1 + b1_env))
-
         h_norm = F.layer_norm(h, [h.shape[-1]])
         h = h + self.layer2(h_norm * (1.0 + t_s2 + s2_st) + (t_b2 + b2_env))
-
         h_norm = F.layer_norm(h, [h.shape[-1]])
         h = h + self.layer3(h_norm * (1.0 + t_s3 + s3_st) + (t_b3 + b3_env))
-
         return self.out_proj(h)
 
 
 # ---------------------------------------------------------------------------
-# 9. GridCFN（多步版，集成全部改进）
+# 11. GridCFN（DMSD 版，集成所有改进）
 # ---------------------------------------------------------------------------
 
 class GridCFN(nn.Module):
     """
-    多步预测版 GridCFN。
+    GridCFN-DMSD 多步预测版。
 
-    参数变化（相比原版）：
-      n_nodes  : 节点数，AdaptiveGCN 需要（从 load_data 的 adj.shape[0] 传入）
-      adap_dim : 自适应邻接矩阵的节点嵌入维度（默认 16）
-      T_out    : 预测步长
+    新增参数（相比原版）：
+      rank_r           : 低秩 GCN 的秩（默认 8）
+      lambda_rank      : 秩正则权重（默认 0.01）
+      lambda_club      : CLUB 一致性惩罚权重（默认 0.05，替代原 lambda_mi）
+      freq_candidates  : 频率分流候选窗口（tuple，数据集相关）
+      wind_mask        : SDWPF 风向先验掩码 [N,N]，其他数据集传 None
     """
 
     def __init__(
@@ -534,38 +673,65 @@ class GridCFN(nn.Module):
         n_nodes: int,
         in_dim=1, gcn_hidden=64, tcn_hidden=64,
         env_dim=32, stoch_dim=32, ms_out_dim=32,
-        n_scg_layers=3, out_dim=1, lambda_mi=0.5,
+        n_scg_layers=3, out_dim=1,
+        # 新参数
+        lambda_mi=0.5,      # 保留字段名兼容 config，实际语义变为 lambda_club
+        lambda_rank=0.01,
+        rank_r=8,
+        freq_candidates=(12, 24, 48, 96),
+        wind_mask=None,
+        # 以下与原版相同
         gcn_layers=2, tcn_layers=4,
         cfm_hidden=128, cfm_time_emb_dim=16,
         chunk_size=8192,
         ms_dilations=(1, 7, 30),
         T_out=1,
-        T_in=None,                  # ← 新增：传给 MultiScaleContext 做 dilation 裁剪
-        adap_dim=16,
+        T_in=None,
+        adap_dim=16,        # 保留参数名兼容 main.py，DMSD 中不使用
     ):
         super().__init__()
-        self.lambda_mi = lambda_mi
-        self.feat_dim  = out_dim
-        self.T_out     = T_out
-        self.cfm_dim   = T_out * out_dim
-        self.env_dim   = env_dim
-        self.stoch_dim = stoch_dim
+        self.lambda_club = lambda_mi   # config 里的 lambda_mi 在此充当 lambda_club
+        self.lambda_rank = lambda_rank
+        self.feat_dim    = out_dim
+        self.T_out       = T_out
+        self.cfm_dim     = T_out * out_dim
+        self.env_dim     = env_dim
+        self.stoch_dim   = stoch_dim
 
-        self.backbone     = Backbone(n_nodes, in_dim, gcn_hidden, tcn_hidden,
-                                     gcn_layers, tcn_layers, adap_dim)
-        self.disentangler = CausalDisentangler(tcn_hidden, env_dim, stoch_dim)
-        self.club         = CLUBEstimator(env_dim, stoch_dim)
-        self.ms_context   = MultiScaleContext(env_dim, ms_out_dim, dilations=ms_dilations,
-                                              T_in=T_in)
-        self.scgmp        = SCGMP(stoch_dim, env_dim, n_scg_layers, chunk_size=chunk_size)
+        # ── 双轨 Backbone（替换原 Backbone + CausalDisentangler）──────────
+        self.backbone = DualTrackBackbone(
+            n_nodes         = n_nodes,
+            in_dim          = in_dim,
+            env_dim         = env_dim,
+            stoch_dim       = stoch_dim,
+            gcn_hidden      = gcn_hidden,
+            tcn_hidden      = tcn_hidden,
+            gcn_layers      = gcn_layers,
+            tcn_layers      = tcn_layers,
+            rank_r          = rank_r,
+            freq_candidates = freq_candidates,
+            wind_mask       = wind_mask,
+        )
+
+        # ── CLUB：两个独立实例 ──────────────────────────────────────────
+        # club_e: MI(He, X_low_pooled)   — x_dim=env_dim,   y_dim=env_dim
+        # club_s: MI(Hs, X_high_pooled)  — x_dim=stoch_dim, y_dim=stoch_dim
+        self.club_e = CLUBEstimator(env_dim,   env_dim)
+        self.club_s = CLUBEstimator(stoch_dim, stoch_dim)
+
+        # ── 下游模块（接口完全不变）────────────────────────────────────
+        self.ms_context = MultiScaleContext(env_dim, ms_out_dim,
+                                            dilations=ms_dilations, T_in=T_in)
+        self.scgmp      = SCGMP(stoch_dim, env_dim, n_scg_layers,
+                                chunk_size=chunk_size)
         self.vector_field = CFMVectorField(
-            out_dim=self.cfm_dim,
-            env_dim=ms_out_dim,
-            stoch_dim=stoch_dim,
-            hidden_dim=cfm_hidden,
-            time_emb_dim=cfm_time_emb_dim,
-            T_out=T_out,
-            feat_dim=out_dim,
+            out_dim       = self.cfm_dim,
+            env_dim       = ms_out_dim,
+            stoch_dim     = stoch_dim,
+            hidden_dim    = cfm_hidden,
+            time_emb_dim  = cfm_time_emb_dim,
+            T_out         = T_out,
+            feat_dim      = out_dim,
         )
 
     # ------------------------------------------------------------------
@@ -586,59 +752,61 @@ class GridCFN(nn.Module):
         return adj.nonzero(as_tuple=False).t().contiguous()
 
     # ------------------------------------------------------------------
+    # 秩正则（代理 DualTrackBackbone.rank_loss）
+    # ------------------------------------------------------------------
+
+    def rank_loss(self) -> torch.Tensor:
+        return self.backbone.rank_loss()
+
+    # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
     def forward(self, x, adj_norm, edge_index):
         """
-        x : [B, T_in, N, F]
-        返回: He_prime, Hs_prime, He, Hs, mi_loss
+        x         : [B, T_in, N, F]
+        adj_norm  : [N, N]  — 传入保持接口兼容，DMSD 内部不再使用固定图（双轨 GCN 自学习邻接）
+        edge_index: [2, E]  — SCGMP 使用
+
+        返回:
+          He_prime      : [B, N, ms_out_dim]
+          Hs_prime      : [B, N, stoch_dim]
+          He            : [B, N, env_dim]
+          Hs            : [B, N, stoch_dim]
+          X_low_pooled  : [B, N, env_dim]
+          X_high_pooled : [B, N, stoch_dim]
         """
-        H              = self.backbone(x, adj_norm)
-        He, Hs, He_seq = self.disentangler(H)
-        mi_loss        = self.club(He, Hs)
-        He_prime       = self.ms_context(He_seq)
-        Hs_prime       = self.scgmp(Hs, He, edge_index)
-        return He_prime, Hs_prime, He, Hs, mi_loss
+        He_seq, He, Hs, X_low_pooled, X_high_pooled = self.backbone(x)
+        He_prime = self.ms_context(He_seq)
+        Hs_prime = self.scgmp(Hs, He, edge_index)
+        return He_prime, Hs_prime, He, Hs, X_low_pooled, X_high_pooled
 
     # ------------------------------------------------------------------
-    # CFM 训练损失（分层 t 采样）
+    # CFM 训练损失（不变）
     # ------------------------------------------------------------------
 
     def cfm_loss(self, He_prime: torch.Tensor, Hs_prime: torch.Tensor,
                  y_target: torch.Tensor,
                  n_t_samples: int = 4,
                  sigma_min: float = 0.01) -> torch.Tensor:
-        """
-        OT-CFM 训练损失。
-
-        改进：t 使用分层随机采样（stratified sampling），把 [0,1] 均分为
-        n_t_samples 个区间，每个区间内随机取一个点。相比纯随机采样，
-        t 的覆盖更均匀，训练初期收敛更快，避免 t 集中在某个区域。
-
-        y_target : [B, N, T_out * feat_dim]
-        """
         assert y_target.shape[-1] == self.cfm_dim, (
             f"y_target.shape[-1]={y_target.shape[-1]} != cfm_dim={self.cfm_dim}"
         )
         B, N, _ = y_target.shape
         device  = y_target.device
         losses  = []
-
         for k in range(n_t_samples):
-            x0 = torch.randn_like(y_target)
-            # 分层采样：第 k 个区间 [k/n, (k+1)/n) 内均匀采样
-            t = (k + torch.rand(B, device=device)) / n_t_samples   # ← 改进
+            x0    = torch.randn_like(y_target)
+            t     = (k + torch.rand(B, device=device)) / n_t_samples
             t_bc  = t.reshape(B, 1, 1)
             x_t   = (1.0 - (1.0 - sigma_min) * t_bc) * x0 + t_bc * y_target
             u_t   = y_target - (1.0 - sigma_min) * x0
             v_pred = self.vector_field(x_t, t, He_prime, Hs_prime)
             losses.append(F.mse_loss(v_pred, u_t))
-
         return torch.stack(losses).mean()
 
     # ------------------------------------------------------------------
-    # CFM 采样（Heun 二阶 ODE 求解器）
+    # CFM 采样（Heun 二阶 ODE，不变）
     # ------------------------------------------------------------------
 
     @torch.no_grad()
@@ -647,42 +815,25 @@ class GridCFN(nn.Module):
                n_steps: int = 20,
                sigma_min: float = 0.01,
                x0_scale: float = 1.0) -> torch.Tensor:
-        """
-        Heun 二阶 ODE 求解器（比 Euler 精度高，相同步数下轨迹误差更小）。
-
-        Heun 方法（预测-校正）：
-            v1    = f(x_t,   t)
-            x_hat = x_t + dt * v1          （Euler 预测步）
-            v2    = f(x_hat, t + dt)        （在预测点再算一次向量场）
-            x_t+1 = x_t + dt * (v1 + v2) / 2  （梯形校正）
-
-        每步比 Euler 多一次 vector_field forward，但可以用更少的步数
-        达到同等质量，实际推理时间相近。
-
-        返回 : [n_samples, B, N, T_out, feat_dim]
-        """
         B, N, _ = He_prime.shape
         S       = n_samples
         device  = He_prime.device
         dt      = 1.0 / n_steps
 
-        he = He_prime.detach().repeat_interleave(S, dim=0)   # [B*S, N, ms_out_dim]
-        hs = Hs_prime.detach().repeat_interleave(S, dim=0)   # [B*S, N, stoch_dim]
+        he = He_prime.detach().repeat_interleave(S, dim=0)
+        hs = Hs_prime.detach().repeat_interleave(S, dim=0)
         x  = torch.randn(B * S, N, self.cfm_dim, device=device) * x0_scale
 
         for step in range(n_steps):
             t_val  = step * dt
             t_next = t_val + dt
-
             t_vec      = torch.full((B * S,), t_val,  device=device, dtype=torch.float32)
             t_next_vec = torch.full((B * S,), t_next, device=device, dtype=torch.float32)
-
             v1    = self.vector_field(x, t_vec, he, hs)
             x_hat = x + dt * v1
             v2    = self.vector_field(x_hat, t_next_vec, he, hs)
             x     = x + dt * 0.5 * (v1 + v2)
 
-        # [B*S, N, T_out*feat_dim] → [S, B, N, T_out, feat_dim]
         x = x.reshape(B, S, N, self.T_out, self.feat_dim)
         x = x.permute(1, 0, 2, 3, 4).contiguous()
         return x
