@@ -70,24 +70,24 @@ class FrequencyDecomposer(nn.Module):
         """
         x: [B*N, T, F]，对时间维做 kernel=k 的均值池化（反射填充）。
         返回同形状。
+
+        修复说明：之前 pad_l/pad_r 被截断后，k_eff = pad_l + pad_r + 1 不再等于
+        原始 k，导致移动平均窗口缩水（极端情况下退化为 k_eff=1，频率分流失效）。
+        正确做法：先用截断后的 pad 做填充，然后始终用原始 k 做 avg_pool1d，
+        输出长度 = padded_T - k + 1，最后裁剪/复制对齐到 T_len。
         """
         if k <= 1:
             return x
-        # 需要 padding = k-1，左右各 (k-1)//2，奇数 kernel 时左边多一格
-        pad_l = (k - 1) // 2
-        pad_r = k - 1 - pad_l
-        # reflect 模式要求 padding < input_size，做保护性截断
         T_len = x.shape[1]   # x: [B*N, T, F]
-        pad_l = min(pad_l, T_len - 1)
-        pad_r = min(pad_r, T_len - 1)
-        # F.pad 作用在最后一维；把 T 移到最后
+        # 反射填充要求 padding < input_size，保护性截断
+        pad_l = min((k - 1) // 2,       T_len - 1)
+        pad_r = min(k - 1 - (k - 1) // 2, T_len - 1)
         x_t = x.permute(0, 2, 1)           # [B*N, F, T]
         x_t = F.pad(x_t, (pad_l, pad_r), mode="reflect")
-        # kernel 跟随实际 padding 大小，保证输出长度 == 输入 T
-        k_eff = pad_l + pad_r + 1
-        k_eff = min(k_eff, x_t.shape[-1])
-        x_t = F.avg_pool1d(x_t, kernel_size=k_eff, stride=1, padding=0)
-        # 输出长度 = padded_T - k_eff + 1，可能不等于原 T，裁剪对齐
+        # 始终使用原始 k 而非截断后的 k_eff，保证每个候选窗口语义不同
+        k_actual = min(k, x_t.shape[-1])
+        x_t = F.avg_pool1d(x_t, kernel_size=k_actual, stride=1, padding=0)
+        # 输出长度 = padded_T - k_actual + 1，对齐到原始 T_len
         if x_t.shape[-1] > T_len:
             x_t = x_t[:, :, :T_len]
         elif x_t.shape[-1] < T_len:
@@ -157,12 +157,16 @@ class LowRankGCN(nn.Module):
         """秩正则：鼓励 U 的列向量线性独立，防止低秩退化为秩-1。"""
         G   = self.U.T @ self.U                           # [r, r]
         eps = 1e-4 * torch.eye(self.rank_r, device=self.U.device)
-        # log det(G + εI)，det 通过 Cholesky 计算更稳定
+        # log det(G + εI)，优先用 Cholesky（数值更稳定）
         try:
-            L   = torch.linalg.cholesky(G + eps)
+            L      = torch.linalg.cholesky(G + eps)
             logdet = 2.0 * L.diagonal().log().sum()
         except Exception:
             logdet = torch.logdet(G + eps)
+        # 防止数值异常（nan/inf）静默传播到总 loss 导致训练崩溃；
+        # 返回 0 相当于本 step 跳过秩正则，比 nan 蔓延代价小。
+        if not torch.isfinite(logdet):
+            return G.new_tensor(0.0)
         return -logdet
 
     def forward(self, x: torch.Tensor, wind_mask=None) -> torch.Tensor:
@@ -455,7 +459,12 @@ class CLUBEstimator(nn.Module):
         if same.any() and M > 1:
             idx  = same.nonzero(as_tuple=True)[0]
             swap = (idx + 1) % M
-            perm[idx], perm[swap] = perm[swap].clone(), perm[idx].clone()
+            # 使用临时变量避免批量赋值时的读写竞争：
+            # 当 idx/swap 为多元素 tensor 时，perm[idx], perm[swap] = perm[swap], perm[idx]
+            # 的右侧求值顺序未定义，可能导致部分元素被覆盖后再读。
+            tmp          = perm[swap].clone()
+            perm[swap]   = perm[idx].clone()
+            perm[idx]    = tmp
         return perm
 
     def forward(self, x, y):
@@ -490,7 +499,10 @@ class MultiScaleContext(nn.Module):
     def __init__(self, env_dim, ms_out_dim, dilations=(1, 7, 30), T_in: int = None):
         super().__init__()
         if T_in is not None:
-            valid = [d for d in dilations if 2 * d < T_in]
+            # 感受野 = (kernel_size-1)*dilation = 2*dilation（kernel=3）
+            # 条件改为 <= T_in，避免感受野恰好等于 T_in 时被误过滤
+            # 原条件 2*d < T_in 会错误丢弃 Solar/SDWPF 的 dilation=84（2*84=168=T_in）
+            valid = [d for d in dilations if 2 * d <= T_in]
             if not valid:
                 valid = [1]
             dilations = valid

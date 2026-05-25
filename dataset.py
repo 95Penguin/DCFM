@@ -15,6 +15,7 @@ GridCFN – 数据集工具
 """
 
 import os
+import platform
 import numpy as np
 import pandas as pd
 import torch
@@ -181,7 +182,12 @@ def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,
 
     elif raw.ndim == 3:
         T0, D1, D2 = raw.shape
-        if D2 > D1 and D2 > T0 and T0 < 5000:
+        # 格式 B (N, F, T)：第0维是站点数（通常 < 5000），第2维是时间步（远大于站点数）。
+        # 判据：T0 < D2（时间步比站点数大得多）且 T0 < D1（站点数 > 特征数不成立时也安全）。
+        # 相比原来硬编码 T0<5000，改为 T0 < D2 且 D2 > D1 的相对判据，
+        # 避免在格式A且站点数恰好<5000时误判。
+        is_format_b = (D2 > T0) and (D2 > D1) and (T0 <= D1)
+        if is_format_b:
             raw = raw.transpose(2, 0, 1)
             print(f"  [Weather2k] 检测到格式 B (N,F,T)，已转置为 (T,N,F): {raw.shape}")
         else:
@@ -407,21 +413,25 @@ def _build_loaders(raw: np.ndarray,
 
     # num_workers 根据节点数自适应：Weather(1866节点) 等超大图用 0 避免 /dev/shm OOM，
     # 其余数据集用多进程加速（4/2）。batch_size<=4 说明节点极多，保守用 0。
-    nw_train = 0 if (batch_size <= 4 or N > 500) else 4
-    nw_eval  = 0 if (batch_size <= 4 or N > 500) else 2
-    pin      = (nw_train > 0)   # pin_memory 仅在多进程模式下开启，避免 shm 问题
+    # Windows 下 DataLoader 多进程需要 if __name__=='__main__' 保护，直接禁用以避免死锁。
+    is_windows = platform.system() == 'Windows'
+    nw_train = 0 if (is_windows or batch_size <= 4 or N > 500) else 4
+    nw_eval  = 0 if (is_windows or batch_size <= 4 or N > 500) else 2
+    # pin_memory 只在对应 loader 使用多进程时开启，避免 shm 问题
+    pin_train = (nw_train > 0)
+    pin_eval  = (nw_eval  > 0)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size,
                               shuffle=True,  num_workers=nw_train,
-                              pin_memory=pin,
+                              pin_memory=pin_train,
                               persistent_workers=(nw_train > 0))
     val_loader   = DataLoader(val_ds,   batch_size=batch_size,
                               shuffle=False, num_workers=nw_eval,
-                              pin_memory=pin,
+                              pin_memory=pin_eval,
                               persistent_workers=(nw_eval > 0))
     test_loader  = DataLoader(test_ds,  batch_size=batch_size,
                               shuffle=False, num_workers=nw_eval,
-                              pin_memory=pin,
+                              pin_memory=pin_eval,
                               persistent_workers=(nw_eval > 0))
 
     adj_tensor = torch.tensor(adj, dtype=torch.float32)

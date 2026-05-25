@@ -205,7 +205,8 @@ def train_one_epoch(
                     max_norm=1.0,
                 )
                 club_optimizer.step()
-                var_loss_val = var_loss.item()
+                var_loss_val += var_loss.item()
+            var_loss_val /= club_inner_steps   # 记录内循环平均值，而非最后一步
         else:
             var_loss_val = 0.0
 
@@ -300,6 +301,7 @@ def evaluate(model: GridCFN, loader: DataLoader,
         ).cpu().numpy()
 
         samples_list.append(raw_samples)
+        # y 不参与 GPU 计算，直接在 CPU 上 permute
         y_np = y.permute(0, 2, 1, 3).numpy()
         y_list.append(y_np)
 
