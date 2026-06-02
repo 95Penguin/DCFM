@@ -32,7 +32,7 @@ class ModelConfig:
     ms_dilations:     tuple = (1, 7, 30)
     # ── DMSD 新增参数 ──────────────────────────────────────────────────
     rank_r:           int   = 8           # 低秩 GCN 的秩，建议：Solar/SDWPF=6，Electricity=12
-    lambda_rank:      float = 0.01        # 秩正则权重
+    lambda_rank:      float = 0.1         # 秩正则权重（rank_loss 已/rank_r 归一化，此值等效原 0.01×rank_r）
     freq_candidates:  tuple = (12, 24, 48, 96)  # 频率分流候选窗口（10min 粒度数据集）
 
 
@@ -107,12 +107,12 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.05,           # lambda_club
+                lambda_mi=0.01,            # lambda_club， 0.1->0.01
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 24, 84),
                 rank_r=6,                 # Solar 137节点，秩=6
-                lambda_rank=0.01,
+                lambda_rank=0.01,          # rank_loss 已/rank_r 归一化，此处补偿 × rank_r 约等效原 0.01。0.1->0.01
                 freq_candidates=(12, 24, 48, 96),   # 10min 粒度
             ),
             train=TrainConfig(
@@ -141,12 +141,12 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.05,           # lambda_club
+                lambda_mi=0.01,           # lambda_club
                 cfm_hidden=384, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 12, 84),
                 rank_r=12,                # Electricity 321节点，秩=12
-                lambda_rank=0.01,
+                lambda_rank=0.01,          # rank_loss 已/rank_r 归一化
                 freq_candidates=(6, 12, 24, 48),    # 1h 粒度
             ),
             train=TrainConfig(
@@ -205,12 +205,12 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.05,           # lambda_club
+                lambda_mi=0.01,           # lambda_club
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 24, 84),
                 rank_r=6,                 # SDWPF 134节点，秩=6
-                lambda_rank=0.01,
+                lambda_rank=0.01,          # rank_loss 已/rank_r 归一化
                 freq_candidates=(12, 24, 48, 96),   # 10min 粒度
             ),
             train=TrainConfig(
