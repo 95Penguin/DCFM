@@ -442,14 +442,319 @@
 
 
 
-"""
-GridCFN – 数据集工具
+# """
+# GridCFN – 数据集工具
 
-支持四个数据集：
-  - Solar-Energy  (137 PV plants, 10-min, 2007)
-  - Electricity   (UCI, 321 clients, 1-hour, 2012-2014)
-  - Weather2k     (1866 stations, 1-hour, 2017-2021)
-  - SDWPF         (134 wind turbines, 10-min, 2020-2021, KDD Cup 2022)
+# 支持四个数据集：
+#   - Solar-Energy  (137 PV plants, 10-min, 2007)
+#   - Electricity   (UCI, 321 clients, 1-hour, 2012-2014)
+#   - Weather2k     (1866 stations, 1-hour, 2017-2021)
+#   - SDWPF         (134 wind turbines, 10-min, 2020-2021, KDD Cup 2022)
+# """
+
+# import os
+# import platform
+# import numpy as np
+# import pandas as pd
+# import torch
+# from torch.utils.data import Dataset, DataLoader
+# from typing import Optional
+
+
+# # ---------------------------------------------------------------------------
+# # 邻接矩阵
+# # ---------------------------------------------------------------------------
+
+# def build_correlation_adj(data: np.ndarray, threshold: float = 0.7) -> np.ndarray:
+#     """
+#     基于皮尔逊相关系数构建二值邻接矩阵。
+#     """
+#     corr = np.corrcoef(data.T)
+#     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+#     adj  = (np.abs(corr) >= threshold).astype(np.float32)
+#     np.fill_diagonal(adj, 0)
+
+#     isolated = (adj.sum(axis=1) == 0)
+#     if isolated.any():
+#         print(f"  [adj] 检测到 {isolated.sum()} 个孤立节点，已补自环")
+#         adj[isolated, isolated] = 1.0
+
+#     return adj
+
+
+# # ---------------------------------------------------------------------------
+# # 滑动窗口数据集
+# # ---------------------------------------------------------------------------
+
+# class SlidingWindowDataset(Dataset):
+#     def __init__(self, data: np.ndarray, adj: np.ndarray,
+#                  T_in: int = 168, T_out: int = 1):
+#         super().__init__()
+#         self.data      = torch.tensor(data, dtype=torch.float32)
+#         self.adj       = torch.tensor(adj,  dtype=torch.float32)
+#         self.T_in      = T_in
+#         self.T_out     = T_out
+#         self.n_samples = len(data) - T_in - T_out + 1
+#         assert self.n_samples > 0, (
+#             f"数据长度 {len(data)} 不足以构造窗口 T_in={T_in} + T_out={T_out}"
+#         )
+
+#     def __len__(self):
+#         return self.n_samples
+
+#     def __getitem__(self, idx):
+#         x = self.data[idx : idx + self.T_in]
+#         y = self.data[idx + self.T_in : idx + self.T_in + self.T_out]
+#         return x, y   # shape: [T_in, N, F], [T_out, N, F]
+
+
+# # ---------------------------------------------------------------------------
+# # Z-score 归一化 (优化版)
+# # ---------------------------------------------------------------------------
+
+# class Scaler:
+#     """
+#     自适应 Z-score 归一化。
+#     通过 self.axis 参数自适应选择：
+#       - 全局归一化 (axis=(0, 1))：计算所有时间步和所有节点的均值/标准差。
+#       - 逐节点归一化 (axis=(0,))：独立计算每个节点的时间序列均值/标准差，适应高异质性场景。
+#     """
+#     def __init__(self, axis=(0, 1), log_transform: bool = False):
+#         self.axis = axis
+#         self.mean = None
+#         self.std  = None
+#         self.log_transform: bool = log_transform
+
+#     def fit(self, data: np.ndarray) -> "Scaler":
+#         # data: [T, N, F]
+#         self.mean = data.mean(axis=self.axis, keepdims=True)
+#         self.std  = data.std(axis=self.axis, keepdims=True) + 1e-8
+#         return self
+
+#     def transform(self, data: np.ndarray) -> np.ndarray:
+#         return (data - self.mean) / self.std
+
+#     def inverse_transform(self, data):
+#         """支持 numpy array 或 torch tensor，实现灵活的高维广播。"""
+#         is_torch = torch.is_tensor(data)
+#         device = data.device if is_torch else None
+#         dtype = data.dtype if is_torch else None
+
+#         mean_val = self.mean
+#         std_val  = self.std
+
+#         if is_torch:
+#             m = torch.tensor(mean_val, dtype=dtype, device=device)
+#             s = torch.tensor(std_val, dtype=dtype, device=device)
+#         else:
+#             m = mean_val
+#             s = std_val
+
+#         # 全局尺度：[1, 1, F]
+#         if self.axis == (0, 1):
+#             out = data * s + m
+#         else:
+#             # 逐节点尺度：m, s 为 [1, N, F]
+#             # 对齐高维数据的 N 维度，避免 flatten 重组时无法广播
+#             ndims = len(data.shape)
+#             if ndims == 3:  # [T, N, F]
+#                 m_aligned, s_aligned = m, s
+#             elif ndims == 4:  # [B, N, T_out, F]
+#                 if is_torch:
+#                     m_aligned = m.view(1, m.shape[1], 1, m.shape[2])
+#                     s_aligned = s.view(1, s.shape[1], 1, s.shape[2])
+#                 else:
+#                     m_aligned = m.reshape(1, m.shape[1], 1, m.shape[2])
+#                     s_aligned = s.reshape(1, s.shape[1], 1, s.shape[2])
+#             elif ndims == 5:  # [S, B, N, T_out, F]
+#                 if is_torch:
+#                     m_aligned = m.view(1, 1, m.shape[1], 1, m.shape[2])
+#                     s_aligned = s.view(1, 1, s.shape[1], 1, s.shape[2])
+#                 else:
+#                     m_aligned = m.reshape(1, 1, m.shape[1], 1, m.shape[2])
+#                     s_aligned = s.reshape(1, 1, s.shape[1], 1, s.shape[2])
+#             else:
+#                 m_aligned, s_aligned = m, s
+
+#             out = data * s_aligned + m_aligned
+
+#         if self.log_transform:
+#             if is_torch:
+#                 out = torch.expm1(out)
+#             else:
+#                 out = np.expm1(out)
+#         return out
+
+
+# # ---------------------------------------------------------------------------
+# # 数据集加载器
+# # ---------------------------------------------------------------------------
+
+# def load_solar_energy(data_path: str, T_in: int = 168, T_out: int = 1,
+#                       adj_threshold: float = 0.95, batch_size: int = 32):
+#     raw = np.loadtxt(data_path, delimiter=',')
+#     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Solar')
+
+
+# def load_electricity(data_path: str, T_in: int = 168, T_out: int = 1,
+#                      adj_threshold: float = 0.7, batch_size: int = 32):
+#     raw = np.loadtxt(data_path, delimiter=',')
+#     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Electricity')
+
+
+# def load_weather(data_path: str, T_in: int = 168, T_out: int = 1,
+#                  adj_threshold: float = 0.6, batch_size: int = 32,
+#                  feature_idx: int = 0):
+#     raw = np.load(data_path)
+#     print(f"  [Weather2k] 原始 shape: {raw.shape}, dtype: {raw.dtype}")
+
+#     if raw.ndim == 2:
+#         raw = raw[:, :, None]
+#     elif raw.ndim == 3:
+#         T0, D1, D2 = raw.shape
+#         is_format_b = (D2 > T0) and (D2 > D1) and (T0 <= D1)
+#         if is_format_b:
+#             raw = raw.transpose(2, 0, 1)
+
+#     T, N, F = raw.shape
+#     if F > 1 and feature_idx >= 0:
+#         raw = raw[:, :, feature_idx : feature_idx + 1]
+
+#     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='Weather')
+
+
+# def load_sdwpf(data_path: str, T_in: int = 168, T_out: int = 1,
+#                adj_threshold: float = 0.88, batch_size: int = 32):
+#     raw = _load_sdwpf_csv(data_path)
+#     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='SDWPF')
+
+
+# def _load_sdwpf_csv(data_path: str) -> np.ndarray:
+#     print(f"  [SDWPF] 正在读取: {data_path}")
+#     df = pd.read_csv(data_path)
+#     df.columns = [c.split('(')[0].strip() for c in df.columns]
+#     df['time_step'] = _parse_time_step(df)
+#     df = _clean_sdwpf(df)
+
+#     pivot = df.pivot_table(
+#         index='time_step', columns='TurbID', values='Patv', aggfunc='mean'
+#     )
+#     expected_turbs = sorted(df['TurbID'].unique())
+#     pivot = pivot.reindex(columns=expected_turbs)
+
+#     t_min, t_max = pivot.index.min(), pivot.index.max()
+#     full_index   = np.arange(t_min, t_max + 1)
+#     pivot        = pivot.reindex(full_index)
+
+#     raw = pivot.values.astype(np.float32)
+#     df_raw = pd.DataFrame(raw)
+#     df_raw = df_raw.interpolate(method='linear', axis=0, limit_direction='both')
+#     raw    = df_raw.values.astype(np.float32)
+
+#     remaining_nan = np.isnan(raw).sum()
+#     if remaining_nan > 0:
+#         col_means = np.nanmean(raw, axis=0)
+#         nan_cols = np.isnan(col_means)
+#         if nan_cols.any():
+#             global_mean = np.nanmean(raw) if not np.all(nan_cols) else 0.0
+#             col_means[nan_cols] = global_mean
+#         nan_mask  = np.isnan(raw)
+#         raw[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+
+#     return raw
+
+
+# def _parse_time_step(df: pd.DataFrame) -> pd.Series:
+#     def tmstamp_to_step(ts: str) -> int:
+#         try:
+#             h, m = map(int, str(ts).strip().split(':'))
+#             return h * 6 + m // 10
+#         except Exception:
+#             return 0
+#     intra_step = df['Tmstamp'].apply(tmstamp_to_step)
+#     day_0based = (df['Day'] - df['Day'].min())
+#     return (day_0based * 144 + intra_step).astype(int)
+
+
+# def _clean_sdwpf(df: pd.DataFrame) -> pd.DataFrame:
+#     df.loc[df['Patv'] < 0, 'Patv'] = 0.0
+#     if 'Wspd' in df.columns:
+#         mask_stop = (df['Patv'] <= 0) & (df['Wspd'] > 2.5)
+#         df.loc[mask_stop, 'Patv'] = np.nan
+#     pab_cols = [c for c in ['Pab1', 'Pab2', 'Pab3'] if c in df.columns]
+#     if pab_cols:
+#         mask_pab = (df[pab_cols] > 89.0).any(axis=1)
+#         df.loc[mask_pab, 'Patv'] = np.nan
+#     if 'Wspd' in df.columns:
+#         df.loc[df['Wspd'] < 0, 'Patv'] = np.nan
+#     for col in ['Etmp', 'Itmp']:
+#         if col in df.columns:
+#             mask_temp = (df[col] < -40) | (df[col] > 80)
+#             df.loc[mask_temp, 'Patv'] = np.nan
+#     return df
+
+
+# def _build_loaders(raw: np.ndarray,
+#                    T_in: int, T_out: int,
+#                    adj_threshold: float,
+#                    batch_size: int,
+#                    name: str = '',
+#                    log_transform: bool = False) -> tuple:
+#     if raw.ndim == 2:
+#         raw = raw[:, :, None]
+
+#     T, N, F = raw.shape
+#     n_train  = int(T * 0.7)
+#     n_val    = int(T * 0.1)
+
+#     train_raw = raw[:n_train]
+#     val_raw   = raw[n_train : n_train + n_val]
+#     test_raw  = raw[n_train + n_val :]
+
+#     # ─── [修改] 重点：对节点异质性高的数据集开启逐节点归一化 ───
+#     scale_axis = (0,1)
+
+#     scaler     = Scaler(axis=scale_axis, log_transform=log_transform).fit(train_raw)
+#     train_data = scaler.transform(train_raw)
+#     val_data   = scaler.transform(val_raw)
+#     test_data  = scaler.transform(test_raw)
+
+#     adj = build_correlation_adj(train_data[:, :, 0], threshold=adj_threshold)
+
+#     print(f"[{name}] T={T}, N={N}, F={F} | scale_axis={scale_axis} | "
+#           f"train={n_train}, val={n_val}, test={T - n_train - n_val} | "
+#           f"edges={int(adj.sum())}, adj_density={adj.mean():.3f}")
+
+#     train_ds = SlidingWindowDataset(train_data, adj, T_in, T_out)
+#     val_ds   = SlidingWindowDataset(val_data,   adj, T_in, T_out)
+#     test_ds  = SlidingWindowDataset(test_data,  adj, T_in, T_out)
+
+#     is_windows = platform.system() == 'Windows'
+#     nw_train = 0 if (is_windows or batch_size <= 4 or N > 500) else 4
+#     nw_eval  = 0 if (is_windows or batch_size <= 4 or N > 500) else 2
+#     pin_train = (nw_train > 0)
+#     pin_eval  = (nw_eval  > 0)
+
+#     train_loader = DataLoader(train_ds, batch_size=batch_size,
+#                               shuffle=True,  num_workers=nw_train,
+#                               pin_memory=pin_train,
+#                               persistent_workers=(nw_train > 0))
+#     val_loader   = DataLoader(val_ds,   batch_size=batch_size,
+#                               shuffle=False, num_workers=nw_eval,
+#                               pin_memory=pin_eval,
+#                               persistent_workers=(nw_eval > 0))
+#     test_loader  = DataLoader(test_ds,  batch_size=batch_size,
+#                               shuffle=False, num_workers=nw_eval,
+#                               pin_memory=pin_eval,
+#                               persistent_workers=(nw_eval > 0))
+
+#     adj_tensor = torch.tensor(adj, dtype=torch.float32)
+#     return train_loader, val_loader, test_loader, adj_tensor, scaler, F
+
+
+
+"""
+GridCFN – 数据集工具（多特征支持版）
 """
 
 import os
@@ -466,9 +771,6 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 def build_correlation_adj(data: np.ndarray, threshold: float = 0.7) -> np.ndarray:
-    """
-    基于皮尔逊相关系数构建二值邻接矩阵。
-    """
     corr = np.corrcoef(data.T)
     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
     adj  = (np.abs(corr) >= threshold).astype(np.float32)
@@ -504,21 +806,16 @@ class SlidingWindowDataset(Dataset):
 
     def __getitem__(self, idx):
         x = self.data[idx : idx + self.T_in]
-        y = self.data[idx + self.T_in : idx + self.T_in + self.T_out]
-        return x, y   # shape: [T_in, N, F], [T_out, N, F]
+        # ─── [修改] 重点：对标签进行切片 [:, :1]，保证输入是 F_in 维，但预测永远是 index=0 的物理功率 (F_out=1) ───
+        y = self.data[idx + self.T_in : idx + self.T_in + self.T_out, :, :1]
+        return x, y
 
 
 # ---------------------------------------------------------------------------
-# Z-score 归一化 (优化版)
+# Z-score 归一化
 # ---------------------------------------------------------------------------
 
 class Scaler:
-    """
-    自适应 Z-score 归一化。
-    通过 self.axis 参数自适应选择：
-      - 全局归一化 (axis=(0, 1))：计算所有时间步和所有节点的均值/标准差。
-      - 逐节点归一化 (axis=(0,))：独立计算每个节点的时间序列均值/标准差，适应高异质性场景。
-    """
     def __init__(self, axis=(0, 1), log_transform: bool = False):
         self.axis = axis
         self.mean = None
@@ -526,7 +823,6 @@ class Scaler:
         self.log_transform: bool = log_transform
 
     def fit(self, data: np.ndarray) -> "Scaler":
-        # data: [T, N, F]
         self.mean = data.mean(axis=self.axis, keepdims=True)
         self.std  = data.std(axis=self.axis, keepdims=True) + 1e-8
         return self
@@ -535,7 +831,6 @@ class Scaler:
         return (data - self.mean) / self.std
 
     def inverse_transform(self, data):
-        """支持 numpy array 或 torch tensor，实现灵活的高维广播。"""
         is_torch = torch.is_tensor(data)
         device = data.device if is_torch else None
         dtype = data.dtype if is_torch else None
@@ -554,8 +849,7 @@ class Scaler:
         if self.axis == (0, 1):
             out = data * s + m
         else:
-            # 逐节点尺度：m, s 为 [1, N, F]
-            # 对齐高维数据的 N 维度，避免 flatten 重组时无法广播
+            # 逐节点尺度
             ndims = len(data.shape)
             if ndims == 3:  # [T, N, F]
                 m_aligned, s_aligned = m, s
@@ -629,39 +923,52 @@ def load_sdwpf(data_path: str, T_in: int = 168, T_out: int = 1,
     return _build_loaders(raw, T_in, T_out, adj_threshold, batch_size, name='SDWPF')
 
 
+# ─── [修改] 重点：重构 SDWPF 载入函数，同时读取并对齐：功率、风速、温度、桨距角 4 个物理特征 ───
 def _load_sdwpf_csv(data_path: str) -> np.ndarray:
-    print(f"  [SDWPF] 正在读取: {data_path}")
+    print(f"  [SDWPF] 正在读取多物理特征数据: {data_path}")
     df = pd.read_csv(data_path)
     df.columns = [c.split('(')[0].strip() for c in df.columns]
     df['time_step'] = _parse_time_step(df)
     df = _clean_sdwpf(df)
 
-    pivot = df.pivot_table(
-        index='time_step', columns='TurbID', values='Patv', aggfunc='mean'
-    )
     expected_turbs = sorted(df['TurbID'].unique())
-    pivot = pivot.reindex(columns=expected_turbs)
+    
+    # 选取 4 个极具物理代表性的核心特征（功率、风速、温度、桨距角）
+    feature_cols = ['Patv', 'Wspd', 'Etmp', 'Pab1']
+    feature_arrays = []
+    
+    for col in feature_cols:
+        pivot = df.pivot_table(
+            index='time_step', columns='TurbID', values=col, aggfunc='mean'
+        )
+        pivot = pivot.reindex(columns=expected_turbs)
+        t_min, t_max = pivot.index.min(), pivot.index.max()
+        full_index   = np.arange(t_min, t_max + 1)
+        pivot        = pivot.reindex(full_index)
 
-    t_min, t_max = pivot.index.min(), pivot.index.max()
-    full_index   = np.arange(t_min, t_max + 1)
-    pivot        = pivot.reindex(full_index)
+        raw_feat = pivot.values.astype(np.float32)
+        df_feat = pd.DataFrame(raw_feat)
+        # 线性插值，填补缺失的气象或状态信息
+        df_feat = df_feat.interpolate(method='linear', axis=0, limit_direction='both')
+        raw_feat = df_feat.values.astype(np.float32)
 
-    raw = pivot.values.astype(np.float32)
-    df_raw = pd.DataFrame(raw)
-    df_raw = df_raw.interpolate(method='linear', axis=0, limit_direction='both')
-    raw    = df_raw.values.astype(np.float32)
+        # 极端边缘 NaN 采用各列均值填充
+        remaining_nan = np.isnan(raw_feat).sum()
+        if remaining_nan > 0:
+            col_means = np.nanmean(raw_feat, axis=0)
+            nan_cols = np.isnan(col_means)
+            if nan_cols.any():
+                global_mean = np.nanmean(raw_feat) if not np.all(nan_cols) else 0.0
+                col_means[nan_cols] = global_mean
+            nan_mask = np.isnan(raw_feat)
+            raw_feat[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
+            
+        feature_arrays.append(raw_feat[..., None])
 
-    remaining_nan = np.isnan(raw).sum()
-    if remaining_nan > 0:
-        col_means = np.nanmean(raw, axis=0)
-        nan_cols = np.isnan(col_means)
-        if nan_cols.any():
-            global_mean = np.nanmean(raw) if not np.all(nan_cols) else 0.0
-            col_means[nan_cols] = global_mean
-        nan_mask  = np.isnan(raw)
-        raw[nan_mask] = np.take(col_means, np.where(nan_mask)[1])
-
-    return raw
+    # 在最后一个维度拼接，合成形状为 [T, N, 4] 的高阶时空特征矩阵
+    raw_multifeats = np.concatenate(feature_arrays, axis=-1)
+    print(f"  [SDWPF] 多特征整合成功: shape={raw_multifeats.shape} (功率, 风速, 温度, 桨距角)")
+    return raw_multifeats
 
 
 def _parse_time_step(df: pd.DataFrame) -> pd.Series:
@@ -711,8 +1018,7 @@ def _build_loaders(raw: np.ndarray,
     val_raw   = raw[n_train : n_train + n_val]
     test_raw  = raw[n_train + n_val :]
 
-    # ─── [修改] 重点：对节点异质性高的数据集开启逐节点归一化 ───
-    scale_axis = (0,1)
+    scale_axis = (0, 1)
 
     scaler     = Scaler(axis=scale_axis, log_transform=log_transform).fit(train_raw)
     train_data = scaler.transform(train_raw)

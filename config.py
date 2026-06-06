@@ -190,6 +190,42 @@ def get_config(preset: str = "solar") -> Config:
             ),
         )
 
+    # elif preset == "sdwpf":
+    #     T_out = 12   # SDWPF 10min，T_out=12 → 预测未来 2h
+    #     return Config(
+    #         data=DataConfig(
+    #             dataset="sdwpf",
+    #             data_path="./data/sdwpf_245days_v1.csv",
+    #             T_in=168, T_out=T_out,
+    #             adj_threshold=0.88,
+    #             batch_size=32,
+    #         ),
+    #         model=ModelConfig(
+    #             in_dim=1, gcn_hidden=64, gcn_layers=2,
+    #             tcn_hidden=64, tcn_layers=4,
+    #             env_dim=32, stoch_dim=32, ms_out_dim=32,
+    #             n_scg_layers=3, out_dim=1,
+    #             lambda_mi=0.01,           # lambda_club
+    #             cfm_hidden=256, cfm_time_emb_dim=16,
+    #             chunk_size=16384,
+    #             ms_dilations=(1, 24, 84),
+    #             rank_r=6,                 # SDWPF 134节点，秩=6
+    #             lambda_rank=0.01,          # rank_loss 已/rank_r 归一化
+    #             freq_candidates=(12, 24, 48, 96),   # 10min 粒度
+    #         ),
+    #         train=TrainConfig(
+    #             lr=5e-4, max_epochs=200,
+    #             patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
+    #             seed=42, grad_clip=1.0,
+    #             warmup_epochs=5, 
+    #             cfm_n_samples=100,  #50->100
+    #             cfm_n_samples_test=100, #200->100
+    #             cfm_n_steps=15,      #20->15
+    #             cfm_n_t_samples=4,
+    #             cfm_sigma_min=0.01,
+    #             cfm_x0_scale=1.0,
+    #         ),
+    #     )
     elif preset == "sdwpf":
         T_out = 12   # SDWPF 10min，T_out=12 → 预测未来 2h
         return Config(
@@ -201,10 +237,12 @@ def get_config(preset: str = "solar") -> Config:
                 batch_size=32,
             ),
             model=ModelConfig(
-                in_dim=1, gcn_hidden=64, gcn_layers=2,
+                in_dim=4,                 # ─── [修改] 重点：输入改为 4 个气象/状态特征 ───
+                gcn_hidden=64, gcn_layers=2,
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
-                n_scg_layers=3, out_dim=1,
+                n_scg_layers=3, 
+                out_dim=1,                # 预测输出保持为 1（只预测未来功率 Patv）
                 lambda_mi=0.01,           # lambda_club
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
@@ -218,9 +256,9 @@ def get_config(preset: str = "solar") -> Config:
                 patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
                 seed=42, grad_clip=1.0,
                 warmup_epochs=5, 
-                cfm_n_samples=100,  #50->100
-                cfm_n_samples_test=100, #200->100
-                cfm_n_steps=15,      #20->15
+                cfm_n_samples=100,  
+                cfm_n_samples_test=100, 
+                cfm_n_steps=15,      
                 cfm_n_t_samples=4,
                 cfm_sigma_min=0.01,
                 cfm_x0_scale=1.0,

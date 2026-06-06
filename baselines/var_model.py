@@ -15,7 +15,7 @@ from .utils import compute_metrics
 
 
 def run_var(train_loader, test_loader, T_in: int, T_out: int,
-            device, max_lags: int = 24, logger=None, scaler=None, null_val=None):
+            device, max_lags: int = 3, logger=None, scaler=None, null_val=None):  #24->3
     def _log(msg):
         (logger.info if logger else print)(msg)
 
