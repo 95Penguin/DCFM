@@ -19,7 +19,7 @@ import torch
 
 from config import Config, get_config
 from model import GridCFN
-from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf
+from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf, load_pjm
 from train import train
 
 
@@ -94,6 +94,8 @@ def load_data(cfg):
                             feature_idx=getattr(d, "weather_feature_idx", 0))
     elif d.dataset == "sdwpf":
         return load_sdwpf(d.data_path, d.T_in, d.T_out, d.adj_threshold, d.batch_size)
+    elif d.dataset == "pjm":
+        return load_pjm(d.data_path, d.T_in, d.T_out, d.adj_threshold, d.batch_size)
     else:
         raise ValueError(f"未知数据集: '{d.dataset}'")
 
@@ -174,7 +176,7 @@ def main(cfg):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GridCFN Multi-Step Training")
     parser.add_argument("--preset", type=str, default="solar",
-                        choices=["solar", "electricity", "weather", "sdwpf"])
+                        choices=["solar", "electricity", "weather", "sdwpf", "pjm"])
     # 可选：命令行覆盖 T_out
     parser.add_argument("--T_out", type=int, default=None,
                         help="预测步长，覆盖 preset 默认值（如 --T_out 24）")

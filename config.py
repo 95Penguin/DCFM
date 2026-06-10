@@ -1,3 +1,8 @@
+"""
+config.py
+GridCFN 时空网络参数配置文件
+"""
+
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -7,7 +12,7 @@ class DataConfig:
     dataset:       str           = "solar"
     data_path:     Optional[str] = "./data/solar_AL.txt"
     T_in:          int           = 168
-    T_out:         int           = 12     # ← 多步版默认 12，可设 12~48
+    T_out:         int           = 12     # 多步版默认12步
     adj_threshold: float         = 0.95
     batch_size:    int           = 32
 
@@ -23,17 +28,16 @@ class ModelConfig:
     stoch_dim:        int   = 32
     ms_out_dim:       int   = 32
     n_scg_layers:     int   = 3
-    out_dim:          int   = 1           # 每步每节点的特征维度，通常保持 1
-    lambda_mi:        float = 0.5         # DMSD 中充当 lambda_club（CLUB 一致性惩罚权重）
-    # CFM hidden 在多步时适当加宽，因为输出维度 = T_out * out_dim
-    cfm_hidden:       int   = 256         # ← 多步版加宽（原 128）
+    out_dim:          int   = 1           # 每步预测变量数，预测功率为 1
+    lambda_mi:        float = 0.5         # 互信息CLUB损失权重
+    cfm_hidden:       int   = 256         # 连续流匹配隐层维度
     cfm_time_emb_dim: int   = 16
     chunk_size:       int   = 16384
     ms_dilations:     tuple = (1, 7, 30)
-    # ── DMSD 新增参数 ──────────────────────────────────────────────────
-    rank_r:           int   = 8           # 低秩 GCN 的秩，建议：Solar/SDWPF=6，Electricity=12
-    lambda_rank:      float = 0.1         # 秩正则权重（rank_loss 已/rank_r 归一化，此值等效原 0.01×rank_r）
-    freq_candidates:  tuple = (12, 24, 48, 96)  # 频率分流候选窗口（10min 粒度数据集）
+    rank_r:           int   = 8           # 低秩矩阵隐秩
+    lambda_rank:      float = 0.1         
+    freq_candidates:  tuple = (12, 24, 48, 96)  
+    dropout:          float = 0.1         # 默认正则化 Dropout 
 
 
 @dataclass
@@ -79,21 +83,8 @@ class Config:
 
 
 def get_config(preset: str = "solar") -> Config:
-    """
-    多步预测 preset。
-
-    T_out 建议值（中期预测）：
-      Solar / SDWPF (10min) : T_out=12 → 2h；T_out=24 → 4h；T_out=48 → 8h
-      Electricity / Weather (1h): T_out=12 → 12h；T_out=24 → 1day；T_out=48 → 2days
-
-    cfm_hidden 随 T_out 增大应适当加宽（T_out*feat_dim 增大，需要更大容量）：
-      T_out=12  → cfm_hidden=256
-      T_out=24  → cfm_hidden=384
-      T_out=48  → cfm_hidden=512
-    """
-
     if preset == "solar":
-        T_out = 12   # Solar 10min，T_out=12 → 预测未来 2h
+        T_out = 12   
         return Config(
             data=DataConfig(
                 dataset="solar",
@@ -107,68 +98,70 @@ def get_config(preset: str = "solar") -> Config:
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.01,            # lambda_club， 0.1->0.01
+                lambda_mi=0.01,            
                 cfm_hidden=256, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 24, 84),
-                rank_r=6,                 # Solar 137节点，秩=6
-                lambda_rank=0.01,          # rank_loss 已/rank_r 归一化，此处补偿 × rank_r 约等效原 0.01。0.1->0.01
-                freq_candidates=(12, 24, 48, 96),   # 10min 粒度
+                rank_r=6,                 
+                lambda_rank=0.01,          
+                freq_candidates=(12, 24, 48, 96),   
+                dropout=0.1,
             ),
             train=TrainConfig(
                 lr=5e-4, max_epochs=200,
                 patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
                 seed=42, grad_clip=1.0, warmup_epochs=5,
-                cfm_n_samples=100,  #50->100
-                cfm_n_samples_test=100, #200->100
-                cfm_n_steps=15,  #20->15
+                cfm_n_samples=100,  
+                cfm_n_samples_test=100, 
+                cfm_n_steps=15,  
                 cfm_n_t_samples=4,
             ),
         )
 
     elif preset == "electricity":
-        T_out = 12   # Electricity 1h，T_out=12 → 预测未来 12h
+        T_out = 12   
         return Config(
             data=DataConfig(
                 dataset="electricity",
                 data_path="./data/electricity.txt",
                 T_in=168, T_out=T_out,
                 adj_threshold=0.6,
-                batch_size=16,   # 节点多 + T_out 大，适当减小 batch
+                batch_size=16,   
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
                 tcn_hidden=64, tcn_layers=4,
                 env_dim=32, stoch_dim=32, ms_out_dim=32,
                 n_scg_layers=3, out_dim=1,
-                lambda_mi=0.01,           # lambda_club
+                lambda_mi=0.01,           
                 cfm_hidden=384, cfm_time_emb_dim=16,
                 chunk_size=16384,
                 ms_dilations=(1, 12, 84),
-                rank_r=12,                # Electricity 321节点，秩=12
-                lambda_rank=0.01,          # rank_loss 已/rank_r 归一化
-                freq_candidates=(6, 12, 24, 48),    # 1h 粒度
+                rank_r=12,                
+                lambda_rank=0.01,          
+                freq_candidates=(6, 12, 24, 48),    
+                dropout=0.1,
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,
                 patience=25, lr_decay_factor=0.5, lr_decay_patience=12,
                 seed=42, grad_clip=1.0, warmup_epochs=5,
-                cfm_n_samples=100,  #50->100
-                cfm_n_samples_test=100, #200->100
-                cfm_n_steps=15,      #20->15
+                cfm_n_samples=100,  
+                cfm_n_samples_test=100, 
+                cfm_n_steps=15,      
                 cfm_n_t_samples=4,
             ),
         )
 
     elif preset == "weather":
-        T_out = 12   # Weather 1h，T_out=12 → 预测未来 12h
+        T_out = 12   
         return Config(
             data=DataConfig(
                 dataset="weather",
                 data_path="./data/weather2k.npy",
                 T_in=168, T_out=T_out,
                 adj_threshold=0.8,
-                batch_size=2,    # Weather 节点极多，减小 batch
+                batch_size=2,    
             ),
             model=ModelConfig(
                 in_dim=1, gcn_hidden=64, gcn_layers=2,
@@ -179,83 +172,101 @@ def get_config(preset: str = "solar") -> Config:
                 cfm_hidden=384, cfm_time_emb_dim=16,
                 chunk_size=4096,
                 ms_dilations=(1, 12, 84),
+                dropout=0.1,
             ),
             train=TrainConfig(
                 lr=1e-3, max_epochs=200,
                 patience=25, lr_decay_factor=0.5, lr_decay_patience=12,
                 seed=42, grad_clip=1.0, warmup_epochs=3,
-                cfm_n_samples=10,        # Weather 节点极多，严格限制并行采样数
+                cfm_n_samples=10,        
                 cfm_n_samples_test=50,
                 cfm_n_steps=20, cfm_n_t_samples=4,
             ),
         )
 
     # elif preset == "sdwpf":
-    #     T_out = 12   # SDWPF 10min，T_out=12 → 预测未来 2h
+    #     T_out = 12   
     #     return Config(
     #         data=DataConfig(
     #             dataset="sdwpf",
     #             data_path="./data/sdwpf_245days_v1.csv",
     #             T_in=168, T_out=T_out,
-    #             adj_threshold=0.88,
-    #             batch_size=32,
+    #             adj_threshold=0.94,       
+    #             batch_size=16,            
     #         ),
     #         model=ModelConfig(
-    #             in_dim=1, gcn_hidden=64, gcn_layers=2,
-    #             tcn_hidden=64, tcn_layers=4,
-    #             env_dim=32, stoch_dim=32, ms_out_dim=32,
-    #             n_scg_layers=3, out_dim=1,
-    #             lambda_mi=0.01,           # lambda_club
-    #             cfm_hidden=256, cfm_time_emb_dim=16,
+    #             in_dim=4,                 
+    #             gcn_hidden=96,            
+    #             gcn_layers=2,
+    #             tcn_hidden=96,            
+    #             tcn_layers=4,
+    #             env_dim=48,               
+    #             stoch_dim=48,             
+    #             ms_out_dim=48,
+    #             n_scg_layers=3, 
+    #             out_dim=1,                
+    #             lambda_mi=0.001,          
+    #             cfm_hidden=320,           
+    #             cfm_time_emb_dim=16,
     #             chunk_size=16384,
-    #             ms_dilations=(1, 24, 84),
-    #             rank_r=6,                 # SDWPF 134节点，秩=6
-    #             lambda_rank=0.01,          # rank_loss 已/rank_r 归一化
-    #             freq_candidates=(12, 24, 48, 96),   # 10min 粒度
+    #             ms_dilations=(1, 6, 24),  
+    #             rank_r=8,                 
+    #             lambda_rank=0.01,          
+    #             freq_candidates=(12, 24, 48, 96),   
+    #             dropout=0.20,             
     #         ),
     #         train=TrainConfig(
-    #             lr=5e-4, max_epochs=200,
+    #             lr=3e-4, max_epochs=200,  
     #             patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
     #             seed=42, grad_clip=1.0,
-    #             warmup_epochs=5, 
-    #             cfm_n_samples=100,  #50->100
-    #             cfm_n_samples_test=100, #200->100
-    #             cfm_n_steps=15,      #20->15
+    #             weight_decay=2e-4,        
+    #             warmup_epochs=15,         
+    #             cfm_n_samples=100,  
+    #             cfm_n_samples_test=100, 
+    #             cfm_n_steps=15,      
     #             cfm_n_t_samples=4,
     #             cfm_sigma_min=0.01,
     #             cfm_x0_scale=1.0,
     #         ),
     #     )
+
     elif preset == "sdwpf":
-        T_out = 12   # SDWPF 10min，T_out=12 → 预测未来 2h
+        T_out = 12   
         return Config(
             data=DataConfig(
                 dataset="sdwpf",
                 data_path="./data/sdwpf_245days_v1.csv",
                 T_in=168, T_out=T_out,
-                adj_threshold=0.88,
-                batch_size=32,
+                adj_threshold=0.88,       # 稍微放宽阈值，引入更多空间风机关联
+                batch_size=16,            
             ),
             model=ModelConfig(
-                in_dim=4,                 # ─── [修改] 重点：输入改为 4 个气象/状态特征 ───
-                gcn_hidden=64, gcn_layers=2,
-                tcn_hidden=64, tcn_layers=4,
-                env_dim=32, stoch_dim=32, ms_out_dim=32,
+                in_dim=4,                 
+                gcn_hidden=64,            # 降低隐藏层维度（96->64），通过剪枝减少模型容量，强力防过拟合
+                gcn_layers=2,
+                tcn_hidden=64,            # 降低隐藏层维度（96->64）
+                tcn_layers=4,
+                env_dim=32,               
+                stoch_dim=32,             
+                ms_out_dim=32,
                 n_scg_layers=3, 
-                out_dim=1,                # 预测输出保持为 1（只预测未来功率 Patv）
-                lambda_mi=0.01,           # lambda_club
-                cfm_hidden=256, cfm_time_emb_dim=16,
+                out_dim=1,                
+                lambda_mi=0.01,           
+                cfm_hidden=256,           
+                cfm_time_emb_dim=16,
                 chunk_size=16384,
-                ms_dilations=(1, 24, 84),
-                rank_r=6,                 # SDWPF 134节点，秩=6
-                lambda_rank=0.01,          # rank_loss 已/rank_r 归一化
-                freq_candidates=(12, 24, 48, 96),   # 10min 粒度
+                ms_dilations=(1, 24, 84),  # 恢复为 10min 粒度对应的 4小时、14小时跨度
+                rank_r=6,                 
+                lambda_rank=0.01,          
+                freq_candidates=(12, 24, 48, 96),   
+                dropout=0.25,             # 提升至 0.25，全面阻断噪声过拟合
             ),
             train=TrainConfig(
-                lr=5e-4, max_epochs=200,
+                lr=1.5e-4, max_epochs=200, # 降低学习率，平滑更新
                 patience=30, lr_decay_factor=0.5, lr_decay_patience=15,
                 seed=42, grad_clip=1.0,
-                warmup_epochs=5, 
+                weight_decay=1e-3,        # 强力 L2 正则化约束 (1e-5 -> 1e-3)
+                warmup_epochs=5,         
                 cfm_n_samples=100,  
                 cfm_n_samples_test=100, 
                 cfm_n_steps=15,      
@@ -265,7 +276,41 @@ def get_config(preset: str = "solar") -> Config:
             ),
         )
 
+    elif preset == "pjm":
+        T_out = 24   # PJM 1h 粒度下，默认预测未来24小时
+        return Config(
+            data=DataConfig(
+                dataset="pjm",
+                data_path="./data/archive",  # 请确保您的 Kaggle 解压 CSV 存放在该路径
+                T_in=168, T_out=T_out,
+                adj_threshold=0.6,          # 稍微放宽以确保图连接通畅
+                batch_size=32,
+            ),
+            model=ModelConfig(
+                in_dim=1, gcn_hidden=64, gcn_layers=2,
+                tcn_hidden=64, tcn_layers=4,
+                env_dim=32, stoch_dim=32, ms_out_dim=32,
+                n_scg_layers=3, out_dim=1,
+                lambda_mi=0.01,            
+                cfm_hidden=256, cfm_time_emb_dim=16,
+                chunk_size=16384,
+                ms_dilations=(1, 12, 24),  # 小时级数据更关注12h、24h的周期特征
+                rank_r=4,                  # PJM 分区约有11个独立节点，设秩r=4完全足够
+                lambda_rank=0.01,          
+                freq_candidates=(12, 24, 48),  # 对应小时级多尺度周期（半天、一天、两天）
+                dropout=0.1,
+            ),
+            train=TrainConfig(
+                lr=1e-3, max_epochs=200,
+                patience=30, lr_decay_factor=0.5, lr_decay_patience=12,
+                seed=42, grad_clip=1.0, warmup_epochs=5,
+                cfm_n_samples=100,  
+                cfm_n_samples_test=100, 
+                cfm_n_steps=15,  
+                cfm_n_t_samples=4,
+            ),
+        )
     else:
         raise ValueError(
-            f"Unknown preset: '{preset}'. Choose: solar, electricity, weather, sdwpf"
+            f"Unknown preset: '{preset}'. Choose: solar, electricity, weather, sdwpf, pjm"
         )
