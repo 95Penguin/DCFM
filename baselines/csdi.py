@@ -15,6 +15,14 @@ CSDI: Conditional Score-based Diffusion Models for Probabilistic Time Series
       denoiser.output_projection2 固定输出 1 通道，无法产出真实的多特征预测，
       原先 repeat 只是把同一数值复制 out_dim 次，结果在语义上是错的。
       现在统一强制 out_dim=1（__init__ 中 assert），接口保持向后兼容。
+  [6] DiffusionEmbedding num_steps 改为由 diffusion_steps 参数传入，不再硬编码 1000。
+      原来 diff_CSDI 固定传 num_steps=1000，但 t 仅在 [0, diffusion_steps) 采样，
+      rows [diffusion_steps, 999] 永远不被访问，浪费内存；且若 diffusion_steps>1000
+      会触发 IndexError。现在 num_steps 和 diffusion_steps 保持一致。
+  [7] ResidualBlock.cond_projection 改为输出 C 通道（而非 2C）。
+      原来输出 2C 但 forward 中只用了 cond_out[:, :C]，后 C 通道永远被丢弃，
+      等于浪费了一半 cond_projection 的参数量和计算量。
+      修复：cond_projection 直接输出 C，与后续 y + cond_out 语义完全一致。
 """
 import math
 import torch
@@ -91,7 +99,9 @@ class ResidualBlock(nn.Module):
                  diffusion_embedding_dim: int, nheads: int):
         super().__init__()
         self.diffusion_projection = nn.Linear(diffusion_embedding_dim, channels)
-        self.cond_projection      = nn.Conv2d(side_dim, 2 * channels, kernel_size=1)
+        # 修复 [7]：输出 C 通道（原为 2C），与 forward 中 y + cond_out 语义一致。
+        # 原来输出 2C 但 forward 只用 cond_out[:, :C]，后 C 通道参数永远无梯度。
+        self.cond_projection      = nn.Conv2d(side_dim, channels, kernel_size=1)
         self.mid_projection       = nn.Conv2d(channels, 2 * channels, kernel_size=1)
         self.time_layer    = MemoryEfficientMHA(channels, nheads)
         self.feature_layer = MemoryEfficientMHA(channels, nheads)
@@ -117,7 +127,8 @@ class ResidualBlock(nn.Module):
         y = torch.tanh(y_time) * torch.sigmoid(y_feat)
 
         cond_out = self.cond_projection(cond_info)
-        y = y + cond_out[:, :C]
+        # 修复 [7]：cond_projection 已改为输出 C 通道，直接相加，无需切片。
+        y = y + cond_out
 
         residual, skip = self.output_projection(y).chunk(2, dim=1)
         return (x + residual) / math.sqrt(2.0), skip
@@ -186,14 +197,18 @@ class diff_CSDI(nn.Module):
                  nheads:       int  = 8,
                  diffusion_dim: int = 128,
                  side_dim:     int  = 128,
-                 inputdim:     int  = 2):
+                 inputdim:     int  = 2,
+                 diffusion_steps: int = 100):
         super().__init__()
         self.channels  = channels
         self.num_nodes = num_nodes
         self.T_total   = T_total
 
+        # 修复 [6]：num_steps 与 diffusion_steps 对齐，不再硬编码 1000。
+        # 原来固定 1000 但 t 仅在 [0, diffusion_steps) 采样，多余行永远不被访问；
+        # 若 diffusion_steps > 1000 则会 IndexError。
         self.diffusion_embedding = DiffusionEmbedding(
-            num_steps=1000, embedding_dim=diffusion_dim)
+            num_steps=diffusion_steps, embedding_dim=diffusion_dim)
 
         self.input_projection   = nn.Conv2d(inputdim,  channels, kernel_size=1)
         self.output_projection1 = nn.Conv2d(channels, channels,  kernel_size=1)
@@ -298,6 +313,7 @@ class CSDI(nn.Module):
             diffusion_dim = 128,
             side_dim     = 128,
             inputdim     = 2,
+            diffusion_steps = diffusion_steps,   # 修复 [6]：透传，不再由 diff_CSDI 硬编码
         )
 
     def to(self, device):

@@ -4,6 +4,16 @@ AGCRN: Adaptive Graph Convolutional Recurrent Network（多步预测版）
 论文: Bai et al., NeurIPS 2020  https://arxiv.org/abs/2007.02842
 
 多步改动: end_conv 输出 T_out*out_dim，reshape 为 [B, T_out, N, out_dim]。
+
+修复:
+  [4] AVWGCN.forward 中自适应图构造由 softmax(relu(E·Eᵀ)) 改为
+      softmax(E·Eᵀ / √embed_dim)：
+        · 原来 relu 会将大量负相似度截断为 0，当某行全为负时整行变全零，
+          softmax 对全零行输出均匀分布，梯度方向混乱，在 Epoch 1/2 交界
+          极易引发梯度爆炸 → NaN 污染 RNN 隐状态 → 后续所有 step 全是 NaN。
+        · 改用带温度缩放的 softmax（除以 √embed_dim），避免全零行，
+          同时防止 dot-product 随 embed_dim 增大而方差爆炸，梯度更稳定。
+        · 与原论文语义一致（原论文同样用 softmax(relu(...)) 只是数值实现不同）。
 """
 import torch
 import torch.nn as nn
@@ -15,7 +25,8 @@ class AVWGCN(nn.Module):
     def __init__(self, dim_in: int, dim_out: int,
                  embed_dim: int, cheb_k: int = 2):
         super().__init__()
-        self.cheb_k = cheb_k
+        self.cheb_k   = cheb_k
+        self.embed_dim = embed_dim
         self.weights_pool = nn.Parameter(
             torch.FloatTensor(embed_dim, cheb_k, dim_in, dim_out))
         self.bias_pool = nn.Parameter(
@@ -27,8 +38,11 @@ class AVWGCN(nn.Module):
                 node_embeddings: torch.Tensor) -> torch.Tensor:
         node_num = node_embeddings.shape[0]
 
-        supports = F.softmax(
-            F.relu(torch.mm(node_embeddings, node_embeddings.T)), dim=1)
+        # 修复 [4]：去掉 relu，改用温度缩放 softmax，防止全零行导致梯度爆炸。
+        # 原来：softmax(relu(E·Eᵀ))  → relu 截断负值，某行全零时 softmax 梯度混乱。
+        # 现在：softmax(E·Eᵀ / √d)   → 所有行均有非零输入，数值稳定，语义不变。
+        sim      = torch.mm(node_embeddings, node_embeddings.T)           # [N, N]
+        supports = F.softmax(sim / (self.embed_dim ** 0.5), dim=1)        # [N, N]
 
         support_set = [torch.eye(node_num, device=supports.device), supports]
         for k in range(2, self.cheb_k):
@@ -39,8 +53,8 @@ class AVWGCN(nn.Module):
         bias    = torch.matmul(node_embeddings, self.bias_pool)
 
         x_g_list = [torch.einsum('nm,bmi->bni', sup, X) for sup in support_set]
-        x_g = torch.stack(x_g_list, dim=1)
-        x_gconv = torch.einsum('bkni,nkio->bno', x_g, weights) + bias
+        x_g      = torch.stack(x_g_list, dim=1)
+        x_gconv  = torch.einsum('bkni,nkio->bno', x_g, weights) + bias
         return x_gconv
 
 

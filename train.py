@@ -32,32 +32,74 @@ def mape(pred, true, eps=1e-8):
 
 
 # ─── [优化] 动态置换次数设计，防止大样本量下 CPU 计算崩溃 ───
+# def crps_empirical(samples: np.ndarray, y: np.ndarray, chunk_size: int = 500) -> float:
+#     S = samples.shape[0]
+#     N_total = samples.shape[1]
+#     crps_list = []
+    
+#     # 样本量大时，适当减少置换次数（4-5次足够精确），防止 CPU 算力穿透
+#     n_rep = min(4, S - 1) if S > 30 else min(10, S - 1)
+#     rng = np.random.default_rng(seed=0)  # 移到循环外，避免每个 chunk 使用相同排列序列
+    
+#     for i in range(0, N_total, chunk_size):
+#         end = min(i + chunk_size, N_total)
+#         chunk_samples = samples[:, i:end]
+#         chunk_y = y[i:end]
+        
+#         mae_term = np.abs(chunk_samples - chunk_y[None]).mean(axis=0)
+#         spreads = []
+#         for _ in range(n_rep):
+#             perm = rng.permutation(S)
+#             clash = np.where(perm == np.arange(S))[0]
+#             for idx in clash:
+#                 swap = (idx + 1) % S
+#                 perm[idx], perm[swap] = perm[swap], perm[idx]
+#             spreads.append(np.abs(chunk_samples - chunk_samples[perm]).mean(axis=0))
+#         spread = np.mean(spreads, axis=0)
+#         crps_list.append((mae_term - 0.5 * spread).mean())
+        
+#     return float(np.mean(crps_list))
+
 def crps_empirical(samples: np.ndarray, y: np.ndarray, chunk_size: int = 500) -> float:
     S = samples.shape[0]
     N_total = samples.shape[1]
     crps_list = []
-    
+
     # 样本量大时，适当减少置换次数（4-5次足够精确），防止 CPU 算力穿透
     n_rep = min(4, S - 1) if S > 30 else min(10, S - 1)
-    rng = np.random.default_rng(seed=0)  # 移到循环外，避免每个 chunk 使用相同排列序列
-    
+    rng = np.random.default_rng(seed=0)
+
+    def _derange(perm):
+        """将 perm 中 perm[i]==i 的位置修正，保证结果仍是合法置换且无不动点。"""
+        arange = np.arange(S)
+        clash = np.where(perm == arange)[0]
+        if len(clash) == 0:
+            return perm
+        if len(clash) >= 2:
+            # clash>=2：整体循环右移一位。
+            # 数学保证：roll 后 perm[clash[k]] = 原perm[clash[k-1]] = clash[k-1] != clash[k]，无不动点。
+            perm[clash] = np.roll(perm[clash], 1)
+        else:
+            # clash==1：roll 单元素无效，需与任意非clash位置交换。
+            # 置换特性保证：perm[j]!=j 且 perm[j]!=i（不重复），交换后两个位置均无不动点。
+            i = int(clash[0])
+            j = int(np.where(perm != arange)[0][0])
+            perm[i], perm[j] = perm[j], perm[i]
+        return perm
+
     for i in range(0, N_total, chunk_size):
         end = min(i + chunk_size, N_total)
         chunk_samples = samples[:, i:end]
         chunk_y = y[i:end]
-        
+
         mae_term = np.abs(chunk_samples - chunk_y[None]).mean(axis=0)
         spreads = []
         for _ in range(n_rep):
-            perm = rng.permutation(S)
-            clash = np.where(perm == np.arange(S))[0]
-            for idx in clash:
-                swap = (idx + 1) % S
-                perm[idx], perm[swap] = perm[swap], perm[idx]
+            perm = _derange(rng.permutation(S))
             spreads.append(np.abs(chunk_samples - chunk_samples[perm]).mean(axis=0))
         spread = np.mean(spreads, axis=0)
         crps_list.append((mae_term - 0.5 * spread).mean())
-        
+
     return float(np.mean(crps_list))
 
 
@@ -251,6 +293,14 @@ def train_one_epoch(
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(main_params, max_norm=grad_clip)
         optimizer.step()
+        # 修复：mi_penalty 反向传播时，梯度也会流入 club_e/club_s 参数（因为它们的
+        # var_net 参与了 forward 计算），但 main optimizer.zero_grad() 只清除了
+        # main_params 的梯度（club 参数 id 不在 main_params 中，zero_grad 对它们无效）。
+        # 不清除会导致 club 参数在连续 batch 间累积来自 mi_penalty 的梯度，
+        # 等到下一 batch 的 club_optimizer.zero_grad() 才被清除，
+        # 相当于 club 参数被隐式地以错误的累积梯度更新。
+        # 修复：主 loss 反向完毕后立即清除 club 参数的梯度，与 main 优化完全解耦。
+        club_optimizer.zero_grad()
 
         total_loss  += loss.item()
         total_cfm   += cfm_l.item()
@@ -303,11 +353,13 @@ def evaluate(model: GridCFN, loader: DataLoader,
         ).cpu().numpy()
 
         del He_prime, Hs_prime, x
-        torch.cuda.empty_cache()
 
         samples_list.append(raw_samples)
         y_np = y.permute(0, 2, 1, 3).numpy()
         y_list.append(y_np)
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     samples_all = np.concatenate(samples_list, axis=1)
     y_all       = np.concatenate(y_list, axis=0)
@@ -457,27 +509,29 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         torch.load(cfg_train.save_path, map_location=device, weights_only=True)
     )
 
-    # Temperature Calibration
-    logger.info("\n正在验证集上做 Temperature Calibration...")
-    _, samples_val, y_val = evaluate(
+    # ── Temperature Calibration ────────────────────────────────────────────
+    # 在归一化域做 calibration，避免反归一化后不同节点量纲差异（如 electricity
+    # 节点间差 200 倍）导致大值节点主导 PICP 估计，使 best_T 偏差。
+    # best_T 估计完毕后，统一应用到同样在归一化域的测试集样本上，再做逆变换。
+    logger.info("\n正在验证集上做 Temperature Calibration（归一化域）...")
+    _, samples_val_norm, y_val_norm = evaluate(
         model, val_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
         n_samples=n_samples_test, n_steps=n_steps,
-        temperature=1.0, inverse_transform=True,
+        temperature=1.0, inverse_transform=False,   # ← 改为归一化域
         sigma_min=sigma_min, x0_scale=x0_scale,
     )
-    best_T      = calibrate_temperature(samples_val, y_val, target_coverage=0.95)
-    picp_before = picp_empirical(samples_val, y_val)
-    mu_val      = samples_val.mean(axis=0)
-    scaled_val  = mu_val[None] + best_T * (samples_val - mu_val[None])
-    picp_after  = picp_empirical(scaled_val, y_val)
+    best_T      = calibrate_temperature(samples_val_norm, y_val_norm, target_coverage=0.95)
+    picp_before = picp_empirical(samples_val_norm, y_val_norm)
+    mu_val_norm = samples_val_norm.mean(axis=0)
+    scaled_val  = mu_val_norm[None] + best_T * (samples_val_norm - mu_val_norm[None])
+    picp_after  = picp_empirical(scaled_val, y_val_norm)
     logger.info(
         f"最优 Temperature: {best_T:.3f}  "
-        f"（验证集 PICP@T=1.0: {picp_before:.4f} → PICP@T={best_T:.2f}: {picp_after:.4f}）"
+        f"（验证集归一化域 PICP@T=1.0: {picp_before:.4f} → PICP@T={best_T:.2f}: {picp_after:.4f}）"
     )
 
-    # ─── [核心优化] 仅在测试集上运行单次流匹配采样 ───
-    # 拿到归一化的预测结果，再利用 Z-score 映射到物理域，从而免去第二次 CFM 解算，节省 15 分钟
+    # ── 测试集：单次 CFM 采样，归一化域 → 逆变换到物理域 ─────────────────────
     logger.info("\n开始测试集流解算建模采样 (仅单次求解)...")
     _, samples_test_norm, y_test_norm = evaluate(
         model, test_loader, adj_norm, edge_index, device,
@@ -488,24 +542,40 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     )
 
     logger.info("解算完成。进行物理量纲逆映射...")
-    # 利用 Scaler 直接进行 NumPy 逆映射（执行耗时 < 0.1秒，效果完全等价于重新调用 evaluate）
     samples_test = _inverse_samples(samples_test_norm, scaler)
     y_test       = _inverse_y(y_test_norm, scaler)
 
+    # ── 计算四组指标 ──────────────────────────────────────────────────────
+    # 1. 归一化域校准后（主要汇报，量纲一致，calibration最准确）
+    # 2. 反归一化校准后（论文里的物理可读指标，用同一个 best_T）
+    # 3/4. T=1.0 未校准版本（与 deterministic baselines 对比用）
     logger.info("计算最终指标中...")
-    test_m_raw  = evaluate_all(samples_test, y_test)
-    mu_test     = samples_test.mean(axis=0, keepdims=True)
-    test_m      = evaluate_all(mu_test + best_T * (samples_test - mu_test), y_test)
-    
-    mu_norm     = samples_test_norm.mean(axis=0, keepdims=True)
-    test_m_norm = evaluate_all(mu_norm + best_T * (samples_test_norm - mu_norm), y_test_norm)
-    test_m_raw_norm = evaluate_all(samples_test_norm, y_test_norm)
+
+    mu_norm          = samples_test_norm.mean(axis=0, keepdims=True)
+    test_m_norm      = evaluate_all(mu_norm + best_T * (samples_test_norm - mu_norm), y_test_norm)
+    test_m_raw_norm  = evaluate_all(samples_test_norm, y_test_norm)
+
+    mu_test  = samples_test.mean(axis=0, keepdims=True)
+    test_m   = evaluate_all(mu_test + best_T * (samples_test - mu_test), y_test)
+    test_m_raw = evaluate_all(samples_test, y_test)
 
     sep      = "=" * 60
     avg_keys = ["MAE", "RMSE", "MAPE", "CRPS", "PICP", "PINAW"]
 
     logger.info(f"\n{sep}")
-    logger.info(f"TEST SET RESULTS — 反归一化域 (Temperature={best_T:.3f}, T_out={model.T_out})")
+    logger.info(f"TEST SET RESULTS — 归一化域校准后【主要指标】(Temperature={best_T:.3f}, T_out={model.T_out})")
+    logger.info(sep)
+    for k in avg_keys:
+        logger.info(f"  {k:<8}: {test_m_norm[k]:.4f}")
+    logger.info(f"\n  {'Step':<6}  {'MAE':>8}  {'RMSE':>8}  {'CRPS':>8}")
+    for h in range(model.T_out):
+        mae_h  = test_m_norm.get(f"MAE_h{h+1}",  float("nan"))
+        rmse_h = test_m_norm.get(f"RMSE_h{h+1}", float("nan"))
+        crps_h = test_m_norm.get(f"CRPS_h{h+1}", float("nan"))
+        logger.info(f"  h={h+1:<4}  {mae_h:>8.4f}  {rmse_h:>8.4f}  {crps_h:>8.4f}")
+
+    logger.info(f"\n{sep}")
+    logger.info(f"TEST SET RESULTS — 反归一化域校准后（物理量纲可读）(Temperature={best_T:.3f})")
     logger.info(sep)
     for k in avg_keys:
         logger.info(f"  {k:<8}: {test_m[k]:.4f}")
@@ -517,22 +587,16 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
         logger.info(f"  h={h+1:<4}  {mae_h:>8.4f}  {rmse_h:>8.4f}  {crps_h:>8.4f}")
 
     logger.info(f"\n{sep}")
-    logger.info(f"TEST SET RESULTS — 归一化域 (Temperature={best_T:.3f}, T_out={model.T_out})")
-    logger.info(sep)
-    for k in avg_keys:
-        logger.info(f"  {k:<8}: {test_m_norm[k]:.4f}")
-
-    logger.info(f"\n{sep}")
-    logger.info(f"TEST SET RESULTS — 未校准反归一化 / 与 baselines 对比用 (Temperature=1.0)")
-    logger.info(sep)
-    for k in avg_keys:
-        logger.info(f"  {k:<8}: {test_m_raw[k]:.4f}")
-
-    logger.info(f"\n{sep}")
-    logger.info(f"TEST SET RESULTS — 未校准归一化域 (Temperature=1.0)")
+    logger.info(f"TEST SET RESULTS — 未校准归一化域 / 与 baselines 对比用 (Temperature=1.0)")
     logger.info(sep)
     for k in avg_keys:
         logger.info(f"  {k:<8}: {test_m_raw_norm[k]:.4f}")
+
+    logger.info(f"\n{sep}")
+    logger.info(f"TEST SET RESULTS — 未校准反归一化域 (Temperature=1.0)")
+    logger.info(sep)
+    for k in avg_keys:
+        logger.info(f"  {k:<8}: {test_m_raw[k]:.4f}")
     logger.info(sep)
 
     history["test_metrics"]          = test_m

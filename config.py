@@ -255,7 +255,9 @@ def get_config(preset: str = "solar") -> Config:
                 cfm_hidden=256,           
                 cfm_time_emb_dim=16,
                 chunk_size=16384,
-                ms_dilations=(1, 24, 84),  # 恢复为 10min 粒度对应的 4小时、14小时跨度
+                ms_dilations=(1, 12, 48),  # 10min粒度: 1步/12步(2h)/48步(8h)
+                                           # 感受野=3×48=144 < T_in=168，全部有效
+                                           # 原(1,24,84)中84对应感受野252>168，末层被截断
                 rank_r=6,                 
                 lambda_rank=0.01,          
                 freq_candidates=(12, 24, 48, 96),   
@@ -277,7 +279,7 @@ def get_config(preset: str = "solar") -> Config:
         )
 
     elif preset == "pjm":
-        T_out = 24   # PJM 1h 粒度下，默认预测未来24小时
+        T_out = 12   # PJM 1h 粒度下，默认预测未来24小时
         return Config(
             data=DataConfig(
                 dataset="pjm",

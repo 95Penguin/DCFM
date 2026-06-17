@@ -10,6 +10,15 @@ baselines/utils.py
 评估策略（2025-05 修订）：
   统一无 mask 全量评估，与 GridCFN 主模型对齐，方便与文献直接比较。
   所有函数保留 null_val 参数接口，但传入任何值均不做 mask。
+
+修复:
+  [5] train_model 训练循环中增加 NaN/Inf 防护：
+        · 计算 loss 后立即检测 torch.isfinite(loss)，若为 NaN 或 Inf
+          则跳过本 batch（zero_grad + continue），不执行 backward / step，
+          防止 NaN 通过参数更新污染整个模型权重。
+        · 同时在 batch 日志中统计并打印 NaN 跳过次数，方便排查根因。
+        · 对已收集的有效 losses 做均值时加 `or [float('nan')]` 保护，
+          避免全 NaN epoch 时 np.mean([]) 引发 RuntimeWarning。
 """
 import math
 import time
@@ -163,6 +172,9 @@ def train_model(model, train_loader, val_loader, test_loader,
 
     null_val : 保留接口兼容性，不使用，统一无 mask 全量评估。
     prob     : True 时输出 [B, T_out, N, 2*F]，用 NLL loss，测试额外报告 CRPS
+
+    修复 [5]：每个 batch 计算 loss 后先检测 isfinite，NaN/Inf 时跳过该 batch，
+    防止梯度爆炸污染模型权重，同时在日志中打印跳过次数便于排查。
     """
     def _log(msg):
         (logger.info if logger else print)(msg)
@@ -177,6 +189,7 @@ def train_model(model, train_loader, val_loader, test_loader,
         model.train()
         t0 = time.time()
         losses = []
+        nan_skipped = 0  # 修复 [5]：记录本 epoch 跳过的 NaN batch 数
 
         for batch_idx, (x, y) in enumerate(train_loader, 1):
             # x: [B, T_in, N, F],  y: [B, T_out, N, F]
@@ -191,6 +204,15 @@ def train_model(model, train_loader, val_loader, test_loader,
             else:
                 loss = masked_mae(out, y)
 
+            # 修复 [5]：检测 NaN / Inf，若出现则跳过本 batch。
+            # 不执行 backward / step，防止 NaN 梯度更新污染模型权重。
+            # 原因：梯度爆炸首先体现为 loss=NaN，一旦 step() 执行，
+            # 权重也会变 NaN，之后所有 batch 的前向传播均输出 NaN，无法恢复。
+            if not torch.isfinite(loss):
+                nan_skipped += 1
+                optimizer.zero_grad()
+                continue
+
             loss.backward()
             if grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -201,10 +223,14 @@ def train_model(model, train_loader, val_loader, test_loader,
                 elapsed = time.time() - t0
                 eta = elapsed / batch_idx * (n_batches - batch_idx)
                 _log(f"  Epoch {epoch:3d} [{batch_idx:4d}/{n_batches}] "
-                     f"loss={float(np.mean(losses)):.4f}  "
+                     f"loss={float(np.mean(losses or [float('nan')])):.4f}  "
                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s")
 
-        tl = float(np.mean(losses))
+        # 修复 [5]：若本 epoch 出现过 NaN，在 epoch 行统一打印，不淹没 batch 日志
+        nan_warn = f"  [!] {nan_skipped} NaN batch(es) skipped" if nan_skipped > 0 else ""
+
+        # 用 `or [float('nan')]` 防止 losses 为空列表（全 epoch NaN）时 np.mean 报错
+        tl = float(np.mean(losses or [float("nan")]))
         history["train_loss"].append(tl)
 
         model.eval()
@@ -229,7 +255,7 @@ def train_model(model, train_loader, val_loader, test_loader,
             no_improve += 1
 
         _log(f"  Epoch {epoch:3d} | train={tl:.4f} | val={val_mae:.4f} | "
-             f"best={best_val:.4f} | {time.time()-t0:.1f}s")
+             f"best={best_val:.4f} | {time.time()-t0:.1f}s{nan_warn}")
         if no_improve >= patience:
             _log(f"  Early stop @ epoch {epoch}")
             break

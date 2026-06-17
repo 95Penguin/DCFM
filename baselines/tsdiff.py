@@ -35,9 +35,8 @@ TSDiff: Predict, Refine, Repeat — Rasul et al., NeurIPS 2023
       避免非连续内存张量传入 Conv1d 时引发隐式 copy 或警告。
   [5] sample() 和 compute_loss() 中仅使用第一个特征维（in_dim>1 时静默丢弃），
       现在在构造函数中加警告日志，防止用户误以为多特征全部被利用。
-  [6] 删除 sample() 中语义错误的 out_dim>1 repeat 分支：
-      backbone.output_proj 固定输出 1 通道，无法产出真实多特征预测，
-      repeat 只是复制同一数值。统一 assert out_dim=1，接口保持向后兼容。
+  [7] run_tsdiff 中 channels 加上限 min(..., 128)：cfm_hidden 为 GridCFN CFM 设计
+      （256~384），直接用于 TSDiff WaveNet 骨干会在大图（weather 1866节点）OOM。
 """
 import math
 import os
@@ -439,10 +438,12 @@ class TSDiff(nn.Module):
 # ── 内部评估（概率指标）──────────────────────────────────────────────────
 
 def _evaluate_tsdiff(model: "TSDiff", loader, device, scaler,
-                     null_val: float = None, logger=None) -> dict:
+                     null_val: float = None, logger=None,
+                     max_batches: int = None) -> dict:
     """
     评估概率预测指标。
     model.n_samples 已由调用方在调用前设置好，此处不重复覆盖。
+    max_batches: 若不为 None，只跑前 max_batches 个 batch（用于 val 快速估计）。
     """
     from baselines.utils import compute_prob_metrics
 
@@ -452,6 +453,8 @@ def _evaluate_tsdiff(model: "TSDiff", loader, device, scaler,
 
     with torch.no_grad():
         for i, (x, y) in enumerate(loader):
+            if max_batches is not None and i >= max_batches:
+                break
             x = x.to(device)
             t0 = time.time()
             raw = model.sample(x, return_samples=True)   # [S, B, N, T_out, 1]
@@ -490,13 +493,18 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
     train_loader, val_loader, test_loader = loaders
     d, m, t_cfg = cfg.data, cfg.model, cfg.train
 
-    channels        = getattr(m, "cfm_hidden",     64)
+    # cfm_hidden 是为 GridCFN 的 CFM 设计的（256~384），直接用于 TSDiff WaveNet 骨干
+    # 会在大图（weather 1866节点）上 OOM。上限 128 可覆盖所有数据集。
+    channels        = min(getattr(m, "cfm_hidden",     64), 128)
     n_layers        = getattr(m, "tcn_layers",       8)
     kernel_size     = getattr(m, "kernel_size",      3)
     diffusion_steps = getattr(m, "diffusion_steps", 100)
     n_samples_val   = getattr(t_cfg, "cfm_n_samples",      10)
     n_samples_test  = getattr(t_cfg, "cfm_n_samples_test", 50)
     node_emb_dim    = getattr(m, "env_dim",         16)
+    # 验证时最多用这么多 batch（防止大图上卡住）。默认 50 通常足够反映趋势。
+    # 可在 cfg.train 中设置 tsdiff_val_max_batches=N 覆盖。
+    val_max_batches = getattr(t_cfg, "tsdiff_val_max_batches", 50)
 
     model = TSDiff(
         num_nodes       = num_nodes,
@@ -559,10 +567,14 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
 
         avg_loss = epoch_loss / max(n_batches, 1)
 
-        # 验证：n_samples=1 大幅加速（100步×1样本 vs 100步×10样本）
+        # 验证：n_samples=1 大幅加速（100步×1样本 vs 100步×10样本）。
+        # 对大图（如 weather 1866节点）仍很慢：每 batch 跑 n_steps 次 backbone forward，
+        # 输入维度 [B*N, 1, T]，val 全集可能数千 batch。
+        # 修复：最多只跑 val_max_batches 个 batch 做快速监控，足以反映训练趋势。
         model.n_samples = 1
         val_m = _evaluate_tsdiff(model, val_loader, device, scaler,
-                                 null_val=null_val, logger=logger)
+                                 null_val=null_val, logger=logger,
+                                 max_batches=val_max_batches)
 
         scheduler.step(val_m["CRPS"])
         cur_lr  = optimizer.param_groups[0]["lr"]

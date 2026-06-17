@@ -325,15 +325,34 @@ class CLUBEstimator(nn.Module):
         )
         return log_prob.mean(dim=-1)
 
-    def _neg_perm(self, M, device):
+    # def _neg_perm(self, M, device):
+    #     perm = torch.randperm(M, device=device)
+    #     same = perm == torch.arange(M, device=device)
+    #     if same.any() and M > 1:
+    #         idx  = same.nonzero(as_tuple=True)[0]
+    #         swap = (idx + 1) % M
+    #         tmp          = perm[swap].clone()
+    #         perm[swap]   = perm[idx].clone()
+    #         perm[idx]    = tmp
+    #     return perm
+
+    def _neg_perm(self, M: int, device):
         perm = torch.randperm(M, device=device)
-        same = perm == torch.arange(M, device=device)
-        if same.any() and M > 1:
-            idx  = same.nonzero(as_tuple=True)[0]
-            swap = (idx + 1) % M
-            tmp          = perm[swap].clone()
-            perm[swap]   = perm[idx].clone()
-            perm[idx]    = tmp
+        arange = torch.arange(M, device=device)
+        clash = (perm == arange).nonzero(as_tuple=True)[0]
+        if len(clash) == 0:
+            return perm
+        if len(clash) >= 2:
+            # clash>=2：整体循环右移一位，数学保证无不动点且仍是合法置换。
+            roll_idx = torch.roll(torch.arange(len(clash), device=device), 1)
+            perm[clash] = perm[clash[roll_idx]].clone()
+        else:
+            # clash==1：torch.roll 单元素无效，与任意非clash位置交换。
+            # 置换特性保证交换后两个位置均无不动点。
+            i = int(clash[0])
+            non_clash = (perm != arange).nonzero(as_tuple=True)[0]
+            j = int(non_clash[0])
+            perm[i], perm[j] = perm[j].clone(), perm[i].clone()
         return perm
 
     def forward(self, x, y):
@@ -543,7 +562,6 @@ class GridCFN(nn.Module):
         ms_dilations=(1, 7, 30),
         T_out=1,
         T_in=None,
-        adap_dim=16,
         dropout=0.1,
     ):
         super().__init__()

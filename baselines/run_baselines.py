@@ -7,6 +7,7 @@ baselines/run_baselines.py
   uv run baselines/run_baselines.py --preset electricity --models dcrnn mtgnn stid
   uv run baselines/run_baselines.py --preset weather --models ha stid --gpu_id 0
   uv run baselines/run_baselines.py --preset sdwpf --models dcrnn tsflow k2vae
+  uv run baselines/run_baselines.py --preset pjm --models ha var dcrnn mtgnn
 
 所有结果保存在 result/baselines/<dataset>/<timestamp>/
 
@@ -14,6 +15,14 @@ baselines/run_baselines.py
   [1] load_weather 调用补全 feature_idx 参数
   [2] null_val 统一传 None：全量无 mask 评估，与 GridCFN 主模型对齐，
       方便与文献直接对比。
+  [3] 补全 pjm 数据集支持（import、load_data 分支、--preset choices）
+  [6] run_agcrn 中学习率由 3e-3 降至 5e-4，并收紧 weight_decay 至 1e-3：
+        · 日志显示 Epoch 1 后半段 loss 从 0.41 升至 0.61，是 lr 过大导致
+          参数开始震荡的典型表现。原 lr=3e-3 在图卷积梯度尚不稳定时
+          （配合修复 [4] 后仍需保守起步）仍可能引发震荡。
+        · 降至 5e-4 与 DCRNN/STGCN 等其他基线保持同一量级，
+          同时加强 weight_decay 抑制嵌入向量的范数无限增大。
+        · scheduler patience 从 10 降至 8，让 ReduceLROnPlateau 更快介入。
 """
 
 import argparse
@@ -31,7 +40,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import get_config
-from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf
+from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf, load_pjm
 
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────
@@ -73,6 +82,7 @@ def setup_logger(log_path: str, name: str = "baselines") -> logging.Logger:
 def load_data(cfg):
     """
     修复 [1]：load_weather 补全 feature_idx 参数。
+    修复 [3]：补全 pjm 数据集支持，与 main.py 保持一致。
     """
     d = cfg.data
     if d.dataset == "solar":
@@ -82,20 +92,24 @@ def load_data(cfg):
         return load_electricity(d.data_path, d.T_in, d.T_out,
                                 d.adj_threshold, d.batch_size)
     elif d.dataset == "weather":
-        # 修复：补全 feature_idx 参数，与 main.py 保持一致
+        # 修复 [1]：补全 feature_idx 参数，与 main.py 保持一致
         return load_weather(d.data_path, d.T_in, d.T_out,
                             d.adj_threshold, d.batch_size,
                             feature_idx=getattr(d, "weather_feature_idx", 0))
     elif d.dataset == "sdwpf":
         return load_sdwpf(d.data_path, d.T_in, d.T_out,
                           d.adj_threshold, d.batch_size)
+    elif d.dataset == "pjm":
+        # 修复 [3]：补全 pjm 分支
+        return load_pjm(d.data_path, d.T_in, d.T_out,
+                        d.adj_threshold, d.batch_size)
     else:
         raise ValueError(d.dataset)
 
 
 def _get_null_val(dataset: str, scaler) -> None:
     """
-    统一返回 None：所有数据集均无 mask，全量评估，与 GridCFN 主模型对齐。
+    统一返回 None：所有数据集均无 mask，全量评估，与 GridCFN 对齐。
     null_val 参数在各函数中保留接口但不使用。
     """
     return None
@@ -250,9 +264,14 @@ def run_agcrn(loaders, adj, cfg, device, save_dir, logger,
     ).to(device)
     logger.info(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3, weight_decay=1e-4)
+    # 修复 [6]：lr 由 3e-3 降至 5e-4，weight_decay 由 1e-4 升至 1e-3，
+    # scheduler patience 由 10 降至 8。
+    # 原 lr=3e-3 过大：Epoch 1 后半段 loss 从 0.41→0.61 明显上升，
+    # 说明参数已在震荡，配合修复 [4]（图稳定性）后仍需保守的学习率起步。
+    # weight_decay 加强防止 node_embeddings 范数无限增大（它不受 grad_clip 控制）。
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=10, factor=0.5)
+        optimizer, patience=8, factor=0.5)
 
     return train_model(
         model, train_loader, val_loader, test_loader,
@@ -338,6 +357,9 @@ def run_csdi(loaders, adj, cfg, device, save_dir, logger,
     max_epochs = cfg.train.max_epochs
     save_path  = os.path.join(save_dir, "csdi_best.pt")
     history    = {"train_loss": [], "val_mae": []}
+    # 验证时最多跑这么多 batch，防止大图上的 DDPM 逆向采样把 val 卡住。
+    # 可在 cfg.train 中设置 csdi_val_max_batches=N 覆盖。
+    val_max_batches = getattr(cfg.train, "csdi_val_max_batches", 50)
 
     for epoch in range(1, max_epochs + 1):
         model.train()
@@ -366,10 +388,12 @@ def run_csdi(loaders, adj, cfg, device, save_dir, logger,
         vm = []
         t_val = time.time()
         with torch.no_grad():
-            for x, y in val_loader:
+            for batch_i, (x, y) in enumerate(val_loader):
+                if batch_i >= val_max_batches:
+                    break
                 x, y = x.to(device), y.to(device)
-                pred = model(x)
-                vm.append(masked_mae(pred, y, null_val).item())
+                pred = model(x)                              # [B, T_out, N, 1]
+                vm.append(masked_mae(pred, y[..., :1], null_val).item())
         val_mae = float(np.mean(vm))
         model.n_samples = 10
         history["val_mae"].append(val_mae)
@@ -480,7 +504,7 @@ MODEL_REGISTRY = {
     "mtgnn":    run_mtgnn,
     "agcrn":    run_agcrn,
     "stid":     run_stid,
-    "tsflow":   run_tsflow, 
+    "tsflow":   run_tsflow,
     "patchtst": run_patchtst,
     "k2vae":    run_k2vae,
     "tsdiff":   run_tsdiff,
@@ -493,7 +517,7 @@ MODEL_REGISTRY = {
 def main():
     parser = argparse.ArgumentParser(description="GridCFN Baselines Runner (Multi-Step)")
     parser.add_argument("--preset", type=str, default="solar",
-                        choices=["solar", "electricity", "weather", "sdwpf"])
+                        choices=["solar", "electricity", "weather", "sdwpf", "pjm"])
     parser.add_argument("--models", nargs="+",
                         default=list(MODEL_REGISTRY.keys()),
                         choices=list(MODEL_REGISTRY.keys()),

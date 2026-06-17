@@ -100,7 +100,7 @@ def load_data(cfg):
         raise ValueError(f"未知数据集: '{d.dataset}'")
 
 
-def build_model(cfg, in_dim=None, n_nodes=None):
+def build_model(cfg, in_dim=None, n_nodes=None, wind_mask=None):
     m = cfg.model
     return GridCFN(
         n_nodes=n_nodes,
@@ -115,12 +115,11 @@ def build_model(cfg, in_dim=None, n_nodes=None):
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
         T_out=cfg.data.T_out,
         T_in=cfg.data.T_in,
-        adap_dim=getattr(m, "adap_dim", 16),
-        # ── DMSD 新增参数 ──────────────────────────────────────────────
+        # adap_dim 已移除：GridCFN 从未实际使用该参数
         rank_r=getattr(m, "rank_r", 8),
         lambda_rank=getattr(m, "lambda_rank", 0.01),
         freq_candidates=getattr(m, "freq_candidates", (12, 24, 48, 96)),
-        wind_mask=None,   # SDWPF 风向掩码：如有元数据可在此传入 [N,N] tensor
+        wind_mask=wind_mask,   # SDWPF 风向掩码由 main() 构造后传入
     )
 
 
@@ -148,7 +147,25 @@ def main(cfg):
     n_nodes    = adj.shape[0]
     logger.info(f"Graph      : {n_nodes} nodes, {edge_index.shape[1]} edges")
 
-    model    = build_model(cfg, in_dim=in_dim, n_nodes=n_nodes).to(device)
+    # ── SDWPF 风向掩码：从坐标文件构造有向尾流掩码 ──────────────────────────
+    # 若坐标文件不存在，wind_mask=None，SparseGCN 退化为无向自适应图（仍可训练）
+    wind_mask = None
+    if cfg.data.dataset == "sdwpf":
+        from wind_mask_utils import build_wind_mask_from_csv
+        coord_path = os.path.join(os.path.dirname(cfg.data.data_path), "sdwpf_turb_location.csv")
+        if os.path.exists(coord_path):
+            wind_mask = build_wind_mask_from_csv(coord_path, angle_tol=45.0)
+            logger.info(f"WindMask   : 已加载，shape={tuple(wind_mask.shape)}，"
+                        f"非零边={int(wind_mask.sum())} / {n_nodes * n_nodes}")
+        else:
+            logger.info(f"WindMask   : 坐标文件未找到（{coord_path}），跳过风向掩码")
+    if wind_mask is not None and wind_mask.shape[0] != n_nodes:
+        raise ValueError(
+            f"wind_mask 台数 {wind_mask.shape[0]} 与数据节点数 n_nodes={n_nodes} 不一致，"
+            f"请检查坐标文件与数据文件的风机数量是否匹配。"
+        )
+
+    model    = build_model(cfg, in_dim=in_dim, n_nodes=n_nodes, wind_mask=wind_mask).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Parameters : {n_params:,}  (cfm_dim={model.cfm_dim})\n")
 

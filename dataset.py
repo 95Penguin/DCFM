@@ -249,10 +249,19 @@ def load_pjm(data_path: str, T_in: int = 168, T_out: int = 1,
         if time_col is None:
             continue
             
-        # 2. 强力转换为无时区统一时间戳
+        # 2. 强力转换为无时区统一时间戳（先转 UTC 再去掉 tzinfo）
+        # 修复：原来用 dt.tz_localize(None) 仅去掉 tzinfo 标签但保留本地墙上时间，
+        # 导致不同 UTC 偏移的文件（如 -05:00 与 -04:00）合并后时间轴错位。
+        # 正确做法：先 tz_convert('UTC') 统一到 UTC，再 tz_localize(None) 去标签。
+        # 对于本来就是 tz-naive 的列，dt.tz_localize('UTC') 先标记再转换。
         df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
         df = df.dropna(subset=[time_col])
-        df[time_col] = df[time_col].dt.tz_localize(None)
+        if df[time_col].dt.tz is not None:
+            # tz-aware：先转 UTC，再去掉 tz 标签（保留 UTC 时刻）
+            df[time_col] = df[time_col].dt.tz_convert('UTC').dt.tz_localize(None)
+        else:
+            # tz-naive：假定已是 UTC，直接使用（不做额外转换）
+            pass
         
         # 3. 去重并设为索引
         df = df.drop_duplicates(subset=[time_col])
@@ -362,6 +371,7 @@ def _parse_time_step(df: pd.DataFrame) -> pd.Series:
 
 
 def _clean_sdwpf(df: pd.DataFrame) -> pd.DataFrame:
+    # ── 原有 Patv 清洗逻辑不变 ──
     df.loc[df['Patv'] < 0, 'Patv'] = 0.0
     if 'Wspd' in df.columns:
         mask_stop = (df['Patv'] <= 0) & (df['Wspd'] > 2.5)
@@ -376,6 +386,15 @@ def _clean_sdwpf(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             mask_temp = (df[col] < -40) | (df[col] > 80)
             df.loc[mask_temp, 'Patv'] = np.nan
+
+    # ── 新增：辅助特征自身的异常值也置 NaN，交给后续插值处理 ──
+    if 'Wspd' in df.columns:
+        df.loc[(df['Wspd'] < 0) | (df['Wspd'] > 50), 'Wspd'] = np.nan  # 风速物理上限 ~50m/s
+    if 'Etmp' in df.columns:
+        df.loc[(df['Etmp'] < -40) | (df['Etmp'] > 80), 'Etmp'] = np.nan
+    if 'Pab1' in df.columns:
+        df.loc[(df['Pab1'] < 0) | (df['Pab1'] > 90), 'Pab1'] = np.nan  # 桨距角 0-90°
+
     return df
 
 
