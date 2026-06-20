@@ -3,7 +3,7 @@ baselines/run_baselines.py
 统一 baseline 运行入口（多步预测版），与 GridCFN 的 main.py 接口一致。
 
 用法:
-  uv run baselines/run_baselines.py --preset solar
+  uv run baselines/run_baselines.py --preset solar --models tsdiff stid
   uv run baselines/run_baselines.py --preset electricity --models dcrnn mtgnn stid
   uv run baselines/run_baselines.py --preset weather --models ha stid --gpu_id 0
   uv run baselines/run_baselines.py --preset sdwpf --models dcrnn tsflow k2vae
