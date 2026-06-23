@@ -1,0 +1,7 @@
+experiment,MAE,RMSE,MAPE,CRPS,PICP,PINAW,best_val_CRPS,epochs_run,best_T
+noclub__noclub_ms_scgmp_rank_wind,0.93,2.2594,17519259.4511,0.6561,0.9338,0.0445,0.0672,60,0.8
+noms__club_noms_scgmp_rank_wind,0.8861,2.2152,17564298.0111,0.6336,0.9513,0.0462,0.0645,73,0.9
+noscgmp__club_ms_noscgmp_rank_wind,0.8771,2.2108,16151311.3855,0.6262,0.9377,0.0431,0.0644,82,0.8
+nomsscgmp__club_noms_noscgmp_rank_wind,0.8421,2.2075,13104825.4385,0.6113,0.9461,0.0412,0.0642,114,0.9
+norank__club_ms_scgmp_norank_wind,0.8888,2.2868,14650891.2573,0.6431,0.9352,0.0412,0.0665,105,0.8
+none__noclub_noms_noscgmp_norank_nowind,0.8774,2.2339,15300409.3056,0.6309,0.9445,0.0431,0.0644,126,0.9

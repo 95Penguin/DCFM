@@ -28,6 +28,8 @@ from config import ... 之前执行，否则会报 ModuleNotFoundError。
   python ablation/run_ablation.py --preset solar --only full noclub noms
   uv run ablation/run_ablation.py --preset solar --only full noclub noms
   uv run ablation/run_ablation.py --preset solar --only noclub noms noscgmp nomsscgmp norank none
+  uv run ablation/run_ablation.py --preset solar --only noCFM_det noCFM_gauss
+
 
 实验组合（默认跑全部）：
   full        完整模型（CLUB + MultiScaleContext + SCGMP + RankLoss，全开）
@@ -54,13 +56,18 @@ import sys
 # __file__ 是 .../GridCFN/ablation/run_ablation.py
 # os.path.dirname(__file__) 是 .../GridCFN/ablation
 # 再上一级 os.path.dirname(...) 就是 .../GridCFN，即项目根目录
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ABLATION_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT  = os.path.dirname(_ABLATION_DIR)
+# 项目根目录：让 from model/config/train/dataset import ... 找到目标
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+# ablation/ 目录自身：让 from ablation_model/ablation_train import ... 找到目标
+if _ABLATION_DIR not in sys.path:
+    sys.path.insert(0, _ABLATION_DIR)
 
 import argparse
-import copy
 import json
+import logging
 import random
 from datetime import datetime
 
@@ -82,14 +89,23 @@ from ablation_train import ablation_train
 
 def get_ablation_configs(only=None):
     configs = {
-        "full":    AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=True,  use_rank_loss=True,  use_wind_mask=True,  name="full"),
-        "noclub":  AblationConfig(use_club=False, use_ms_context=True,  use_scgmp=True,  use_rank_loss=True,  use_wind_mask=True,  name="noclub"),
-        "noms":    AblationConfig(use_club=True,  use_ms_context=False, use_scgmp=True,  use_rank_loss=True,  use_wind_mask=True,  name="noms"),
-        "noscgmp": AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=False, use_rank_loss=True,  use_wind_mask=True,  name="noscgmp"),
-        "norank":  AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=True,  use_rank_loss=False, use_wind_mask=True,  name="norank"),
-        "nowind":  AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=True,  use_rank_loss=True,  use_wind_mask=False, name="nowind"),
-        "nomsscgmp": AblationConfig(use_club=True, use_ms_context=False, use_scgmp=False, use_rank_loss=True,  use_wind_mask=True,  name="nomsscgmp"),
-        "none":    AblationConfig(use_club=False, use_ms_context=False, use_scgmp=False, use_rank_loss=False, use_wind_mask=False, name="none"),
+        # ── 基础消融组 ───────────────────────────────────────────────────────
+        "full":      AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=True,  use_rank_loss=True,  use_wind_mask=True,  cfm_head="cfm",           name="full"),
+        "noclub":    AblationConfig(use_club=False, use_ms_context=True,  use_scgmp=True,  use_rank_loss=True,  use_wind_mask=True,  cfm_head="cfm",           name="noclub"),
+        "noms":      AblationConfig(use_club=True,  use_ms_context=False, use_scgmp=True,  use_rank_loss=True,  use_wind_mask=True,  cfm_head="cfm",           name="noms"),
+        "noscgmp":   AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=False, use_rank_loss=True,  use_wind_mask=True,  cfm_head="cfm",           name="noscgmp"),
+        "norank":    AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=True,  use_rank_loss=False, use_wind_mask=True,  cfm_head="cfm",           name="norank"),
+        "nowind":    AblationConfig(use_club=True,  use_ms_context=True,  use_scgmp=True,  use_rank_loss=True,  use_wind_mask=False, cfm_head="cfm",           name="nowind"),
+        "nomsscgmp": AblationConfig(use_club=True,  use_ms_context=False, use_scgmp=False, use_rank_loss=True,  use_wind_mask=True,  cfm_head="cfm",           name="nomsscgmp"),
+        "none":      AblationConfig(use_club=False, use_ms_context=False, use_scgmp=False, use_rank_loss=False, use_wind_mask=False, cfm_head="cfm",           name="none"),
+        # ── CFM 输出头消融（变体 A / B）────────────────────────────────────
+        # 变体 A：去掉概率建模，换成确定性 MLP 点预测头（MSE 训练）
+        #   回答：CFM 的概率框架整体上是否有价值？
+        #   CRPS 退化为 MAE，PICP/PINAW 意义弱但数值合法（区间宽度 = 0）。
+        "noCFM_det":   AblationConfig(use_club=True, use_ms_context=True, use_scgmp=True, use_rank_loss=True, use_wind_mask=True, cfm_head="deterministic", name="noCFM_det"),
+        # 变体 B：保留概率输出，但用参数化高斯替换 CFM（NLL 训练，采样自 N(μ,σ²)）
+        #   回答：CFM 的非高斯/多模分布建模能力是否相比简单高斯有优势？
+        "noCFM_gauss": AblationConfig(use_club=True, use_ms_context=True, use_scgmp=True, use_rank_loss=True, use_wind_mask=True, cfm_head="gaussian",       name="noCFM_gauss"),
     }
     if only:
         missing = [k for k in only if k not in configs]
@@ -184,6 +200,7 @@ def build_wind_mask_if_needed(cfg, n_nodes):
 def run_single_ablation(cfg, ablation: AblationConfig, device,
                          train_loader, val_loader, test_loader,
                          adj_norm, edge_index, in_dim, n_nodes, wind_mask,
+                         scaler,
                          result_root: str, logger=None):
     """
     跑一组消融配置，返回包含 test 指标的 dict（已写入 history json）。
@@ -209,7 +226,7 @@ def run_single_ablation(cfg, ablation: AblationConfig, device,
         model=model,
         train_loader=train_loader, val_loader=val_loader, test_loader=test_loader,
         adj_norm=adj_norm, edge_index=edge_index, device=device,
-        cfg_train=cfg.train, scaler=cfg._scaler, logger=logger,
+        cfg_train=cfg.train, scaler=scaler, logger=logger,
         save_path=save_path,
     )
 
@@ -232,23 +249,32 @@ def run_single_ablation(cfg, ablation: AblationConfig, device,
 def summarize(results: dict, result_root: str):
     """
     results: {tag: history_dict}
-    生成 summary.csv 和 summary.md，汇报指标取"反归一化域校准后"
-    （history['test_metrics']，与 train.py 主报告口径一致，物理量纲可读）。
+    生成 summary.csv 和 summary.md，同时汇报：
+      - 反归一化域校准后指标：history['test_metrics']，物理量纲可读；
+      - 归一化域校准后指标：history['test_metrics_norm']，便于跨数据集/尺度比较。
     """
     rows = []
     for tag, hist in results.items():
         tm = hist["test_metrics"]
+        tm_norm = hist.get("test_metrics_norm", {})
         rows.append({
-            "experiment":   tag,
-            "MAE":          round(tm["MAE"], 4),
-            "RMSE":         round(tm["RMSE"], 4),
-            "MAPE":         round(tm["MAPE"], 4),
-            "CRPS":         round(tm["CRPS"], 4),
-            "PICP":         round(tm["PICP"], 4),
-            "PINAW":        round(tm["PINAW"], 4),
+            "experiment":    tag,
+            "cfm_head":      hist.get("ablation_cfm_head", "cfm"),
+            "MAE":           round(tm["MAE"], 4),
+            "RMSE":          round(tm["RMSE"], 4),
+            "MAPE":          round(tm["MAPE"], 4),
+            "CRPS":          round(tm["CRPS"], 4),
+            "PICP":          round(tm["PICP"], 4),
+            "PINAW":         round(tm["PINAW"], 4),
+            "MAE_norm":      round(tm_norm["MAE"], 4) if "MAE" in tm_norm else np.nan,
+            "RMSE_norm":     round(tm_norm["RMSE"], 4) if "RMSE" in tm_norm else np.nan,
+            "MAPE_norm":     round(tm_norm["MAPE"], 4) if "MAPE" in tm_norm else np.nan,
+            "CRPS_norm":     round(tm_norm["CRPS"], 4) if "CRPS" in tm_norm else np.nan,
+            "PICP_norm":     round(tm_norm["PICP"], 4) if "PICP" in tm_norm else np.nan,
+            "PINAW_norm":    round(tm_norm["PINAW"], 4) if "PINAW" in tm_norm else np.nan,
             "best_val_CRPS": round(hist["best_val_crps"], 4),
-            "epochs_run":   hist["n_epochs_run"],
-            "best_T":       round(hist["best_temperature"], 3),
+            "epochs_run":    hist["n_epochs_run"],
+            "best_T":        round(hist["best_temperature"], 3),
         })
     df = pd.DataFrame(rows).set_index("experiment")
 
@@ -264,8 +290,11 @@ def summarize(results: dict, result_root: str):
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# 消融实验汇总（{datetime.now().strftime('%Y-%m-%d %H:%M')}）\n\n")
         f.write(df.to_markdown())
-        f.write("\n\n注：以上指标为反归一化域、温度校准后的测试集结果，"
-                "CRPS/MAE/RMSE/PINAW 越小越好，PICP 越接近 0.95 越好。\n")
+        f.write("\n\n注：无后缀指标为反归一化域、温度校准后的测试集结果；"
+                "`*_norm` 指标为归一化域、温度校准后的测试集结果。"
+                "CRPS/MAE/RMSE/PINAW 越小越好，PICP 越接近 0.95 越好。\n"
+                "noCFM_det（确定性头）的 CRPS 在数值上等于 MAE，"
+                "PICP/PINAW 因区间宽度为 0 无概率意义，仅供参考。\n")
 
     print(f"\n汇总表已保存:\n  CSV : {csv_path}\n  MD  : {md_path}\n")
     print(df.to_string())
@@ -313,7 +342,6 @@ def main():
     result_root = os.path.join(PROJECT_ROOT, "ablation_results", cfg.data.dataset, timestamp)
     os.makedirs(result_root, exist_ok=True)
 
-    import logging
     logger = logging.getLogger("gridcfn.ablation.main")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
@@ -331,7 +359,6 @@ def main():
 
     # ── 数据只加载一次，所有消融组共享同一份划分，保证公平对比 ──
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
-    cfg._scaler = scaler   # 挂在 cfg 上方便 run_single_ablation 取用，不污染 dataclass 字段
 
     adj_norm   = GridCFN.normalize_adj(adj)
     edge_index = GridCFN.adj_to_edge_index(adj)
@@ -343,6 +370,12 @@ def main():
         logger.info(f"WindMask: shape={tuple(wind_mask.shape)}, 非零边={int(wind_mask.sum())}")
 
     ablation_configs = get_ablation_configs(only=args.only)
+
+    # nowind 对非 sdwpf 数据集 wind_mask 本来就是 None，消融无实际效果，跳过避免浪费算力
+    if cfg.data.dataset != "sdwpf" and "nowind" in ablation_configs and args.only is None:
+        del ablation_configs["nowind"]
+        logger.info("非 sdwpf 数据集，自动跳过 nowind 实验（wind_mask=None，该开关无效果）")
+
     logger.info(f"将运行 {len(ablation_configs)} 组消融实验: {list(ablation_configs.keys())}")
 
     results = {}
@@ -351,6 +384,7 @@ def main():
             cfg, ablation, device,
             train_loader, val_loader, test_loader,
             adj_norm, edge_index, in_dim, n_nodes, wind_mask,
+            scaler=scaler,
             result_root=result_root, logger=logger,
         )
         results[ablation.tag()] = history

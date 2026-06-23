@@ -18,14 +18,25 @@
 都是纯函数，不依赖具体是 GridCFN 还是 AblationGridCFN，可以直接拿来用。
 """
 
+import os
+import sys
+
+# ── 路径处理：把项目根目录插入 sys.path ──────────────────────────────────────
+# 本文件位于 GridCFN/ablation/ablation_train.py，上一级是项目根目录
+_HERE         = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 import time
 import logging
 from typing import Dict
 
-import numpy as np
 import torch
 
-from train import evaluate, calibrate_temperature, picp_empirical, evaluate_all
+from train import evaluate, calibrate_temperature, evaluate_all
 from ablation_model import AblationGridCFN, AblationConfig
 
 
@@ -43,7 +54,7 @@ def ablation_train_one_epoch(
     warmup_epochs:    int = 5,
     cfm_n_t_samples:  int = 4,
     sigma_min:        float = 0.01,
-    club_inner_steps: int = 3,
+    club_inner_steps: int = 5,
 ) -> Dict[str, float]:
     model.train()
     total_loss = total_cfm = total_mi = total_rank = total_var = total_gnorm = 0.0
@@ -158,13 +169,17 @@ def ablation_train(
     use_club = model.ablation.use_club
 
     # club_e/club_s 的参数始终从 main_params 里排除：use_club=True 时它们由
-    # club_optimizer 单独更新；use_club=False 时它们完全不参与 forward，
-    # 自然也不需要梯度更新，留在 main_params 里没有意义，只会白白占用内存。
+    # club_optimizer 单独更新；use_club=False 时它们完全不参与 forward。
+    # 同时过滤 requires_grad=False 的参数（如替代头实验里被冻结的 vector_field），
+    # 避免它们进入 clip_grad_norm_ 带来无效开销。
     club_param_ids = (
         {id(p) for p in model.club_e.parameters()} |
         {id(p) for p in model.club_s.parameters()}
     )
-    main_params = [p for p in model.parameters() if id(p) not in club_param_ids]
+    main_params = [
+        p for p in model.parameters()
+        if p.requires_grad and id(p) not in club_param_ids
+    ]
 
     if use_club:
         club_optimizer = torch.optim.Adam(
@@ -198,7 +213,7 @@ def ablation_train(
         "val_crps": [], "val_mae": [], "val_rmse": [],
     }
 
-    logger.info(f"[Ablation:{model.ablation.tag()}] 开始训练")
+    logger.info(f"[Ablation:{model.ablation.tag()}] 开始训练  cfm_head={model.ablation.cfm_head}")
     for epoch in range(1, cfg_train.max_epochs + 1):
         t0 = time.time()
         train_m = ablation_train_one_epoch(
@@ -253,6 +268,10 @@ def ablation_train(
     model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
 
     # ── 温度校准（与 train.py 完全一致的口径） ──
+    # 确定性头（cfm_head="deterministic"）的所有 S 份样本完全相同，
+    # mu + T*(samples - mu) = mu 对任意 T 恒成立，calibration 无意义，直接用 T=1.0。
+    is_deterministic = (model.ablation.cfm_head == "deterministic")
+
     _, samples_val_norm, y_val_norm = evaluate(
         model, val_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
@@ -260,7 +279,11 @@ def ablation_train(
         temperature=1.0, inverse_transform=False,
         sigma_min=sigma_min, x0_scale=x0_scale,
     )
-    best_T = calibrate_temperature(samples_val_norm, y_val_norm, target_coverage=0.95)
+    if is_deterministic:
+        best_T = 1.0
+        logger.info(f"[{model.ablation.tag()}] 确定性头，跳过温度校准，best_T 固定为 1.0")
+    else:
+        best_T = calibrate_temperature(samples_val_norm, y_val_norm, target_coverage=0.95)
 
     # ── 测试集评估 ──
     _, samples_test_norm, y_test_norm = evaluate(
@@ -289,5 +312,6 @@ def ablation_train(
     history["best_temperature"]      = best_T
     history["best_val_crps"]         = best_val_crps
     history["ablation_tag"]          = model.ablation.tag()
+    history["ablation_cfm_head"]     = model.ablation.cfm_head
     history["n_epochs_run"]          = epoch
     return history

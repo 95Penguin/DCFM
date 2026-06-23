@@ -26,10 +26,12 @@ baselines/run_baselines.py
 """
 
 import argparse
+import csv
 import json
 import logging
 import os
 import random
+import signal
 import sys
 import time
 from datetime import datetime
@@ -113,6 +115,145 @@ def _get_null_val(dataset: str, scaler) -> None:
     null_val 参数在各函数中保留接口但不使用。
     """
     return None
+
+
+def _json_default(o):
+    if isinstance(o, (np.floating,)):
+        return float(o)
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.ndarray,)):
+        return o.tolist()
+    return str(o)
+
+
+def _metric(res: dict, key: str, norm: bool = False):
+    metrics = res.get("test_metrics", {}) if isinstance(res, dict) else {}
+    if norm:
+        direct_key = f"test_{key.lower()}_norm"
+        metric_key = f"{key}_norm"
+    else:
+        direct_key = f"test_{key.lower()}"
+        metric_key = key
+    return res.get(direct_key, metrics.get(metric_key, float("nan")))
+
+
+def _summary_rows(all_results: dict):
+    rows = []
+    for name, res in all_results.items():
+        row = {"model": name}
+        if not isinstance(res, dict):
+            row.update({"status": "ERROR", "error": "invalid result"})
+        elif "error" in res:
+            row.update({"status": "ERROR", "error": res["error"]})
+        elif not res or (
+            "test_metrics" not in res
+            and not any(k.startswith("test_") for k in res)
+        ):
+            row.update({"status": "ERROR", "error": "no test metrics returned"})
+        else:
+            row.update({
+                "status": "OK",
+                "error": "",
+                "MAE": _metric(res, "MAE"),
+                "RMSE": _metric(res, "RMSE"),
+                "MAPE": _metric(res, "MAPE"),
+                "CRPS": _metric(res, "CRPS"),
+                "MAE_norm": _metric(res, "MAE", norm=True),
+                "RMSE_norm": _metric(res, "RMSE", norm=True),
+                "MAPE_norm": _metric(res, "MAPE", norm=True),
+                "CRPS_norm": _metric(res, "CRPS", norm=True),
+            })
+        rows.append(row)
+    return rows
+
+
+def _format_value(value):
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            return ""
+        return f"{value:.4f}"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    return value
+
+
+def save_summaries(all_results: dict, save_dir: str, dataset: str, ts: str, logger=None):
+    rows = _summary_rows(all_results)
+    result_path = os.path.join(save_dir, f"baselines_results_{dataset}_{ts}.json")
+    csv_path = os.path.join(save_dir, "summary.csv")
+    md_path = os.path.join(save_dir, "summary.md")
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(all_results, f, indent=2, ensure_ascii=False, default=_json_default)
+
+    fieldnames = [
+        "model", "status",
+        "MAE", "RMSE", "MAPE", "CRPS",
+        "MAE_norm", "RMSE_norm", "MAPE_norm", "CRPS_norm",
+        "error",
+    ]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _format_value(row.get(k, "")) for k in fieldnames})
+
+    table_rows = [
+        {k: _format_value(row.get(k, "")) for k in fieldnames}
+        for row in rows
+    ]
+    widths = {
+        k: max(len(k), *(len(str(row.get(k, ""))) for row in table_rows))
+        for k in fieldnames
+    }
+
+    def md_row(row):
+        return "| " + " | ".join(str(row.get(k, "")).ljust(widths[k]) for k in fieldnames) + " |"
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(f"# Baseline 汇总（{dataset}, {ts}）\n\n")
+        f.write(md_row({k: k for k in fieldnames}) + "\n")
+        f.write("| " + " | ".join("-" * widths[k] for k in fieldnames) + " |\n")
+        for row in table_rows:
+            f.write(md_row(row) + "\n")
+        f.write("\n注：无后缀指标为反归一化域；`*_norm` 指标为归一化域。ERROR 行表示该模型运行失败，但其他模型结果已保留。\n")
+
+    if logger:
+        logger.info(f"Summary saved: {csv_path}")
+        logger.info(f"Summary saved: {md_path}")
+        logger.info(f"Results saved: {result_path}")
+    return result_path, csv_path, md_path
+
+
+class _Timeout:
+    def __init__(self, seconds: int, label: str):
+        self.seconds = int(seconds or 0)
+        self.label = label
+        self.enabled = self.seconds > 0 and hasattr(signal, "SIGALRM")
+        self.prev_handler = None
+        self.prev_alarm = 0
+
+    def __enter__(self):
+        if not self.enabled:
+            return self
+        self.prev_handler = signal.getsignal(signal.SIGALRM)
+        self.prev_alarm = signal.alarm(0)
+
+        def _handler(signum, frame):
+            raise TimeoutError(f"{self.label} exceeded {self.seconds}s")
+
+        signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(self.seconds)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self.prev_handler)
+            if self.prev_alarm:
+                signal.alarm(self.prev_alarm)
+        return False
 
 
 # ── 各 baseline 工厂函数 ──────────────────────────────────────────────────
@@ -523,6 +664,8 @@ def main():
                         choices=list(MODEL_REGISTRY.keys()),
                         help="要运行的 baseline 列表")
     parser.add_argument("--gpu_id", type=int, default=-1)
+    parser.add_argument("--model_timeout_minutes", type=float, default=0.0,
+                        help="单个 baseline 的最长运行分钟数；0 表示不启用超时")
     args = parser.parse_args()
 
     cfg     = get_config(args.preset)
@@ -540,6 +683,8 @@ def main():
     logger.info(f"T_out    : {cfg.data.T_out} (multi-step)")
     logger.info(f"Device   : {device}")
     logger.info(f"Models   : {args.models}")
+    logger.info(f"Timeout  : {args.model_timeout_minutes} min per model"
+                if args.model_timeout_minutes > 0 else "Timeout  : disabled")
     logger.info(f"Save dir : {save_dir}")
 
     # 加载数据
@@ -553,17 +698,23 @@ def main():
     logger.info(f"null_val: None (无 mask，全量评估，与 GridCFN 统一)")
 
     all_results = {}
+    timeout_seconds = int(args.model_timeout_minutes * 60)
 
     for model_name in args.models:
         try:
             fn = MODEL_REGISTRY[model_name]
-            result = fn(loaders, adj, cfg, device, save_dir, logger,
-                        in_dim=in_dim, num_nodes=num_nodes,
-                        scaler=scaler, null_val=null_val)
+            with _Timeout(timeout_seconds, model_name):
+                result = fn(loaders, adj, cfg, device, save_dir, logger,
+                            in_dim=in_dim, num_nodes=num_nodes,
+                            scaler=scaler, null_val=null_val)
             all_results[model_name] = result
+            save_summaries(all_results, save_dir, dataset, ts, logger=logger)
         except Exception as e:
             logger.error(f"[{model_name}] FAILED: {e}", exc_info=True)
             all_results[model_name] = {"error": str(e)}
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            save_summaries(all_results, save_dir, dataset, ts, logger=logger)
 
     # ── 汇总表 ────────────────────────────────────────────────────────────
     W = 84
@@ -596,14 +747,7 @@ def main():
             logger.info(f"{name:<12} {mae:>10.4f} {rmse:>10.4f} {mape:>10.2f} {crps:>10.4f}")
     logger.info("=" * W)
 
-    # 保存 JSON
-    result_path = os.path.join(save_dir,
-                               f"baselines_results_{dataset}_{ts}.json")
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(all_results, f, indent=2, ensure_ascii=False,
-                  default=lambda o: float(o)
-                  if isinstance(o, (np.floating,)) else str(o))
-    logger.info(f"Results saved: {result_path}")
+    save_summaries(all_results, save_dir, dataset, ts, logger=logger)
 
 
 if __name__ == "__main__":

@@ -11,9 +11,7 @@ GridCFN 消融实验模型包装层
      train.py 里现成的 train_one_epoch / evaluate 函数，无需改动训练循环；
   3. 关闭某个模块时，该模块的参数仍然会被创建（forward 不调用而已），
      这是为了让消融实验之间的代码路径完全一致、只有"是否使用"这一个变量，
-     避免因为参数量变化引入额外的混杂因素。如果你想看"移除模块后参数量
-     真实减少的效果"，可在 AblationConfig 中将 strict_remove=True，
-     此时会真正不创建该模块的参数（见下方说明）。
+     避免因为参数量变化引入额外的混杂因素。
 
 可消融的模块（开关名 -> 对应图中位置）：
   use_club          : CLUB 互信息解耦损失（min I(He;X_high)+I(Hs;X_low)）
@@ -31,13 +29,25 @@ GridCFN 消融实验模型包装层
   use_wind_mask=False    -> SparseGCN 退化为无向自适应图（仅影响 sdwpf 预设）
 """
 
+import os
+import sys
+
+# ── 路径处理：把项目根目录插入 sys.path ──────────────────────────────────────
+# 本文件位于 GridCFN/ablation/ablation_model.py
+# 上一级目录即项目根目录，包含 model.py / train.py / config.py 等
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+# 同时把 ablation/ 自身加入路径，使 cfm_alternatives 可以被直接 import
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 from dataclasses import dataclass
 import torch
 
-from model import (
-    GridCFN, DualTrackBackbone, CLUBEstimator,
-    MultiScaleContext, SCGMP, CFMVectorField,
-)
+from model import GridCFN
+from cfm_alternatives import DeterministicHead, GaussianHead
 
 
 @dataclass
@@ -47,6 +57,11 @@ class AblationConfig:
     use_scgmp:      bool = True
     use_rank_loss:  bool = True
     use_wind_mask:  bool = True
+    # CFM 输出头类型：
+    #   "cfm"           - 原始 Continuous Flow Matching（完整模型，默认）
+    #   "gaussian"      - 参数化高斯头，NLL 训练（变体 B：noCFM_gauss）
+    #   "deterministic" - 确定性 MLP 点预测，MSE 训练（变体 A：noCFM_det）
+    cfm_head:       str  = "cfm"
     name:           str  = "full"   # 用于日志/结果命名
 
     def tag(self) -> str:
@@ -57,6 +72,7 @@ class AblationConfig:
             "scgmp"  if self.use_scgmp      else "noscgmp",
             "rank"   if self.use_rank_loss  else "norank",
             "wind"   if self.use_wind_mask  else "nowind",
+            self.cfm_head,   # cfm / gaussian / deterministic
         ]
         return f"{self.name}__" + "_".join(flags)
 
@@ -73,12 +89,54 @@ class AblationGridCFN(GridCFN):
         super().__init__(*args, **kwargs)
         self.ablation = ablation or AblationConfig()
 
-        # use_wind_mask=False 时，把 backbone 的 wind_mask 屏蔽掉（仅影响 sdwpf）
-        if not self.ablation.use_wind_mask and self.backbone.wind_mask is not None:
-            # 保留 buffer 本身（避免 state_dict key 缺失报错），forward 时不传入即可
-            self._disable_wind_mask = True
+        # use_wind_mask=False 且 backbone 确实有掩码时才需要临时屏蔽；
+        # 若 wind_mask 本来就是 None（非 sdwpf 数据集），forward 路径无差异，无需屏蔽。
+        # buffer 本身保留在 state_dict 中，不会引起 key 缺失报错。
+        self._disable_wind_mask = (
+            not self.ablation.use_wind_mask
+            and self.backbone.wind_mask is not None
+        )
+
+        # ── 替代输出头（变体 A / B）──────────────────────────────────────────
+        # cfm_head == "cfm" 时直接复用父类 self.vector_field，无额外参数。
+        # 其他情形构建对应头，并冻结 self.vector_field（不参与这两个变体的训练）。
+        head = self.ablation.cfm_head
+        if head == "cfm":
+            # register_module(name, None) 是 PyTorch 的合法调用：
+            # state_dict 不会产生空 key，parameters() 会跳过 None 模块，
+            # 比直接 self.alt_head = None 更规范。
+            self.register_module("alt_head", None)
+        elif head in ("gaussian", "deterministic"):
+            # 维度来源说明：
+            #   He_prime 的维度是 ms_out_dim（ms_context 的输出维度），
+            #   不是 self.env_dim（backbone 原始输出维度）。
+            #   CFMVectorField 里也是 env_dim=ms_out_dim，与此一致。
+            #   从 ms_context.proj.out_features 读取最可靠（proj 是 MultiScaleContext
+            #   最后一个 Linear，out_features 就是 ms_out_dim）。
+            #
+            #   Hs_prime 的维度是 stoch_dim，self.stoch_dim 已正确存储。
+            #   hidden_dim 从 vector_field.out_proj.in_features 读：
+            #   out_proj = Linear(hidden_dim, cfm_dim)，in_features = hidden_dim。
+            ms_out_dim = self.ms_context.proj.out_features
+            vf         = self.vector_field
+            cls        = GaussianHead if head == "gaussian" else DeterministicHead
+            self.alt_head = cls(
+                env_dim    = ms_out_dim,               # He_prime 的实际维度
+                stoch_dim  = self.stoch_dim,           # Hs_prime 的维度
+                hidden_dim = vf.out_proj.in_features,  # CFMVectorField hidden_dim
+                T_out      = self.T_out,
+                feat_dim   = self.feat_dim,
+                dropout    = 0.1,
+            )
+            # 冻结 vector_field 参数：不参与变体 A/B 的训练，
+            # 保留在 state_dict 里只是为了让 checkpoint 结构一致。
+            for p in self.vector_field.parameters():
+                p.requires_grad_(False)
         else:
-            self._disable_wind_mask = False
+            raise ValueError(
+                f"AblationConfig.cfm_head='{head}' 无效，"
+                f"可选: 'cfm', 'gaussian', 'deterministic'"
+            )
 
     def rank_loss(self) -> torch.Tensor:
         if not self.ablation.use_rank_loss:
@@ -101,11 +159,11 @@ class AblationGridCFN(GridCFN):
         if self.ablation.use_ms_context:
             He_prime = self.ms_context(He_seq)
         else:
-            # 退化：直接用池化后的单步环境特征 He，不做多尺度时间卷积精炼。
-            # 注意 ms_context.proj 的输出维度是 ms_out_dim，而 He 的维度是 env_dim，
-            # 二者在默认配置里通常相等（env_dim == ms_out_dim == 32），但为了在
-            # 维度不一致的配置下也能跑通，这里用一个固定（不参与训练核心对比的）
-            # 线性投影对齐维度。该投影层在 __init__ 中按需创建，见下方 _get_passthrough_proj。
+            # 退化语义：He 来自 backbone 的 AttentionPool(TCN(GCN(X_low)))，
+            # 即"单尺度时序池化后的环境特征"，已经具备了单步时间建模能力。
+            # 消融掉的是 MultiScaleContext 在此基础上追加的"多膨胀率卷积 + 跨尺度融合"，
+            # 即去掉多尺度时序精炼，不是去掉所有时序建模。
+            # 这个边界在论文消融分析中需要说清楚，以免审稿人误认为消融了整个时序路径。
             He_prime = self._passthrough_env(He)
 
         # ── SCGMP Layer ──
@@ -143,8 +201,23 @@ class AblationGridCFN(GridCFN):
         return He
 
     def cfm_loss(self, He_prime, Hs_prime, y_target, n_t_samples=4, sigma_min=0.01):
-        return super().cfm_loss(He_prime, Hs_prime, y_target,
-                                 n_t_samples=n_t_samples, sigma_min=sigma_min)
+        if self.alt_head is None:
+            # 原始 CFM flow matching loss
+            return super().cfm_loss(He_prime, Hs_prime, y_target,
+                                    n_t_samples=n_t_samples, sigma_min=sigma_min)
+        # 变体 A / B：调用替代头的 loss（NLL 或 MSE），
+        # n_t_samples / sigma_min 对这两个头无意义，**_ 吸收掉
+        return self.alt_head.loss(He_prime, Hs_prime, y_target)
+
+    def sample(self, He_prime, Hs_prime,
+               n_samples: int = 50, n_steps: int = 20,
+               sigma_min: float = 0.01, x0_scale: float = 1.0):
+        if self.alt_head is None:
+            return super().sample(He_prime, Hs_prime,
+                                  n_samples=n_samples, n_steps=n_steps,
+                                  sigma_min=sigma_min, x0_scale=x0_scale)
+        # 变体 A / B：替代头自带 sample()，n_steps / sigma_min / x0_scale 无意义
+        return self.alt_head.sample(He_prime, Hs_prime, n_samples=n_samples)
 
 
 def build_ablation_model(cfg, in_dim, n_nodes, wind_mask, ablation: AblationConfig):
