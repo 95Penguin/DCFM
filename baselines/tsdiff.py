@@ -471,10 +471,10 @@ def _evaluate_tsdiff(model: "TSDiff", loader, device, scaler,
 
     if scaler is not None:
         shape = samples_all.shape
-        samples_all = scaler.inverse_transform(
-            samples_all.reshape(-1)).reshape(shape)
-        y_all = scaler.inverse_transform(
-            y_all.reshape(-1)).reshape(y_all.shape)
+        s_mean = scaler.mean[..., :1] if scaler.mean.shape[-1] > 1 else scaler.mean
+        s_std  = scaler.std[..., :1]  if scaler.std.shape[-1] > 1  else scaler.std
+        samples_all = (samples_all.reshape(-1) * s_std + s_mean).reshape(shape)
+        y_all = (y_all.reshape(-1) * s_std + s_mean).reshape(y_all.shape)
 
     metrics = compute_prob_metrics(samples_all, y_all)
     for k, v in metrics_norm.items():
@@ -500,11 +500,13 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
     kernel_size     = getattr(m, "kernel_size",      3)
     diffusion_steps = getattr(m, "diffusion_steps", 100)
     n_samples_val   = getattr(t_cfg, "cfm_n_samples",      10)
-    n_samples_test  = getattr(t_cfg, "cfm_n_samples_test", 50)
+    n_samples_test  = getattr(t_cfg, "tsdiff_n_samples_test",
+                     getattr(t_cfg, "cfm_n_samples_test", 50))
     node_emb_dim    = getattr(m, "env_dim",         16)
     # 验证时最多用这么多 batch（防止大图上卡住）。默认 50 通常足够反映趋势。
     # 可在 cfg.train 中设置 tsdiff_val_max_batches=N 覆盖。
     val_max_batches = getattr(t_cfg, "tsdiff_val_max_batches", 50)
+    test_max_batches = getattr(t_cfg, "tsdiff_test_max_batches", 50)
 
     model = TSDiff(
         num_nodes       = num_nodes,
@@ -605,7 +607,9 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
         torch.load(save_path, map_location=device, weights_only=True))
     model.n_samples = n_samples_test
     test_m = _evaluate_tsdiff(model, test_loader, device, scaler,
-                              null_val=null_val, logger=logger)
+                              null_val=null_val, logger=logger,
+                              max_batches=test_max_batches
+                              if test_max_batches > 0 else None)
 
     sep = "=" * 55
     logger.info(f"\n{sep}")

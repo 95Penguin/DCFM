@@ -109,14 +109,15 @@ class Decoder(nn.Module):
 class K2VAE(nn.Module):
     """Koopman-Kalman 增强 VAE，无图结构，单步生成"""
     def __init__(self, in_dim: int = 1, T_in: int = 168, T_out: int = 12,
+                 out_feat: int = 1,
                  patch_len: int = 16, stride: int = 8, d_model: int = 128,
                  koopman_dim: int = 64, latent_dim: int = 64,
                  dec_hidden: int = 256, gru_hidden: int = 64,
                  beta: float = 1.0):
         super().__init__()
         self.T_out    = T_out
-        self.feat_dim = in_dim
-        self.cfm_dim  = T_out * in_dim
+        self.feat_dim = out_feat
+        self.cfm_dim  = T_out * out_feat
         self.beta     = beta
 
         self.embedder    = PatchEmbedding(in_dim, patch_len, stride, d_model)
@@ -185,10 +186,10 @@ def _evaluate_k2vae(model: K2VAE, loader, device, scaler,
 
     if scaler is not None:
         shape = samples_all.shape
-        samples_all = scaler.inverse_transform(
-            samples_all.reshape(-1)).reshape(shape)
-        y_all = scaler.inverse_transform(
-            y_all.reshape(-1)).reshape(y_all.shape)
+        s_mean = scaler.mean[..., :1] if scaler.mean.shape[-1] > 1 else scaler.mean
+        s_std  = scaler.std[..., :1]  if scaler.std.shape[-1] > 1  else scaler.std
+        samples_all = (samples_all.reshape(-1) * s_std + s_mean).reshape(shape)
+        y_all = (y_all.reshape(-1) * s_std + s_mean).reshape(y_all.shape)
 
     metrics = compute_prob_metrics(samples_all, y_all)
     for k, v in metrics_norm.items():
@@ -206,12 +207,17 @@ def run_k2vae(loaders, adj, cfg, device, save_dir, logger,
     """
     train_loader, val_loader, test_loader = loaders
     d, m, t_cfg = cfg.data, cfg.model, cfg.train
+    # 推断输出特征维度：SlidingWindowDataset 的 y 取 data[..., :1]，F_out = 1
+    for x_batch, y_batch in train_loader:
+        out_feat = y_batch.shape[3]
+        break
 
     patch_len = min(16, d.T_in // 4)
     stride    = patch_len // 2
 
     model = K2VAE(
         in_dim      = in_dim if in_dim is not None else 1,
+        out_feat    = out_feat,
         T_in        = d.T_in,
         T_out       = d.T_out,
         patch_len   = patch_len,
@@ -223,7 +229,7 @@ def run_k2vae(loaders, adj, cfg, device, save_dir, logger,
         gru_hidden  = getattr(m, "tcn_hidden", 64),
         beta        = 1.0,
     ).to(device)
-
+    logger.info(f"[K2VAE] in_dim={in_dim}, out_feat={out_feat}, cfm_dim={model.cfm_dim}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[K2VAE] Parameters: {n_params:,}")
 

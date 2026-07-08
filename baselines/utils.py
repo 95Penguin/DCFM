@@ -58,6 +58,14 @@ def compute_metrics(pred, true, null_val=None):
 def inverse_torch(tensor: torch.Tensor, scaler):
     """Inverse-transform a tensor while preserving shape and returning CPU float."""
     shape = tensor.shape
+    # 修复：若 Scaler 训练于多特征（F > 1）但 tensor 只有单特征（F = 1），
+    # 需手动反归一化，避免 Scaler.inverse_transform 内部 reshape(-1, F) 误用特征尺度
+    if scaler.mean.shape[-1] > 1 and tensor.shape[-1] == 1:
+        data_flat = tensor.detach().cpu().numpy().reshape(-1)
+        s_mean = scaler.mean[..., :1].ravel().item()
+        s_std  = scaler.std[..., :1].ravel().item()
+        inv = data_flat * s_std + s_mean
+        return torch.from_numpy(inv.reshape(shape)).float()
     inv = scaler.inverse_transform(tensor.detach().cpu().numpy().reshape(-1))
     return torch.from_numpy(inv.reshape(shape)).float()
 

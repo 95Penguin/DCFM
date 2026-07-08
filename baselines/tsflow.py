@@ -119,15 +119,15 @@ class TSFlowVectorField(nn.Module):
 
 class TSFlow(nn.Module):
     """条件 CFM + GP(OU) 先验，无图结构"""
-    def __init__(self, in_dim: int = 1, T_in: int = 168, T_out: int = 12,
+    def __init__(self, in_dim: int = 1, out_feat: int = 1,
+                 T_in: int = 168, T_out: int = 12,
                  hidden_dim: int = 256, n_enc_layers: int = 4,
                  time_emb_dim: int = 16, ell: float = 1.0):
         super().__init__()
         self.T_out    = T_out
-        self.feat_dim = in_dim
-        self.cfm_dim  = T_out * in_dim
+        self.feat_dim = out_feat
+        self.cfm_dim  = T_out * out_feat
         self.ou_kernel = OUKernel(ell=ell)
-
         self.encoder = ConditionEncoder(in_dim, hidden_dim, n_enc_layers, T_in)
         self.vector_field = TSFlowVectorField(
             out_dim=self.cfm_dim, context_dim=hidden_dim,
@@ -208,10 +208,13 @@ def _evaluate_tsflow(model: TSFlow, loader, device, scaler,
 
     if scaler is not None:
         shape = samples_all.shape
-        samples_all = scaler.inverse_transform(
-            samples_all.reshape(-1)).reshape(shape)
-        y_all = scaler.inverse_transform(
-            y_all.reshape(-1)).reshape(y_all.shape)
+        # 修复：若 Scaler 训练于多特征（SDWPF 有 4 维），预测只含第 0 维（功率），
+        # 需将 mean/std 切片至第 0 维，否则 Scaler.inverse_transform 中的
+        # reshape(-1, F) 会错误混用其他特征尺度
+        s_mean = scaler.mean[..., :1] if scaler.mean.shape[-1] > 1 else scaler.mean
+        s_std  = scaler.std[..., :1]  if scaler.std.shape[-1] > 1  else scaler.std
+        samples_all = (samples_all.reshape(-1) * s_std + s_mean).reshape(shape)
+        y_all = (y_all.reshape(-1) * s_std + s_mean).reshape(y_all.shape)
 
     metrics = compute_prob_metrics(samples_all, y_all)
     for k, v in metrics_norm.items():
@@ -229,9 +232,14 @@ def run_tsflow(loaders, adj, cfg, device, save_dir, logger,
     """
     train_loader, val_loader, test_loader = loaders
     d, m, t_cfg = cfg.data, cfg.model, cfg.train
+    # 推断输出特征维度：SlidingWindowDataset 的 y 取 data[..., :1]，F_out = 1
+    for x_batch, y_batch in train_loader:
+        out_feat = y_batch.shape[3]
+        break
 
     model = TSFlow(
         in_dim      = in_dim or 1,
+        out_feat    = out_feat,
         T_in        = d.T_in,
         T_out       = d.T_out,
         hidden_dim  = getattr(m, "cfm_hidden", 256),
@@ -239,7 +247,7 @@ def run_tsflow(loaders, adj, cfg, device, save_dir, logger,
         time_emb_dim = getattr(m, "cfm_time_emb_dim", 16),
         ell         = 1.0,
     ).to(device)
-
+    logger.info(f"[TSFlow] in_dim={in_dim}, out_feat={out_feat}, cfm_dim={model.cfm_dim}")
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"[TSFlow] Parameters: {n_params:,}")
 

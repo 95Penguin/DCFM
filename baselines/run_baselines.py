@@ -635,11 +635,21 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
                    scaler=scaler, null_val=null_val)
 
 
+def run_diffstg(loaders, adj, cfg, device, save_dir, logger,
+                in_dim=1, num_nodes=1, scaler=None, null_val=None):
+    from baselines.diffstg import run_diffstg as _diffstg
+    logger.info("=" * 52 + "\n[DiffSTG] DDPM + UGnet (graph-aware)")
+    return _diffstg(loaders, adj, cfg, device, save_dir, logger,
+                    in_dim=in_dim, num_nodes=num_nodes,
+                    scaler=scaler, null_val=null_val)
+
+
 # ── 模型注册表 ────────────────────────────────────────────────────────────
 
 MODEL_REGISTRY = {
     "ha":       run_ha,
     "var":      run_var,
+    "diffstg":  run_diffstg,
     "dcrnn":    run_dcrnn,
     "stgcn":    run_stgcn,
     "mtgnn":    run_mtgnn,
