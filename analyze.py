@@ -422,46 +422,68 @@ def plot_picp_pinaw_by_horizon(samples, y, output_dir):
 # 4.5c — 预测分布可视化（典型场景）
 # ───────────────────────────────────────────────────────────────────────────
 
-def plot_distribution_example(samples, y, output_dir, n_examples=3):
+def plot_distribution_example(samples, y, output_dir, n_examples=3, scenarios=None):
     """
-    选几个典型 (节点, 时间步) 展示预测分布直方图 vs 真实值。
+    绘制预测分布包络图 (fan chart)：展示多个百分位带随时间扩散的不确定性。
+    每个子图对应一个 (batch, node)，展示整个预测时域的分布包络。
+    如果传入 scenarios（来自 _find_extreme_scenarios），则使用极端场景。
     """
     S, B, N, T_out, F = samples.shape
+
+    # 百分位带定义 (从外到内)
+    bands = [
+        (5,   95,   "#1f77b4", 0.20),
+        (15,  85,   "#1f77b4", 0.25),
+        (25,  75,   "#1f77b4", 0.30),
+        (40,  60,   "#1f77b4", 0.35),
+    ]
+    median_pct = 50
+
+    # 选择要展示的 (batch, node)
     choices = []
     rng = np.random.RandomState(42)
+    if scenarios:
+        choices = [(b, n, score, label) for b, n, score, label in scenarios[:n_examples]]
+    else:
+        for _ in range(n_examples):
+            b = rng.randint(0, B)
+            n = rng.randint(0, N)
+            choices.append((b, n, 0, ""))
 
-    # 随机选 n_examples 个 (batch, node, step) 组合
-    for _ in range(n_examples):
-        b = rng.randint(0, B)
-        n = rng.randint(0, N)
-        t = rng.randint(0, T_out)
-        choices.append((b, n, t))
-
-    fig, axes = plt.subplots(1, n_examples, figsize=(4.5 * n_examples, 3.5))
+    fig, axes = plt.subplots(n_examples, 1, figsize=(6, 3.0 * n_examples))
     if n_examples == 1:
         axes = [axes]
 
-    for ax, (b, n, t) in zip(axes, choices):
-        s_vals = samples[:, b, n, t, 0]
-        truth = y[b, n, t, 0]
-        mu_pred = s_vals.mean()
+    for ax, item in zip(axes, choices):
+        b, n, score, label = item
+        gc_samples = samples[:, b, n, :, 0]  # (S, T_out)
+        fore_steps = np.arange(T_out)
 
-        ax.hist(s_vals, bins=40, color=COLORS["gridcfn"], alpha=0.7,
-                density=True, edgecolor="white", linewidth=0.3)
-        ax.axvline(truth, color=COLORS["ground_truth"], linewidth=2,
-                   label=f"Truth={truth:.2f}")
-        ax.axvline(mu_pred, color=COLORS["gridcfn"], linestyle="--",
-                   linewidth=1.5, label=f"Mean={mu_pred:.2f}")
+        # 从外到内绘制百分位带
+        for lo_pct, hi_pct, color, alpha in bands:
+            lo = np.percentile(gc_samples, lo_pct, axis=0)
+            hi = np.percentile(gc_samples, hi_pct, axis=0)
+            ax.fill_between(fore_steps, lo, hi, alpha=alpha, color=color)
 
-        # 90% CI
-        lo, hi = np.quantile(s_vals, [0.05, 0.95])
-        ax.axvspan(lo, hi, alpha=0.15, color=COLORS["gridcfn"],
-                   label="90% CI")
+        # 中位数预测线
+        median = np.percentile(gc_samples, median_pct, axis=0)
+        ax.plot(fore_steps, median, "-", color="#1f77b4", linewidth=1.8,
+                label="GridCFN Median")
 
-        ax.set_xlabel("Predicted value")
-        ax.set_ylabel("Density")
-        ax.set_title(f"Node {n}, Step {t+1}")
-        ax.legend(fontsize=7)
+        # 真实值
+        truth = y[b, n, :, 0]
+        ax.plot(fore_steps, truth, "-", color=COLORS["ground_truth"],
+                linewidth=2, label="Ground Truth")
+
+        # 图例与标签
+        if label:
+            ax.set_title(f"{label} — Node {n}")
+        else:
+            ax.set_title(f"Node {n}")
+        ax.set_xlabel("Prediction horizon")
+        ax.set_ylabel("Value")
+        ax.legend(fontsize=8, loc="upper right")
+        ax.grid(True, alpha=0.15)
 
     fig.tight_layout()
     path = os.path.join(output_dir, "distribution_example.png")
@@ -535,11 +557,7 @@ def plot_case_study(samples_gridcfn, y, output_dir,
     for ax, (b, n, score, label) in zip(axes, scenarios):
         ts_truth = y[b, n, :, 0]  # (T_out,)
 
-        # GridCFN
         gc_samples = samples_gridcfn[:, b, n, :, 0]  # (S, T_out)
-        gc_mean = gc_samples.mean(axis=0)
-        gc_lo = np.quantile(gc_samples, 0.05, axis=0)
-        gc_hi = np.quantile(gc_samples, 0.95, axis=0)
 
         # ── History context ──
         if x_history is not None:
@@ -552,30 +570,42 @@ def plot_case_study(samples_gridcfn, y, output_dir,
             ax.axvline(-0.5, color="gray", linestyle=":", linewidth=0.8)
 
         fore_steps = np.arange(len(ts_truth))
-        all_steps = np.arange(-n_hist if x_history is not None else 0, len(ts_truth))
 
-        # GridCFN CI
-        ax.fill_between(fore_steps, gc_lo, gc_hi, alpha=0.25,
-                        color=COLORS["gridcfn_ci"], label="GridCFN 90% CI")
-        ax.plot(fore_steps, gc_mean, "o-", color=COLORS["gridcfn"],
-                label="GridCFN Mean", markersize=3, linewidth=1.5)
 
-        # DiffSTG 对比（可选）
+        # ── 百分位带定义 ──
+        bands = [
+            (5,   95,   0.12),
+            (15,  85,   0.18),
+            (25,  75,   0.22),
+            (40,  60,   0.28),
+        ]
+
+        # ── GridCFN fan chart ──
+        for lo_pct, hi_pct, alpha in bands:
+            lo = np.percentile(gc_samples, lo_pct, axis=0)
+            hi = np.percentile(gc_samples, hi_pct, axis=0)
+            ax.fill_between(fore_steps, lo, hi, alpha=alpha,
+                            color=COLORS["gridcfn_ci"])
+        gc_median = np.percentile(gc_samples, 50, axis=0)
+        ax.plot(fore_steps, gc_median, "-", color=COLORS["gridcfn"],
+                linewidth=1.8, label="GridCFN Median")
+
+        # ── DiffSTG fan chart（可选）──
         if samples_diffstg is not None:
             d_samples = samples_diffstg[:, b, n, :, 0]
-            d_mean = d_samples.mean(axis=0)
-            d_lo = np.quantile(d_samples, 0.05, axis=0)
-            d_hi = np.quantile(d_samples, 0.95, axis=0)
-
-            ax.fill_between(fore_steps, d_lo, d_hi, alpha=0.2,
-                            color=COLORS["diffstg_ci"], label="DiffSTG 90% CI")
-            ax.plot(fore_steps, d_mean, "s--", color=COLORS["diffstg"],
-                    label="DiffSTG Mean", markersize=3, linewidth=1.2)
+            for lo_pct, hi_pct, alpha in bands:
+                lo = np.percentile(d_samples, lo_pct, axis=0)
+                hi = np.percentile(d_samples, hi_pct, axis=0)
+                ax.fill_between(fore_steps, lo, hi, alpha=alpha,
+                                color=COLORS["diffstg_ci"])
+            d_median = np.percentile(d_samples, 50, axis=0)
+            ax.plot(fore_steps, d_median, "--", color=COLORS["diffstg"],
+                    linewidth=1.8, label="DiffSTG Median")
 
         ax.plot(fore_steps, ts_truth, "-", color=COLORS["ground_truth"],
                 label="Ground Truth", linewidth=2)
 
-        ax.set_xlabel("Time step (within forecast horizon)")
+        ax.set_xlabel("Prediction horizon")
         ax.set_ylabel("Value")
         ax.set_title(f"{label} — Batch {b}, Node {n} "
                      f"(score={score:.2f})")
@@ -666,16 +696,8 @@ def main():
         logger.info("Section 4.5 — Probability Calibration Analysis")
         logger.info("=" * 52)
 
-        # 4.5a — Reliability diagram
-        logger.info("[4.5a] Reliability diagram...")
-        plot_reliability_diagram(samples_gc, y_test, args.output_dir)
-
-        # 4.5b — PICP / PINAW vs horizon
-        logger.info("[4.5b] PICP / PINAW by horizon...")
-        plot_picp_pinaw_by_horizon(samples_gc, y_test, args.output_dir)
-
-        # 4.5c — Distribution example
-        logger.info("[4.5c] Distribution examples...")
+        # 典型场景预测分布可视化
+        logger.info("[4.5] Prediction distribution visualization...")
         plot_distribution_example(samples_gc, y_test, args.output_dir)
 
     # ══════════════════════════════════════════════════════════════════════
