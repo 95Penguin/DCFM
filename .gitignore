@@ -1,29 +1,105 @@
-# 数据文件夹（你要忽略的核心）
+# ====================== 1. 数据集 & 大数值文件（核心解决你npy超大文件警告） ======================
+# 原始数据集文件夹
 data/
-# # 模型权重
-# *.pt
-# *.pth
-# *.pkl
-# *.h5
-# Python 缓存
+dataset/
+datasets/
+
+# 所有numpy预测/数据文件（全局屏蔽）
+*.npy
+*.npz
+
+# ====================== 2. 训练输出、实验结果、绘图文件 ======================
+# 你的结果目录，全部屏蔽
+result/
+result0/
+results/
+output/
+outputs/
+
+# 各类日志、中间输出
+*.log
+*.out
+*.txt.tmp
+*.csv.tmp
+
+# 模型权重文件
+*.pt
+*.pth
+*.pkl
+*.h5
+*.hdf5
+*.ckpt
+*.bin
+*.safetensors
+
+# 绘图图片、大附件
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+*.eps
+
+# ====================== 3. Python 缓存、编译文件 ======================
 __pycache__/
 *.pyc
 *.pyo
-# 环境配置
-.env/
-venv/
-# IDE 配置
-.idea/
-.vscode/
- 
+*.pyd
+*.pyx
+*.c
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
 
-# 训练结果、日志、模型（重点！）
-result/**/*.json
-result0/
-*.log
-*.pt
-*.pth
-*.h5
-*.ckpt
-*.json
-*.filepart
+# ====================== 4. 虚拟环境 & 依赖 ======================
+venv/
+env/
+.env/
+.venv/
+conda_env/
+site-packages/
+
+# pip缓存
+pip-wheel-metadata/
+
+# ====================== 5. 系统临时文件 ======================
+.DS_Store
+Thumbs.db
+._*
+*~
+*.swp
+*.swo
+*.tmp
+*.temp
+
+# ====================== 6. IDE 编辑器配置 ======================
+# VS Code
+.vscode/
+*.code-workspace
+.vs/
+
+# PyCharm / JetBrains
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Vim
+*.swp
+*.swo
+
+# ====================== 7. 密钥、本地配置 ======================
+.env
+.env.local
+.env.dev
+config.local.yaml
+secret.yaml
+api_key.txt
+
+# ====================== 8. Git 附属无关文件 ======================
+.gitattributes.bak
+*.patch
