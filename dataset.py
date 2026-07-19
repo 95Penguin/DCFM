@@ -443,15 +443,15 @@ def _build_loaders(raw: np.ndarray,
     train_loader = DataLoader(train_ds, batch_size=batch_size,
                               shuffle=True,  num_workers=nw_train,
                               pin_memory=pin_train,
-                              persistent_workers=(nw_train > 0))
+                              persistent_workers=False)  # 改为 False 避免评估时的死锁
     val_loader   = DataLoader(val_ds,   batch_size=batch_size,
-                              shuffle=False, num_workers=nw_eval,
-                              pin_memory=pin_eval,
-                              persistent_workers=(nw_eval > 0))
+                              shuffle=False, num_workers=0,  # 改为 0（评估不需要多进程）
+                              pin_memory=False,
+                              persistent_workers=False)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size,
-                              shuffle=False, num_workers=nw_eval,
-                              pin_memory=pin_eval,
-                              persistent_workers=(nw_eval > 0))
+                              shuffle=False, num_workers=0,  # 改为 0（评估不需要多进程）
+                              pin_memory=False,
+                              persistent_workers=False)
 
     adj_tensor = torch.tensor(adj, dtype=torch.float32)
     return train_loader, val_loader, test_loader, adj_tensor, scaler, F

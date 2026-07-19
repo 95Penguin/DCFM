@@ -1,5 +1,6 @@
 # train.py
 import logging
+import os
 import time
 from typing import Dict
 
@@ -544,6 +545,18 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     logger.info("解算完成。进行物理量纲逆映射...")
     samples_test = _inverse_samples(samples_test_norm, scaler)
     y_test       = _inverse_y(y_test_norm, scaler)
+
+    # 保存预测结果到 result 目录
+    result_dir = os.path.dirname(cfg_train.save_path) or "."
+    os.makedirs(result_dir, exist_ok=True)
+    pred_mean = samples_test.mean(axis=0, keepdims=True)
+    pred_mean = pred_mean.squeeze(0).astype(np.float32)
+    pred_mean = np.transpose(pred_mean, (0, 2, 1, 3))  # [total, T_out, N, F]
+    gt_array = np.transpose(y_test.astype(np.float32), (0, 2, 1, 3))
+    np.save(os.path.join(result_dir, "GridCFN_prediction.npy"), pred_mean)
+    np.save(os.path.join(result_dir, "ground_truth.npy"), gt_array)
+    logger.info(f"Saved prediction arrays: {os.path.join(result_dir, 'GridCFN_prediction.npy')}"
+                f" and {os.path.join(result_dir, 'ground_truth.npy')}")
 
     # ── 计算四组指标 ──────────────────────────────────────────────────────
     # 1. 归一化域校准后（主要汇报，量纲一致，calibration最准确）

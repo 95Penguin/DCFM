@@ -1,0 +1,4 @@
+model,status,MAE,RMSE,MAPE,CRPS,MAE_norm,RMSE_norm,MAPE_norm,CRPS_norm,error
+tsflow,OK,0.9299,2.3425,30114380.6560,0.6282,0.0892,0.2247,70.7537,0.0603,
+patchtst,ERROR,,,,,,,,,'TrainConfig' object has no attribute 'mc_samples_test'
+stid,ERROR,,,,,,,,,'TrainConfig' object has no attribute 'mc_samples_test'

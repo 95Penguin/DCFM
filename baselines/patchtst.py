@@ -255,4 +255,6 @@ def run_patchtst(loaders, adj, cfg, device, save_dir, logger,
         save_path  = os.path.join(save_dir, "patchtst_best.pt"),
         logger     = logger,
         prob       = True,
+        mc_samples_test = getattr(t_cfg, "mc_samples_test", 200),
+        mc_chunk_size   = getattr(t_cfg, "mc_chunk_size", 0),
     )

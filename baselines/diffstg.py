@@ -81,8 +81,9 @@ class STResidualBlock(nn.Module):
         h = h * (1.0 + scale[:,:,None,None]) + shift[:,:,None,None]
         h_s = h.permute(0,3,2,1).reshape(B*T, N, C)
         h_s = F.gelu(self.gcn(h_s, agcn))
-        h = h_s.reshape(B, T, N, C).permute(0,3,2,1)
-        h = self.norm(h.permute(0,2,3,1)).permute(0,3,2,1)
+        h = h_s.reshape(B, T, N, C)
+        h = self.norm(h)
+        h = h.permute(0,3,2,1)
         return h + residual
 
 

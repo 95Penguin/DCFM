@@ -62,6 +62,10 @@ class TrainConfig:
     cfm_n_t_samples:     int   = 4
     cfm_sigma_min:       float = 0.01
     cfm_x0_scale:        float = 1.0
+    # Monte-Carlo empirical interval sampling (for baselines)
+    mc_samples_test:     int   = 200
+    mc_chunk_size:       int   = 0
+    
 
 
 @dataclass
@@ -275,6 +279,8 @@ def get_config(preset: str = "solar") -> Config:
                 cfm_n_t_samples=4,
                 cfm_sigma_min=0.01,
                 cfm_x0_scale=1.0,
+                tsdiff_val_max_batches=2,
+                tsdiff_test_max_batches=10,
             ),
         )
 

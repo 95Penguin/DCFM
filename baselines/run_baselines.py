@@ -35,6 +35,7 @@ import signal
 import sys
 import time
 from datetime import datetime
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -304,6 +305,8 @@ def run_dcrnn(loaders, adj, cfg, device, save_dir, logger,
         grad_clip  = cfg.train.grad_clip,
         save_path  = os.path.join(save_dir, "dcrnn_best.pt"),
         logger     = logger,
+        mc_samples_test = getattr(cfg.train, "mc_samples_test", 200),
+        mc_chunk_size   = getattr(cfg.train, "mc_chunk_size", 0),
         extra_forward_kwargs = {"supports": supports},
     )
 
@@ -336,6 +339,8 @@ def run_stgcn(loaders, adj, cfg, device, save_dir, logger,
         grad_clip  = cfg.train.grad_clip,
         save_path  = os.path.join(save_dir, "stgcn_best.pt"),
         logger     = logger,
+        mc_samples_test = getattr(cfg.train, "mc_samples_test", 200),
+        mc_chunk_size   = getattr(cfg.train, "mc_chunk_size", 0),
         extra_forward_kwargs = {"L_tilde": L_tilde},
     )
 
@@ -381,6 +386,8 @@ def run_mtgnn(loaders, adj, cfg, device, save_dir, logger,
         grad_clip  = cfg.train.grad_clip,
         save_path  = os.path.join(save_dir, "mtgnn_best.pt"),
         logger     = logger,
+        mc_samples_test = getattr(cfg.train, "mc_samples_test", 200),
+        mc_chunk_size   = getattr(cfg.train, "mc_chunk_size", 0),
         extra_forward_kwargs = {},
     )
 
@@ -405,11 +412,6 @@ def run_agcrn(loaders, adj, cfg, device, save_dir, logger,
     ).to(device)
     logger.info(f"  Params: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 修复 [6]：lr 由 3e-3 降至 5e-4，weight_decay 由 1e-4 升至 1e-3，
-    # scheduler patience 由 10 降至 8。
-    # 原 lr=3e-3 过大：Epoch 1 后半段 loss 从 0.41→0.61 明显上升，
-    # 说明参数已在震荡，配合修复 [4]（图稳定性）后仍需保守的学习率起步。
-    # weight_decay 加强防止 node_embeddings 范数无限增大（它不受 grad_clip 控制）。
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=8, factor=0.5)
@@ -424,6 +426,8 @@ def run_agcrn(loaders, adj, cfg, device, save_dir, logger,
         grad_clip  = cfg.train.grad_clip,
         save_path  = os.path.join(save_dir, "agcrn_best.pt"),
         logger     = logger,
+        mc_samples_test = getattr(cfg.train, "mc_samples_test", 200),
+        mc_chunk_size   = getattr(cfg.train, "mc_chunk_size", 0),
     )
 
 
@@ -463,12 +467,13 @@ def run_stid(loaders, adj, cfg, device, save_dir, logger,
         save_path  = os.path.join(save_dir, "stid_best.pt"),
         logger     = logger,
         prob       = True,
+        mc_samples_test = getattr(cfg.train, "mc_samples_test", 200),
+        mc_chunk_size   = getattr(cfg.train, "mc_chunk_size", 0),
     )
 
 
 def run_csdi(loaders, adj, cfg, device, save_dir, logger,
              in_dim=1, num_nodes=1, scaler=None, null_val=None):
-    """CSDI 训练需要同时用 x 和 y，使用自定义训练循环。"""
     from baselines.csdi import CSDI
     from baselines.utils import compute_prob_metrics, masked_mae
 
@@ -713,11 +718,48 @@ def main():
     for model_name in args.models:
         try:
             fn = MODEL_REGISTRY[model_name]
+            # 为 baseline 调用准备一个本地 cfg 副本，按 dataset 注入 baseline 专用的安全默认值，
+            # 避免修改全局 `cfg`（保持你的方法配置不受影响）。
+            local_cfg = deepcopy(cfg)
+            dataset = getattr(local_cfg.data, "dataset", "").lower()
+            if model_name == "tsdiff":
+                # model-level diffusion_steps 优先使用用户配置，否则按 dataset 选默认
+                if not hasattr(local_cfg.model, "diffusion_steps") or getattr(local_cfg.model, "diffusion_steps") is None:
+                    if dataset in ("sdwpf", "electricity"):
+                        local_cfg.model.diffusion_steps = 20
+                    elif dataset == "weather":
+                        local_cfg.model.diffusion_steps = 50
+                    else:
+                        local_cfg.model.diffusion_steps = 100
+
+                # train-level val/test batch 限制：若未配置则按 dataset 选较小上限以加速验证
+                if not hasattr(local_cfg.train, "tsdiff_val_max_batches") or getattr(local_cfg.train, "tsdiff_val_max_batches") is None:
+                    local_cfg.train.tsdiff_val_max_batches = 2 if dataset in ("sdwpf", "electricity") else 50
+                if not hasattr(local_cfg.train, "tsdiff_test_max_batches") or getattr(local_cfg.train, "tsdiff_test_max_batches") is None:
+                    local_cfg.train.tsdiff_test_max_batches = 10 if dataset in ("sdwpf", "electricity") else 50
+
+                # 打印实际注入的参数，便于确认运行时使用的默认值
+                logger.info(f"  [TSDiff run defaults] dataset={dataset} | diffusion_steps={local_cfg.model.diffusion_steps} | "
+                            f"val_max_batches={local_cfg.train.tsdiff_val_max_batches} | "
+                            f"test_max_batches={local_cfg.train.tsdiff_test_max_batches}")
+
             with _Timeout(timeout_seconds, model_name):
-                result = fn(loaders, adj, cfg, device, save_dir, logger,
+                result = fn(loaders, adj, local_cfg, device, save_dir, logger,
                             in_dim=in_dim, num_nodes=num_nodes,
                             scaler=scaler, null_val=null_val)
             all_results[model_name] = result
+
+            if isinstance(result, dict):
+                if "prediction_inv" in result:
+                    np.save(
+                        os.path.join(save_dir, f"{model_name}_prediction.npy"),
+                        result["prediction_inv"]
+                    )
+                if "ground_truth_inv" in result:
+                    gt_path = os.path.join(save_dir, "ground_truth.npy")
+                    if not os.path.exists(gt_path):
+                        np.save(gt_path, result["ground_truth_inv"])
+
             save_summaries(all_results, save_dir, dataset, ts, logger=logger)
         except Exception as e:
             logger.error(f"[{model_name}] FAILED: {e}", exc_info=True)

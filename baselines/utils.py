@@ -170,7 +170,9 @@ def train_model(model, train_loader, val_loader, test_loader,
                 extra_forward_kwargs=None,
                 log_batch_interval=50,
                 prob=False,
-                null_val=None):
+                null_val=None,
+                mc_samples_test: int = None,
+                mc_chunk_size: int = 0):
     """
     多步预测版通用训练循环。
 
@@ -288,6 +290,10 @@ def train_model(model, train_loader, val_loader, test_loader,
     pred_mu  = torch.cat(all_mu)
     true_cat = torch.cat(all_true)
 
+    # ================= 保存预测结果 =================
+    history["prediction"] = pred_mu.detach().cpu().numpy()
+    history["ground_truth"] = true_cat.detach().cpu().numpy()
+
     if prob:
         pred_sigma_norm = torch.cat(all_sigma_raw)
         mae_norm, rmse_norm, mape_norm = compute_metrics(pred_mu, true_cat)
@@ -298,6 +304,9 @@ def train_model(model, train_loader, val_loader, test_loader,
     if scaler is not None:
         pred_mu  = inverse_torch(pred_mu,  scaler)
         true_cat = inverse_torch(true_cat, scaler)
+
+    history["prediction_inv"] = pred_mu.detach().cpu().numpy()
+    history["ground_truth_inv"] = true_cat.detach().cpu().numpy()
 
     mae, rmse, mape = compute_metrics(pred_mu, true_cat)
 
@@ -316,6 +325,63 @@ def train_model(model, train_loader, val_loader, test_loader,
                          "test_mape": mape, "test_crps": crps,
                          "test_mae_norm": mae_norm, "test_rmse_norm": rmse_norm,
                          "test_mape_norm": mape_norm, "test_crps_norm": crps_norm})
+
+        # Monte-Carlo sampling to compute empirical PICP / PINAW (for probabilistic baselines)
+        try:
+            S = int(mc_samples_test) if mc_samples_test is not None else 200
+            mu_norm = torch.cat(all_mu)                # [total, T_out, N, F]
+            sigma_norm = F.softplus(torch.cat(all_sigma_raw))  # same shape
+
+            # y in normalized domain for metrics
+            y_norm = torch.cat(all_true).numpy().transpose(0, 2, 1, 3)  # [total, N, T_out, F]
+
+            # If chunking requested, write samples to a temporary memmap to avoid large peak RAM
+            if mc_chunk_size and mc_chunk_size > 0 and S > mc_chunk_size:
+                import tempfile, os
+                tmpf = tempfile.NamedTemporaryFile(delete=False, suffix=".npy")
+                tmpf.close()
+                try:
+                    shape_mem = (S, mu_norm.shape[0], mu_norm.shape[2], mu_norm.shape[1], mu_norm.shape[3])
+                    samples_mem = np.memmap(tmpf.name, dtype="float32", mode="w+", shape=shape_mem)
+                    for start in range(0, S, mc_chunk_size):
+                        cur = min(mc_chunk_size, S - start)
+                        eps = torch.randn((cur,) + mu_norm.shape)
+                        samples_chunk = (mu_norm.unsqueeze(0) + eps * sigma_norm.unsqueeze(0)).numpy()
+                        samples_chunk = samples_chunk.transpose(0, 1, 3, 2, 4)  # to [cur, total, N, T_out, F]
+                        samples_mem[start:start+cur] = samples_chunk.astype("float32")
+                    samples_norm = np.array(samples_mem)  # load as ndarray for metrics
+                finally:
+                    try:
+                        os.unlink(tmpf.name)
+                    except Exception:
+                        pass
+            else:
+                eps = torch.randn((S,) + mu_norm.shape)
+                samples_norm = (mu_norm.unsqueeze(0) + eps * sigma_norm.unsqueeze(0)).numpy()
+                samples_norm = samples_norm.transpose(0, 1, 3, 2, 4)  # [S, total, N, T_out, F]
+
+            # Prepare physical-domain copies if scaler provided
+            samples_phys = samples_norm.copy()
+            y_phys = y_norm.copy()
+            if scaler is not None:
+                shape_s = samples_phys.shape
+                shape_y = y_phys.shape
+                s_mean = scaler.mean[..., :1] if scaler.mean.shape[-1] > 1 else scaler.mean
+                s_std = scaler.std[..., :1] if scaler.std.shape[-1] > 1 else scaler.std
+                samples_phys = (samples_phys.reshape(-1) * s_std + s_mean).reshape(shape_s)
+                y_phys = (y_phys.reshape(-1) * s_std + s_mean).reshape(shape_y)
+
+            mc_norm = compute_prob_metrics(samples_norm, y_norm)
+            mc_phys = compute_prob_metrics(samples_phys, y_phys)
+            history.update({
+                "PICP": mc_phys.get("PICP", float("nan")),
+                "PINAW": mc_phys.get("PINAW", float("nan")),
+                "PICP_norm": mc_norm.get("PICP", float("nan")),
+                "PINAW_norm": mc_norm.get("PINAW", float("nan")),
+            })
+            _log(f"  [Test] Empirical PICP={history['PICP']:.4f}  PINAW={history['PINAW']:.4f}")
+        except Exception as e:
+            _log(f"  [ProbMetrics] MC sampling failed: {e}; skipping empirical PICP/PINAW")
     else:
         _log(f"  [Test] 归一化域   MAE={mae_norm:.4f}  RMSE={rmse_norm:.4f}  MAPE={mape_norm:.2f}%")
         _log(f"  [Test] 反归一化域 MAE={mae:.4f}  RMSE={rmse:.4f}  MAPE={mape:.2f}%")

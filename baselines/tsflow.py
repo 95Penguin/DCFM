@@ -351,4 +351,46 @@ def run_tsflow(loaders, adj, cfg, device, save_dir, logger,
     history["test_mae"]  = test_m["MAE"]
     history["test_rmse"] = test_m["RMSE"]
     history["test_mape"] = test_m["MAPE"]
+    # --- 生成并保存预测样本（与 baselines.train_model 返回格式兼容）
+    # samples_all: [S, total, N, T_out, F], y_all: [total, N, T_out, F]
+    samples_list, y_list = [], []
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(device)
+            raw = model.sample(x, n_samples=n_samples_test,
+                               n_steps=n_steps, sigma_min=sigma_min)
+            samples_list.append(raw.cpu().numpy())
+            # convert y: [B, T_out, N, F] -> [B, N, T_out, F] to match concatenation in _evaluate_tsflow
+            y_list.append(y.permute(0, 2, 1, 3).numpy())
+
+    if len(samples_list) > 0:
+        samples_all = np.concatenate(samples_list, axis=1)
+        y_all = np.concatenate(y_list, axis=0)
+
+        # pred_mean: [total, N, T_out, F] -> transpose to [total, T_out, N, F]
+        pred_mean = samples_all.mean(axis=0).transpose(0, 2, 1, 3)
+        ground_truth = y_all.transpose(0, 2, 1, 3)
+
+        # 将反归一化的预测和真值放入 history，键名与 train_model 保持一致
+        history["prediction_inv"] = None
+        history["ground_truth_inv"] = None
+        try:
+            # 使用 baselines.utils.inverse_torch 以保持一致的反归一化行为
+            from baselines.utils import inverse_torch
+            import torch as _torch
+            pred_t = _torch.from_numpy(pred_mean).float()
+            gt_t = _torch.from_numpy(ground_truth).float()
+            if scaler is not None:
+                pred_inv = inverse_torch(pred_t, scaler).numpy()
+                gt_inv = inverse_torch(gt_t, scaler).numpy()
+            else:
+                pred_inv = pred_mean
+                gt_inv = ground_truth
+            history["prediction_inv"] = pred_inv
+            history["ground_truth_inv"] = gt_inv
+        except Exception:
+            # 如果反归一化失败，仍将原始预测放回 history
+            history["prediction_inv"] = pred_mean
+            history["ground_truth_inv"] = ground_truth
+
     return history

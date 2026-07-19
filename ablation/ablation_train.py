@@ -32,9 +32,11 @@ if _HERE not in sys.path:
 
 import time
 import logging
+import gc
 from typing import Dict
 
 import torch
+import numpy as np
 
 from train import evaluate, calibrate_temperature, evaluate_all
 from ablation_model import AblationGridCFN, AblationConfig
@@ -265,34 +267,75 @@ def ablation_train(
                 )
                 break
 
-    model.load_state_dict(torch.load(save_path, map_location=device, weights_only=True))
+    # ── 加载最佳模型权重，并释放内存 ──
+    logger.info(f"[{model.ablation.tag()}] 加载最佳模型权重: {save_path}")
+    t0_load = time.time()
+    try:
+        state_dict = torch.load(save_path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        logger.info(f"[{model.ablation.tag()}] 权重加载成功，耗时 {time.time()-t0_load:.2f}s")
+    except Exception as e:
+        logger.error(f"[{model.ablation.tag()}] 权重加载失败: {e}")
+        raise
+    
+    # 清理内存，释放 GPU 缓存
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        logger.info(f"[{model.ablation.tag()}] GPU 缓存已清空")
 
     # ── 温度校准（与 train.py 完全一致的口径） ──
     # 确定性头（cfm_head="deterministic"）的所有 S 份样本完全相同，
     # mu + T*(samples - mu) = mu 对任意 T 恒成立，calibration 无意义，直接用 T=1.0。
     is_deterministic = (model.ablation.cfm_head == "deterministic")
 
-    _, samples_val_norm, y_val_norm = evaluate(
-        model, val_loader, adj_norm, edge_index, device,
-        scaler=scaler, return_preds=True,
-        n_samples=n_samples_test, n_steps=n_steps,
-        temperature=1.0, inverse_transform=False,
-        sigma_min=sigma_min, x0_scale=x0_scale,
-    )
+    logger.info(f"[{model.ablation.tag()}] 开始验证集评估...")
+    t0_val = time.time()
+    try:
+        _, samples_val_norm, y_val_norm = evaluate(
+            model, val_loader, adj_norm, edge_index, device,
+            scaler=scaler, return_preds=True,
+            n_samples=n_samples_test, n_steps=n_steps,
+            temperature=1.0, inverse_transform=False,
+            sigma_min=sigma_min, x0_scale=x0_scale,
+        )
+        logger.info(f"[{model.ablation.tag()}] 验证集评估完成，耗时 {time.time()-t0_val:.2f}s")
+    except Exception as e:
+        logger.error(f"[{model.ablation.tag()}] 验证集评估失败: {e}")
+        raise
     if is_deterministic:
         best_T = 1.0
         logger.info(f"[{model.ablation.tag()}] 确定性头，跳过温度校准，best_T 固定为 1.0")
     else:
+        logger.info(f"[{model.ablation.tag()}] 进行温度校准...")
+        t0_calib = time.time()
         best_T = calibrate_temperature(samples_val_norm, y_val_norm, target_coverage=0.95)
+        logger.info(f"[{model.ablation.tag()}] 温度校准完成: best_T={best_T:.4f}，耗时 {time.time()-t0_calib:.2f}s")
+
+    # 清理中间数据
+    del samples_val_norm, y_val_norm
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # ── 测试集评估 ──
-    _, samples_test_norm, y_test_norm = evaluate(
-        model, test_loader, adj_norm, edge_index, device,
-        scaler=scaler, return_preds=True,
-        n_samples=n_samples_test, n_steps=n_steps,
-        temperature=1.0, inverse_transform=False,
-        sigma_min=sigma_min, x0_scale=x0_scale,
-    )
+    logger.info(f"[{model.ablation.tag()}] 开始测试集评估...")
+    t0_test = time.time()
+    try:
+        _, samples_test_norm, y_test_norm = evaluate(
+            model, test_loader, adj_norm, edge_index, device,
+            scaler=scaler, return_preds=True,
+            n_samples=n_samples_test, n_steps=n_steps,
+            temperature=1.0, inverse_transform=False,
+            sigma_min=sigma_min, x0_scale=x0_scale,
+        )
+        logger.info(f"[{model.ablation.tag()}] 测试集评估完成，耗时 {time.time()-t0_test:.2f}s")
+    except Exception as e:
+        logger.error(f"[{model.ablation.tag()}] 测试集评估失败: {e}")
+        raise
+    logger.info(f"[{model.ablation.tag()}] 进行反归一化和指标计算...")
+    t0_metrics = time.time()
+    
     samples_test = scaler.inverse_transform(samples_test_norm) if scaler is not None else samples_test_norm
     y_test       = scaler.inverse_transform(y_test_norm) if scaler is not None else y_test_norm
 
@@ -304,6 +347,8 @@ def ablation_train(
 
     test_m_raw_norm = evaluate_all(samples_test_norm, y_test_norm)
     test_m_raw       = evaluate_all(samples_test, y_test)
+    
+    logger.info(f"[{model.ablation.tag()}] 指标计算完成，耗时 {time.time()-t0_metrics:.2f}s")
 
     history["test_metrics"]          = test_m
     history["test_metrics_norm"]     = test_m_norm

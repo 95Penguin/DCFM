@@ -1,0 +1,2 @@
+model,status,MAE,RMSE,MAPE,CRPS,MAE_norm,RMSE_norm,MAPE_norm,CRPS_norm,error
+mtgnn,OK,0.9058,2.3006,8039843.7500,0.0000,0.0869,0.2207,75.6157,,
