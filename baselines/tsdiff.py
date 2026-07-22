@@ -35,7 +35,7 @@ TSDiff: Predict, Refine, Repeat — Rasul et al., NeurIPS 2023
       避免非连续内存张量传入 Conv1d 时引发隐式 copy 或警告。
   [5] sample() 和 compute_loss() 中仅使用第一个特征维（in_dim>1 时静默丢弃），
       现在在构造函数中加警告日志，防止用户误以为多特征全部被利用。
-  [7] run_tsdiff 中 channels 加上限 min(..., 128)：cfm_hidden 为 GridCFN CFM 设计
+  [7] run_tsdiff 中 channels 加上限 min(..., 128)：cfm_hidden 为 DCFM CFM 设计
       （256~384），直接用于 TSDiff WaveNet 骨干会在大图（weather 1866节点）OOM。
 """
 import math
@@ -493,7 +493,7 @@ def run_tsdiff(loaders, adj, cfg, device, save_dir, logger,
     train_loader, val_loader, test_loader = loaders
     d, m, t_cfg = cfg.data, cfg.model, cfg.train
 
-    # cfm_hidden 是为 GridCFN 的 CFM 设计的（256~384），直接用于 TSDiff WaveNet 骨干
+    # cfm_hidden 是为 DCFM 的 CFM 设计的（256~384），直接用于 TSDiff WaveNet 骨干
     # 会在大图（weather 1866节点）上 OOM。上限 128 可覆盖所有数据集。
     channels        = min(getattr(m, "cfm_hidden",     64), 128)
     n_layers        = getattr(m, "tcn_layers",       8)

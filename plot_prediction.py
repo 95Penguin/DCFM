@@ -1,7 +1,7 @@
 """
 命令eg:
 python3 plot_prediction.py result/baselines/solar/20260709_174923 \
-  --models GridCFN MTGNN TSFlow PatchTST \
+  --models DCFM MTGNN TSFlow PatchTST \
   --zoom 60 100 \
   --out result/plot/PredictionComparison.png
 """
@@ -11,6 +11,11 @@ import argparse
 import glob
 import os
 from typing import List, Optional, Tuple
+
+# This script exports figures only.  Use the non-interactive backend so it
+# remains stable on macOS environments without a GUI-capable Python backend.
+os.environ.setdefault("MPLBACKEND", "Agg")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(os.path.dirname(__file__), ".mplconfig"))
 
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, ConnectionPatch
@@ -55,7 +60,7 @@ def load_prediction_arrays(root_dir: str,
         data[normalized] = np.load(path)
 
     if "DCFM" not in data:
-        print("Warning: DCFM/GridCFN prediction file not found in the directory.")
+        print("Warning: DCFM prediction file not found in the directory.")
     return data
 
 
@@ -295,7 +300,7 @@ if __name__ == "__main__":
     parser.add_argument("--feature", type=int, default=0,
                         help="Feature index to plot")
     parser.add_argument("--models", nargs="+", default=None,
-                        help="Optional list of model names to plot (e.g. GridCFN MTGNN TSFlow)")
+                        help="Optional list of model names to plot (e.g. DCFM MTGNN TSFlow)")
     parser.add_argument("--zoom", nargs=2, type=int, default=None,
                         help="Optional zoom range as two ints: start end")
     parser.add_argument("--concat", action="store_true",

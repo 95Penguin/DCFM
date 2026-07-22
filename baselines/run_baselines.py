@@ -1,6 +1,6 @@
 """
 baselines/run_baselines.py
-统一 baseline 运行入口（多步预测版），与 GridCFN 的 main.py 接口一致。
+统一 baseline 运行入口（多步预测版），与 DCFM 的 main.py 接口一致。
 
 用法:
   uv run baselines/run_baselines.py --preset solar --models tsdiff stid
@@ -13,7 +13,7 @@ baselines/run_baselines.py
 
 修复：
   [1] load_weather 调用补全 feature_idx 参数
-  [2] null_val 统一传 None：全量无 mask 评估，与 GridCFN 主模型对齐，
+  [2] null_val 统一传 None：全量无 mask 评估，与 DCFM 主模型对齐，
       方便与文献直接对比。
   [3] 补全 pjm 数据集支持（import、load_data 分支、--preset choices）
   [6] run_agcrn 中学习率由 3e-3 降至 5e-4，并收紧 weight_decay 至 1e-3：
@@ -112,7 +112,7 @@ def load_data(cfg):
 
 def _get_null_val(dataset: str, scaler) -> None:
     """
-    统一返回 None：所有数据集均无 mask，全量评估，与 GridCFN 对齐。
+    统一返回 None：所有数据集均无 mask，全量评估，与 DCFM 对齐。
     null_val 参数在各函数中保留接口但不使用。
     """
     return None
@@ -671,7 +671,7 @@ MODEL_REGISTRY = {
 # ── 主函数 ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="GridCFN Baselines Runner (Multi-Step)")
+    parser = argparse.ArgumentParser(description="DCFM Baselines Runner (Multi-Step)")
     parser.add_argument("--preset", type=str, default="solar",
                         choices=["solar", "electricity", "weather", "sdwpf", "pjm"])
     parser.add_argument("--models", nargs="+",
@@ -708,9 +708,9 @@ def main():
     loaders   = (train_loader, val_loader, test_loader)
     logger.info(f"Nodes={num_nodes}, in_dim={in_dim}, T_in={cfg.data.T_in}")
 
-    # 统一无 mask：null_val=None，全量评估，与 GridCFN 对齐
+    # 统一无 mask：null_val=None，全量评估，与 DCFM 对齐
     null_val = _get_null_val(dataset, scaler)
-    logger.info(f"null_val: None (无 mask，全量评估，与 GridCFN 统一)")
+    logger.info(f"null_val: None (无 mask，全量评估，与 DCFM 统一)")
 
     all_results = {}
     timeout_seconds = int(args.model_timeout_minutes * 60)

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-analyze.py — GridCFN 论文 Section 4.5 (概率校准) 和 4.6 (案例分析) 可视化脚本
+analyze.py — DCFM 论文 Section 4.5 (概率校准) 和 4.6 (案例分析) 可视化脚本
 
 用法:
-  # GridCFN 校准分析
-  python analyze.py --checkpoint result/sdwpf/20260613_105929/gridcfn_sdwpf_20260613_105929.pt \\
+  # DCFM 校准分析
+  python analyze.py --checkpoint result/sdwpf/<timestamp>/dcfm_sdwpf_<timestamp>.pt \\
                     --preset sdwpf --output_dir analysis_figures
 
   # 含 DiffSTG 对比的案例分析
-  python analyze.py --checkpoint <gridcfn_ckpt> --preset sdwpf \\
+  python analyze.py --checkpoint <dcfm_ckpt> --preset sdwpf \\
                     --diffstg_checkpoint <diffstg_ckpt> \\
                     --output_dir analysis_figures
 
@@ -33,9 +33,9 @@ from matplotlib.patches import Polygon
 
 from config import Config, get_config
 from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf, load_pjm
-from model import GridCFN
+from model import DCFM
 from train import (
-    evaluate as gridcfn_evaluate,
+    evaluate as dcfm_evaluate,
     calibrate_temperature,
     evaluate_all,
     picp_empirical,
@@ -65,8 +65,8 @@ BASE_STYLE = {
 }
 
 COLORS = {
-    "gridcfn": "#1f77b4",
-    "gridcfn_ci": "#1f77b4",
+    "dcfm": "#1f77b4",
+    "dcfm_ci": "#1f77b4",
     "diffstg": "#d62728",
     "diffstg_ci": "#d62728",
     "ground_truth": "#2ca02c",
@@ -79,9 +79,9 @@ COLORS = {
 # ───────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="GridCFN 校准 / 案例分析")
+    p = argparse.ArgumentParser(description="DCFM 校准 / 案例分析")
     p.add_argument("--checkpoint", type=str, required=True,
-                   help="GridCFN checkpoint .pt 路径")
+                   help="DCFM checkpoint .pt 路径")
     p.add_argument("--preset", type=str, default="solar",
                    choices=["solar", "electricity", "weather", "sdwpf", "pjm"])
     p.add_argument("--T_out", type=int, default=None,
@@ -157,7 +157,7 @@ def load_data(cfg):
 
 def build_model(cfg, in_dim, n_nodes, wind_mask=None, device=None):
     m = cfg.model
-    model = GridCFN(
+    model = DCFM(
         n_nodes=n_nodes,
         in_dim=in_dim if in_dim is not None else m.in_dim,
         gcn_hidden=m.gcn_hidden, gcn_layers=m.gcn_layers,
@@ -245,17 +245,17 @@ def _build_wind_mask(cfg, n_nodes):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# GridCFN 推理（含 Temperature Calibration）
+# DCFM 推理（含 Temperature Calibration）
 # ───────────────────────────────────────────────────────────────────────────
 
-def run_gridcfn_inference(model, train_loader, val_loader, test_loader,
+def run_dcfm_inference(model, train_loader, val_loader, test_loader,
                           adj_norm, edge_index, device, scaler,
                           n_samples=200, n_steps=20, sigma_min=0.01, x0_scale=1.0):
     """运行 inference，返回 calibrated samples 和 ground truth。"""
 
     # ── Temperature Calibration ──
     logging.info("Temperature calibration on validation set...")
-    _, samples_val_norm, y_val_norm = gridcfn_evaluate(
+    _, samples_val_norm, y_val_norm = dcfm_evaluate(
         model, val_loader, adj_norm, edge_index, device,
         scaler=scaler, return_preds=True,
         n_samples=n_samples, n_steps=n_steps,
@@ -333,7 +333,7 @@ def plot_reliability_diagram(samples, y, output_dir, confidence_levels=None):
     fig, ax = plt.subplots(figsize=(5.5, 5))
 
     ax.plot(confidence_levels, empirical_cov, "o-",
-            color=COLORS["gridcfn"], label="GridCFN", markersize=4)
+            color=COLORS["dcfm"], label="DCFM", markersize=4)
     ax.plot([0.5, 1.0], [0.5, 1.0], "--", color="gray", linewidth=1,
             label="Perfect calibration")
 
@@ -341,7 +341,7 @@ def plot_reliability_diagram(samples, y, output_dir, confidence_levels=None):
     ax.fill_between(confidence_levels,
                     np.minimum(confidence_levels, empirical_cov),
                     np.maximum(confidence_levels, empirical_cov),
-                    alpha=0.1, color=COLORS["gridcfn"])
+                    alpha=0.1, color=COLORS["dcfm"])
 
     ax.set_xlabel("Nominal coverage")
     ax.set_ylabel("Empirical coverage (PICP)")
@@ -391,7 +391,7 @@ def plot_picp_pinaw_by_horizon(samples, y, output_dir):
     steps = np.arange(1, T_out + 1)
 
     # PICP
-    ax1.plot(steps, picp_h, "o-", color=COLORS["gridcfn"], label="90% CI",
+    ax1.plot(steps, picp_h, "o-", color=COLORS["dcfm"], label="90% CI",
              markersize=4)
     ax1.plot(steps, picp_95_h, "s--", color=COLORS["calibration"],
              label="95% CI", markersize=4)
@@ -404,7 +404,7 @@ def plot_picp_pinaw_by_horizon(samples, y, output_dir):
     ax1.grid(True, alpha=0.3)
 
     # PINAW
-    ax2.plot(steps, pinaw_h, "o-", color=COLORS["gridcfn"], markersize=4)
+    ax2.plot(steps, pinaw_h, "o-", color=COLORS["dcfm"], markersize=4)
     ax2.set_xlabel("Prediction horizon")
     ax2.set_ylabel("PINAW")
     ax2.set_title("PINAW vs Prediction Horizon")
@@ -456,19 +456,19 @@ def plot_distribution_example(samples, y, output_dir, n_examples=3, scenarios=No
 
     for ax, item in zip(axes, choices):
         b, n, score, label = item
-        gc_samples = samples[:, b, n, :, 0]  # (S, T_out)
+        dcfm_samples = samples[:, b, n, :, 0]  # (S, T_out)
         fore_steps = np.arange(T_out)
 
         # 从外到内绘制百分位带
         for lo_pct, hi_pct, color, alpha in bands:
-            lo = np.percentile(gc_samples, lo_pct, axis=0)
-            hi = np.percentile(gc_samples, hi_pct, axis=0)
+            lo = np.percentile(dcfm_samples, lo_pct, axis=0)
+            hi = np.percentile(dcfm_samples, hi_pct, axis=0)
             ax.fill_between(fore_steps, lo, hi, alpha=alpha, color=color)
 
         # 中位数预测线
-        median = np.percentile(gc_samples, median_pct, axis=0)
+        median = np.percentile(dcfm_samples, median_pct, axis=0)
         ax.plot(fore_steps, median, "-", color="#1f77b4", linewidth=1.8,
-                label="GridCFN Median")
+                label="DCFM Median")
 
         # 真实值
         truth = y[b, n, :, 0]
@@ -545,7 +545,7 @@ def _find_extreme_scenarios(y, top_k=2):
 # 4.6 — 主绘图
 # ───────────────────────────────────────────────────────────────────────────
 
-def plot_case_study(samples_gridcfn, y, output_dir,
+def plot_case_study(samples_dcfm, y, output_dir,
                     samples_diffstg=None, x_history=None, tin=168):
     scenarios = _find_extreme_scenarios(y, top_k=2)
 
@@ -557,7 +557,7 @@ def plot_case_study(samples_gridcfn, y, output_dir,
     for ax, (b, n, score, label) in zip(axes, scenarios):
         ts_truth = y[b, n, :, 0]  # (T_out,)
 
-        gc_samples = samples_gridcfn[:, b, n, :, 0]  # (S, T_out)
+        dcfm_samples = samples_dcfm[:, b, n, :, 0]  # (S, T_out)
 
         # ── History context ──
         if x_history is not None:
@@ -580,15 +580,15 @@ def plot_case_study(samples_gridcfn, y, output_dir,
             (40,  60,   0.28),
         ]
 
-        # ── GridCFN fan chart ──
+        # ── DCFM fan chart ──
         for lo_pct, hi_pct, alpha in bands:
-            lo = np.percentile(gc_samples, lo_pct, axis=0)
-            hi = np.percentile(gc_samples, hi_pct, axis=0)
+            lo = np.percentile(dcfm_samples, lo_pct, axis=0)
+            hi = np.percentile(dcfm_samples, hi_pct, axis=0)
             ax.fill_between(fore_steps, lo, hi, alpha=alpha,
-                            color=COLORS["gridcfn_ci"])
-        gc_median = np.percentile(gc_samples, 50, axis=0)
-        ax.plot(fore_steps, gc_median, "-", color=COLORS["gridcfn"],
-                linewidth=1.8, label="GridCFN Median")
+                            color=COLORS["dcfm_ci"])
+        dcfm_median = np.percentile(dcfm_samples, 50, axis=0)
+        ax.plot(fore_steps, dcfm_median, "-", color=COLORS["dcfm"],
+                linewidth=1.8, label="DCFM Median")
 
         # ── DiffSTG fan chart（可选）──
         if samples_diffstg is not None:
@@ -653,26 +653,26 @@ def main():
     logger.info("Loading data...")
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
 
-    adj_norm = GridCFN.normalize_adj(adj)
-    edge_index = GridCFN.adj_to_edge_index(adj)
+    adj_norm = DCFM.normalize_adj(adj)
+    edge_index = DCFM.adj_to_edge_index(adj)
     n_nodes = adj.shape[0]
     logger.info(f"Graph: {n_nodes} nodes")
 
     wind_mask = _build_wind_mask(cfg, n_nodes)
 
-    # ── Load GridCFN model ──
-    logger.info(f"Loading GridCFN from {args.checkpoint}...")
-    model_gc = load_model_from_checkpoint(
+    # ── Load DCFM model ──
+    logger.info(f"Loading DCFM from {args.checkpoint}...")
+    model_dcfm = load_model_from_checkpoint(
         args.checkpoint, cfg, in_dim, n_nodes, wind_mask, device
     )
 
-    # ── GridCFN inference ──
-    samples_gc, y_test, x_test = run_gridcfn_inference(
-        model_gc, train_loader, val_loader, test_loader,
+    # ── DCFM inference ──
+    samples_dcfm, y_test, x_test = run_dcfm_inference(
+        model_dcfm, train_loader, val_loader, test_loader,
         adj_norm, edge_index, device, scaler,
         n_samples=args.n_samples, n_steps=args.n_steps,
     )
-    logger.info(f"GridCFN samples shape: {samples_gc.shape}")
+    logger.info(f"DCFM samples shape: {samples_dcfm.shape}")
     logger.info(f"Input x shape: {x_test.shape}")
 
     # ── DiffSTG inference (optional) ──
@@ -698,7 +698,7 @@ def main():
 
         # 典型场景预测分布可视化
         logger.info("[4.5] Prediction distribution visualization...")
-        plot_distribution_example(samples_gc, y_test, args.output_dir)
+        plot_distribution_example(samples_dcfm, y_test, args.output_dir)
 
     # ══════════════════════════════════════════════════════════════════════
     # Section 4.6 — 案例分析
@@ -709,12 +709,12 @@ def main():
         logger.info("=" * 52)
 
         logger.info("[4.6] Extreme scenario analysis...")
-        plot_case_study(samples_gc, y_test, args.output_dir,
+        plot_case_study(samples_dcfm, y_test, args.output_dir,
                         x_history=x_test, tin=cfg.data.T_in,
                         samples_diffstg=samples_diffstg)
 
     # ── 打印最终指标摘要 ──
-    metrics = evaluate_all(samples_gc, y_test)
+    metrics = evaluate_all(samples_dcfm, y_test)
     logger.info("\n" + "=" * 52)
     logger.info("Final Metrics on Test Set (calibrated, physical domain)")
     logger.info("=" * 52)

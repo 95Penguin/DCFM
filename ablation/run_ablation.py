@@ -1,10 +1,10 @@
 # run_ablation.py
 """
-GridCFN 消融实验主入口
+DCFM 消融实验主入口
 ────────────────────────────────────────────────────────────────────────
 本文件位于项目根目录下的 ablation/ 子目录中：
 
-    GridCFN/                  <- 项目根目录（model.py, config.py 等都在这里）
+    DCFM/                     <- 项目根目录（model.py, config.py 等都在这里）
     ├── config.py
     ├── dataset.py
     ├── model.py
@@ -44,18 +44,18 @@ from config import ... 之前执行，否则会报 ModuleNotFoundError。
 只改动 ablation 开关，确保差异只来自被消融的模块本身。
 
 输出（固定在项目根目录下，不受执行时所在目录影响）：
-  GridCFN/ablation_results/<dataset>/<timestamp>/<tag>/history_<tag>.json
-  GridCFN/ablation_results/<dataset>/<timestamp>/summary.csv
-  GridCFN/ablation_results/<dataset>/<timestamp>/summary.md
+  DCFM/ablation_results/<dataset>/<timestamp>/<tag>/history_<tag>.json
+  DCFM/ablation_results/<dataset>/<timestamp>/summary.csv
+  DCFM/ablation_results/<dataset>/<timestamp>/summary.md
 """
 
 import os
 import sys
 
 # ── 路径处理：把项目根目录插入 sys.path（必须在 import model/config 等之前） ──
-# __file__ 是 .../GridCFN/ablation/run_ablation.py
-# os.path.dirname(__file__) 是 .../GridCFN/ablation
-# 再上一级 os.path.dirname(...) 就是 .../GridCFN，即项目根目录
+# __file__ 是 .../DCFM/ablation/run_ablation.py
+# os.path.dirname(__file__) 是 .../DCFM/ablation
+# 再上一级 os.path.dirname(...) 就是项目根目录
 _ABLATION_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT  = os.path.dirname(_ABLATION_DIR)
 # 项目根目录：让 from model/config/train/dataset import ... 找到目标
@@ -76,7 +76,7 @@ import pandas as pd
 import torch
 
 from config import get_config
-from model import GridCFN
+from model import DCFM
 from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf, load_pjm
 
 from ablation_model import AblationConfig, build_ablation_model
@@ -306,7 +306,7 @@ def summarize(results: dict, result_root: str):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="GridCFN 消融实验")
+    parser = argparse.ArgumentParser(description="DCFM 消融实验")
     parser.add_argument("--preset", type=str, default="solar",
                          choices=["solar", "electricity", "weather", "sdwpf", "pjm"])
     parser.add_argument("--only", type=str, nargs="+", default=None,
@@ -342,7 +342,7 @@ def main():
     result_root = os.path.join(PROJECT_ROOT, "ablation_results", cfg.data.dataset, timestamp)
     os.makedirs(result_root, exist_ok=True)
 
-    logger = logging.getLogger("gridcfn.ablation.main")
+    logger = logging.getLogger("dcfm.ablation.main")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     ch = logging.StreamHandler(sys.stdout)
@@ -360,8 +360,8 @@ def main():
     # ── 数据只加载一次，所有消融组共享同一份划分，保证公平对比 ──
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
 
-    adj_norm   = GridCFN.normalize_adj(adj)
-    edge_index = GridCFN.adj_to_edge_index(adj)
+    adj_norm   = DCFM.normalize_adj(adj)
+    edge_index = DCFM.adj_to_edge_index(adj)
     n_nodes    = adj.shape[0]
     logger.info(f"Graph: {n_nodes} nodes, {edge_index.shape[1]} edges, in_dim={in_dim}")
 

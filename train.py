@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from model import GridCFN
+from model import DCFM
 
 
 def _set_requires_grad(module: torch.nn.Module, requires_grad: bool) -> None:
@@ -207,7 +207,7 @@ def calibrate_temperature(samples: np.ndarray, y_all: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(
-    model:            GridCFN,
+    model:            DCFM,
     loader:           DataLoader,
     optimizer:        torch.optim.Optimizer,
     club_optimizer:   torch.optim.Optimizer,
@@ -326,7 +326,7 @@ def train_one_epoch(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(model: GridCFN, loader: DataLoader,
+def evaluate(model: DCFM, loader: DataLoader,
              adj_norm: torch.Tensor, edge_index: torch.Tensor,
              device: torch.device,
              scaler=None, return_preds: bool = False,
@@ -384,12 +384,12 @@ def evaluate(model: GridCFN, loader: DataLoader,
 # 主训练流程
 # ---------------------------------------------------------------------------
 
-def train(model: GridCFN, train_loader, val_loader, test_loader,
+def train(model: DCFM, train_loader, val_loader, test_loader,
           adj_norm, edge_index, device, cfg_train,
           scaler=None, logger=None) -> Dict:
 
     if logger is None:
-        logger = logging.getLogger("gridcfn.train")
+        logger = logging.getLogger("dcfm.train")
         if not logger.handlers:
             h = logging.StreamHandler()
             h.setFormatter(logging.Formatter("%(asctime)s | %(message)s",
@@ -553,9 +553,9 @@ def train(model: GridCFN, train_loader, val_loader, test_loader,
     pred_mean = pred_mean.squeeze(0).astype(np.float32)
     pred_mean = np.transpose(pred_mean, (0, 2, 1, 3))  # [total, T_out, N, F]
     gt_array = np.transpose(y_test.astype(np.float32), (0, 2, 1, 3))
-    np.save(os.path.join(result_dir, "GridCFN_prediction.npy"), pred_mean)
+    np.save(os.path.join(result_dir, "DCFM_prediction.npy"), pred_mean)
     np.save(os.path.join(result_dir, "ground_truth.npy"), gt_array)
-    logger.info(f"Saved prediction arrays: {os.path.join(result_dir, 'GridCFN_prediction.npy')}"
+    logger.info(f"Saved prediction arrays: {os.path.join(result_dir, 'DCFM_prediction.npy')}"
                 f" and {os.path.join(result_dir, 'ground_truth.npy')}")
 
     # ── 计算四组指标 ──────────────────────────────────────────────────────

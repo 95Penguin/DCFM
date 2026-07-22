@@ -6,7 +6,7 @@
   1. 当 ablation.use_club=False 时，完全跳过 CLUB 相关的优化器、变分内层
      更新和互信息惩罚项，loss 中也不包含 lambda_club * mi_penalty；
   2. 当 ablation.use_rank_loss=False 时，loss 中不包含 lambda_rank * rank_loss
-     （AblationGridCFN.rank_loss() 在该情况下本身就返回 0，这里加一层显式判断
+     （AblationDCFM.rank_loss() 在该情况下本身就返回 0，这里加一层显式判断
      只是为了让日志更清楚，去掉对推门那一项的依赖）；
   3. 其余（MultiScaleContext / SCGMP / wind_mask）的开关只影响 forward 内部
      计算路径，不影响这里的训练循环结构，所以这个文件不需要为它们写特判。
@@ -15,14 +15,14 @@
   - evaluate()         ：验证/测试集采样 + 指标计算
   - evaluate_all()      ：MAE/RMSE/MAPE/CRPS/PICP/PINAW 等指标
   - calibrate_temperature() ：温度校准
-都是纯函数，不依赖具体是 GridCFN 还是 AblationGridCFN，可以直接拿来用。
+都是纯函数，不依赖具体是 DCFM 还是 AblationDCFM，可以直接拿来用。
 """
 
 import os
 import sys
 
 # ── 路径处理：把项目根目录插入 sys.path ──────────────────────────────────────
-# 本文件位于 GridCFN/ablation/ablation_train.py，上一级是项目根目录
+# 本文件位于项目根目录的 ablation/ablation_train.py，上一级是项目根目录
 _HERE         = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_HERE)
 if _PROJECT_ROOT not in sys.path:
@@ -39,11 +39,11 @@ import torch
 import numpy as np
 
 from train import evaluate, calibrate_temperature, evaluate_all
-from ablation_model import AblationGridCFN, AblationConfig
+from ablation_model import AblationDCFM, AblationConfig
 
 
 def ablation_train_one_epoch(
-    model:            AblationGridCFN,
+    model:            AblationDCFM,
     loader,
     optimizer:        torch.optim.Optimizer,
     club_optimizer,   # 可能为 None（use_club=False 时）
@@ -146,7 +146,7 @@ def ablation_train_one_epoch(
 
 
 def ablation_train(
-    model: AblationGridCFN,
+    model: AblationDCFM,
     train_loader, val_loader, test_loader,
     adj_norm, edge_index, device, cfg_train,
     scaler=None, logger=None,
@@ -161,7 +161,7 @@ def ablation_train(
         主实验的评估口径一致，结果才能放在同一张表里比较。
     """
     if logger is None:
-        logger = logging.getLogger("gridcfn.ablation")
+        logger = logging.getLogger("dcfm.ablation")
         if not logger.handlers:
             h = logging.StreamHandler()
             h.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))

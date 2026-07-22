@@ -1,309 +1,156 @@
-# GridCFN v2
+# DCFM
 
-**Grid-based Causal Flow Network** — 面向电力系统时空序列的概率预测框架。
+> **Disentangled Dual-Conditional Flow Matching for Spatiotemporal Energy Probabilistic Forecasting**
 
-融合双轨因果解耦（Dual-track Causal Disentanglement）与条件流匹配（Conditional Flow Matching, CFM），在分布层面建模未来不确定性，输出预测均值、方差和校准后的置信区间。支持多步预测。
+DCFM is a PyTorch implementation for multi-step probabilistic forecasting on spatiotemporal energy data. It disentangles historical signals into long-term evolution and short-term fluctuation components, constructs complementary conditional representations, and learns the conditional distribution of future states through conditional flow matching.
 
----
+## Overview
 
-## 文件结构
+The model contains three main components:
 
-```
+1. **Heterogeneous Disentangled Representation Learning (HDRL)**: adaptively decomposes the input sequence and encodes long-term and short-term components with heterogeneous graph-temporal encoders.
+2. **Conditional Representation Enhancement (CRE)**: builds long-term condition `C_L` using multi-scale temporal context and short-term condition `C_S` using evolution-guided spatial message passing.
+3. **Conditional Flow Matching (CFM)**: uses asymmetric dual-condition modulation to learn a conditional vector field, then generates forecast samples with a second-order ODE solver.
+
+The training and evaluation pipeline reports both point and probabilistic metrics: MAE, RMSE, CRPS, PICP, and PINAW.
+
+## Repository layout
+
+```text
 .
-├── main.py              # 主入口，命令行解析，训练调度
-├── model.py             # 模型定义（FrequencyDecomposer / LowRankGCN / SparseGCN /
-│                        #          DualTrackBackbone / CLUBEstimator /
-│                        #          MultiScaleContext / SCGMP / CFMVectorField / GridCFN）
-├── train.py             # 训练循环，评估指标（MAE/RMSE/CRPS/PICP/PINAW），早停，温度校准
-├── dataset.py           # 数据加载与预处理（Solar / Electricity / Weather2k / SDWPF）
-├── config.py            # 所有超参数集中管理
-├── plot_results.py      # 7 种出版级可视化图表
-├── baselines/           # 所有对比算法（经典 + 现代概率基线统一放置）
-│   ├── __init__.py
-│   ├── run_baselines.py # 统一入口，--model 指定算法，--dataset 指定数据集
-│   ├── utils.py         # 共享工具函数
-│   ├── ha.py            # Historical Average
-│   ├── var_model.py     # Vector AutoRegression
-│   ├── dcrnn.py         # DCRNN
-│   ├── stgcn.py         # STGCN
-│   ├── mtgnn.py         # MTGNN
-│   ├── agcrn.py         # AGCRN
-│   ├── stid.py          # STID
-│   ├── csdi.py          # CSDI
-│   ├── patchtst.py      # PatchTST
-│   ├── tsdiff.py        # TSDiff
-│   ├── tsflow.py        # TSFlow (ICLR 2025)
-│   └── k2vae.py         # K2VAE (ICML 2025 Spotlight)
-├── data/                # 数据文件（需自行下载）
-├── logs/                # 训练日志（自动创建）
-└── result/              # 实验结果（自动创建）
+├── main.py                         # DCFM training entry point
+├── model.py                        # DCFM model definition
+├── train.py                        # training, sampling, calibration, and evaluation
+├── config.py                       # dataset presets and hyperparameters
+├── dataset.py                      # loaders and graph construction
+├── analyze.py                      # calibration and case-study visualizations
+├── plot_prediction.py              # comparison plot from saved predictions
+├── plot_paper_result_figures.py    # paper result figures
+├── wind_mask_utils.py              # optional SDWPF directional graph prior
+├── ablation/                       # component and prediction-head ablations
+├── baselines/                      # baseline implementations and runner
+├── data/                           # datasets (not included)
+└── result/                         # checkpoints, predictions, logs, and figures
 ```
 
----
+## Environment
 
-## 环境依赖
+Python 3.9--3.11 and PyTorch are recommended. Install a PyTorch build compatible with your CUDA version first, then install the remaining packages:
 
 ```bash
-# 1. 创建虚拟环境（Python 3.9-3.11 推荐）
-uv venv
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
-# 2. 激活虚拟环境（Windows）
-.\.venv\Scripts\Activate
-# (Mac/Linux)
-source .venv/bin/activate
+# Install the PyTorch build appropriate for your platform from pytorch.org.
+pip install torch
+pip install numpy scipy pandas matplotlib scikit-learn tqdm tabulate
+```
 
-# 3. 安装 PyTorch（CUDA 12.6）
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+Verify the environment:
 
-# 4. 安装其余依赖
-uv pip install numpy scipy pandas matplotlib
-
-# 5. 验证 GPU
+```bash
 python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+python main.py --help
 ```
 
----
+## Data preparation
 
-## 数据准备
+Place the source files under `data/`. The default locations are defined in [`config.py`](config.py).
 
-| 数据集 | 文件 | 节点数 | 分辨率 | 来源 |
-|---|---|---|---|---|
-| Solar-Energy | `solar_AL.txt` | 137 PV 电站 | 10 min | [LSTNet repo](https://github.com/laiguokun/multivariate-time-series-data) |
-| Electricity | `electricity.txt` | 321 用电客户 | 1 hour | 同上 |
-| Weather2k | `weather2k.npy` | 1866 气象站 | 1 hour | Weather2k 论文仓库 |
-| SDWPF | `sdwpf_245days_v1.csv` | 134 风机 | 10 min | [Figshare](https://figshare.com/articles/dataset/SDWPF_dataset/24798654) |
+| Preset | Default file | Nodes | Sampling interval |
+|---|---|---:|---:|
+| `solar` | `data/solar_AL.txt` | 137 | 10 min |
+| `electricity` | `data/electricity.txt` | 321 | 1 h |
+| `sdwpf` | `data/sdwpf_245days_v1.csv` | 134 | 10 min |
+| `pjm` | `data/archive/` | 12 | 1 h |
+| `weather` | `data/weather2k.npy` | dataset-dependent | 1 h |
 
-下载后放入 `./data/` 目录。
+For SDWPF, placing `sdwpf_turb_location.csv` next to the main CSV enables the optional directional wind-mask prior. The model remains runnable when this coordinate file is unavailable.
 
----
+## Training DCFM
 
-## 快速开始
+Run from the repository root:
 
 ```bash
-# Solar-Energy（预测未来 2 小时）
-uv run main.py --preset solar
+# Default 12-step forecast
+python main.py --preset solar
+python main.py --preset electricity
+python main.py --preset sdwpf
+python main.py --preset pjm
 
-# Electricity（预测未来 1 天）
-uv run main.py --preset electricity
-
-# Weather2k（预测未来 1 天）
-uv run main.py --preset weather
-
-# SDWPF 风功率（预测未来 2 小时）
-uv run main.py --preset sdwpf
-
-# 自定义预测步长
-uv run main.py --preset solar --T_out 24
+# Override the forecast horizon
+python main.py --preset solar --T_out 24
 ```
 
-训练日志保存到 `result/<dataset>/<timestamp>/`，包含日志文件和最佳模型权重。
+Each run writes artifacts to `result/<dataset>/<timestamp>/`:
 
----
-
-## 模型架构（DMSD 版）
-
-本版本采用 **双轨多尺度解耦（Dual-track Multi-Scale Disentanglement, DMSD）** 架构，将因果解耦从后端线性层（原 CausalDisentangler）提前到前端输入，以更显式的方式分离趋势与残差信息。
-
-```
-Input  X : [B, T_in, N, F]
-  │
-  ├─ FrequencyDecomposer ──────────────────────────────────
-  │   可学习多尺度移动平均，权重由全局均值动态生成
-  │   X_low  = Σ_k w_k · MA_k(X)        （趋势支路）
-  │   X_high = X − X_low                 （残差支路）
-  │
-  ├─ 环境支路（低频趋势 → 因果/全局表征）─────────────────
-  │   X_low → LowRankGCN（A = softmax(U·Uᵀ/√r)，rank-r 邻接）
-  │          → TCN_e（4 层因果膨胀卷积）
-  │          → proj_tcn_e
-  │          → He_seq : [B, T, N, env_dim]
-  │          → AttentionPool → He : [B, N, env_dim]
-  │
-  ├─ 因果支路（高频残差 → 随机/局部表征）─────────────────
-  │   X_high → SparseGCN（可微稀疏化，软阈值 sigmoid）
-  │           → TCN_s（4 层因果膨胀卷积）
-  │           → proj_tcn_s
-  │           → AttentionPool → Hs : [B, N, stoch_dim]
-  │
-  ├─ CLUB（双实例互信息约束）──────────────────────────────
-  │   club_e: MI(He, X_low_pooled)   — 环境表征不含残差信息
-  │   club_s: MI(Hs, X_high_pooled)  — 随机表征不含趋势信息
-  │   minimax 训练迫使 He ⊥ X_high，Hs ⊥ X_low
-  │
-  ├─ MultiScaleContext ────────────────────────────────────
-  │   He_seq → 3 路膨胀因果卷积（dilations 按数据集配置）
-  │          → He_prime : [B, N, ms_out_dim]
-  │
-  ├─ SCGMP（Spatial Causal Gating Message Passing）────────
-  │   Hs, He → 3 层因果门控图消息传递 → Hs_prime : [B, N, stoch_dim]
-  │            门控 = σ(MLP(Hs_dst, Hs_src, He_dst, He_src))
-  │
-  └─ CFMVectorField ───────────────────────────────────────
-      ├─ 时序位置编码（Temporal PE）→ 感知多步位置
-      ├─ 时间嵌入（正弦余弦）→ time_proj
-      ├─ 双流 AdaLN：He_prime 控制 shift，Hs_prime 控制 scale
-      └─ 3 层 MLP + 残差 → v_θ(x_t, t | He_prime, Hs_prime) : [B, N, T_out·F]
+```text
+dcfm_<dataset>_<timestamp>.pt  # best checkpoint
+DCFM_prediction.npy            # predictive mean, [samples, T_out, nodes, features]
+ground_truth.npy               # target values, [samples, T_out, nodes, features]
+history_<dataset>_<timestamp>.json
+dcfm_<dataset>_<timestamp>.log
 ```
 
-### 与原版的关键架构差异
+`DCFM_prediction.npy` is the canonical output name. The plotting utility also recognizes legacy `GridCFN_prediction.npy` files so previously generated results remain usable.
 
-| 模块 | 原版（单轨） | DMSD 版（双轨） |
-|---|---|---|
-| 输入分解 | 无 | FrequencyDecomposer：可学习 MA 分解趋势/残差 |
-| 图卷积 | AdaptiveGCN（固定皮尔逊图 + 可学习邻接叠加） | 双轨：LowRankGCN（rank-r 邻接）+ SparseGCN（可微稀疏化） |
-| 解耦位置 | 后端 CausalDisentangler（线性层 + 注意力池化） | 前端输入分流，解耦更显式 |
-| CLUB 约束 | 单实例 MI(He, Hs) | 双实例：MI(He, X_low) + MI(Hs, X_high) |
-| 秩正则 | 无 | L_rank = −log det(UᵀU + εI)，防止低秩退化 |
+## Configuration
 
-### 训练流程
+All dataset-specific settings are centralised in [`config.py`](config.py). The main fields are:
 
-- **DMSD CLUB minimax**：每个 batch 两步 — Step1 对 `club_e` / `club_s` 内循环梯度上升；Step2 对主网络梯度下降最小化 CFM + λ_rank·L_rank + λ_club·clamp(MI, 0, +∞)
-- **Warmup**：前 N 个 epoch 跳过 CLUB，之后 MI 权重线性升温（3 epoch ramp）
-- **CFM 损失**：OT-CFM，分层随机 t 采样（n_t_samples 个区间各取一点）
-- **早停**：基于验证集 CRPS，patience 可配置
+- `DataConfig`: input history `T_in`, horizon `T_out`, adjacency threshold, and batch size.
+- `ModelConfig`: graph/temporal hidden dimensions, low-rank dimension, multi-scale dilations, and CFM architecture.
+- `TrainConfig`: optimizer settings, early stopping, CFM sample count, ODE steps, and temperature calibration parameters.
 
-> **实现细节（易踩坑）**：`mi_penalty` 反向传播时梯度会经由 `var_net` 流入 `club_e`/`club_s` 参数，但主 `optimizer.zero_grad()` 不会清除这部分梯度。当前代码在主 loss `backward()` 后立刻调用 `club_optimizer.zero_grad()` 来切断这条隐式累积路径。这一行的位置与 club 内循环更新（必须在主 loss backward 之前完成）存在顺序耦合——调整训练循环结构时需保持这个顺序，否则 club 参数可能被错误梯度污染。
+To add a dataset, create a loader in [`dataset.py`](dataset.py), then add a corresponding preset in `get_config()`.
 
-### 推理
+## Baselines and ablations
 
-- **Heun 二阶 ODE 求解器**：预测-校正两步，同等步数下误差低于 Euler
-- **Temperature Calibration**：验证集上网格搜索 [0.5, 5.0] 最优温度，校准预测区间
-
----
-
-## 评估指标
-
-| 指标 | 含义 | 方向 |
-|---|---|---|
-| MAE | 预测均值与真实值的平均绝对误差 | 越小越好 |
-| RMSE | 预测均值与真实值的均方根误差 | 越小越好 |
-| CRPS | 连续排名概率得分，衡量整个预测分布的质量 | 越小越好 |
-| PICP | 95% 预测区间覆盖率（越接近 0.95 越好） | → 0.95 |
-| PINAW | 归一化平均区间宽度 | 越小越好 |
-
-评估在反归一化域（真实量纲）进行，同时汇报平均指标和各预测步 (h1, h2, ...) 的逐步指标。
-
----
-
-## SDWPF 风向掩码：已知假设与局限
-
-`wind_mask_utils.py` 为 SDWPF 风电场构造有向尾流掩码，用于 SparseGCN 的图结构先验。使用前请了解以下简化假设：
-
-- **全局静态主风向**：`_dominant_wind_dir_from_data` 仅用数据文件前 50000 行统计一个全局主风向众数，不区分季节或时段。对 245 天的真实风场数据而言，季节性风向变化会被完全抹平。这是一个**静态先验**，时变的风向-功率关系由 SparseGCN 的可学习稀疏化（`threshold`/`temperature` 参数）在训练中补偿，而不是由 wind_mask 本身建模。
-- **退化兜底会静默生效**：若某风机在设定的下风向扇区（默认 ±45°）内找不到任何邻居，该行掩码会整行置 1（退化为无向全连接）。当前代码只汇报整体非零边数和密度，**不会单独报告有多少台风机触发了这条退化逻辑**。如果退化风机集中在场区边缘或某个朝向，物理意义会被悄悄稀释，解读结果时需要留意训练日志中 `[wind_mask]` 的退化提示行数。
-- **坐标文件缺失时整体跳过**：若 `sdwpf_turb_location.csv` 不存在，`main.py` 会让 `wind_mask=None`，SparseGCN 退化为纯数据驱动的自适应图，仍可训练，但不再有物理尾流约束。
-
-如果后续要在论文中强调"风向物理先验"的贡献，建议补充一次按月/按季节重新统计主风向的消融实验，或在文中明确说明这是粗粒度静态先验。
-
----
-
-## 超参数说明
-
-所有超参数在 `config.py` 中集中管理，按数据集聚类为 preset。
-
-### DataConfig
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `T_in` | 168 | 输入历史步数 |
-| `T_out` | 12 | 预测步数（12=2h @10min, 24=1day @1h） |
-| `adj_threshold` | 0.6-0.95 | 皮尔逊相关阈值，按数据集调整 |
-| `batch_size` | 2-32 | 按节点数自适应调整 |
-
-### ModelConfig（DMSD 新增参数）
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `gcn_hidden` / `tcn_hidden` | 64 | 双轨 Backbone 隐藏维度 |
-| `env_dim` / `stoch_dim` | 32 | He / Hs 表征维度 |
-| `ms_out_dim` | 32 | 多尺度上下文输出维度 |
-| `n_scg_layers` | 3 | SCG-MP 消息传递层数 |
-| `lambda_mi` | 0.05-0.5 | CLUB MI 约束权重（`lambda_club`，节点多时适当降低） |
-| `cfm_hidden` | 256-512 | CFM 向量场隐藏维度（随 T_out 增大加宽） |
-| `ms_dilations` | (1,24,84) 等 | 多尺度卷积膨胀率，按数据集粒度配置 |
-| `rank_r` | 6-12 | LowRankGCN 的秩（Solar/SDWPF=6，Electricity=12） |
-| `lambda_rank` | 0.01 | 秩正则权重 L_rank |
-| `freq_candidates` | (12,24,48,96) | FrequencyDecomposer 候选 MA 窗口（按数据粒度配置） |
-
-> **`ms_dilations` 静默回退提示**：`MultiScaleContext` 会在初始化时过滤掉满足不了 `2 * dilation ≤ T_in` 的膨胀率，仅保留有效感受野范围内的尺度；若全部被过滤掉，回退为单尺度 `[1]`。这个过滤目前**不会打印警告**，更换数据集或调整 `T_in` 时容易被忽略而误以为多尺度仍在生效。例如 sdwpf preset 中注释里特别说明了 `(1, 24, 84)` 在 T_in=168 下感受野会超过 168 导致末层被截断，因此改为 `(1, 12, 48)`；若自定义其他数据集，建议手动核对 `3 × max(dilations) ≤ T_in` 是否成立。
-
-> **sdwpf preset 的超参数已经过手动抗过拟合调整**：相比其他数据集，sdwpf 的 `gcn_hidden`/`tcn_hidden`（96→64）、`dropout`（0.1→0.25）、`weight_decay`（1e-5→1e-3）、`lr`（降至 1.5e-4）均被同时调小/调严，说明该数据集训练初期存在明显过拟合。这些改动叠加在一起，目前没有做逐项消融，无法确定每个改动各自的贡献度。若需要进一步调参或排查 sdwpf 上的异常结果，建议先做一次单变量回退测试（每次只还原一个超参数到默认值）以确认主要贡献来源。
-
-### TrainConfig
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `lr` | 1e-3 或 5e-4 | 主网络学习率（CLUB lr = 0.5×） |
-| `max_epochs` | 200 | 最大训练轮数 |
-| `patience` | 20-30 | 早停耐心值 |
-| `warmup_epochs` | 3-5 | CLUB 热身期 |
-| `grad_clip` | 1.0 | 梯度裁剪 |
-| `cfm_n_samples` | 100 | 训练/验证时采样粒子数 |
-| `cfm_n_samples_test` | 100 | 测试时采样粒子数 |
-| `cfm_n_steps` | 15 | ODE 求解步数 |
-| `cfm_n_t_samples` | 4 | CFM 分层 t 采样数 |
-
----
-
-## 结果可视化
-
-```python
-from plot_results import plot_all
-plot_all(history, result_dir, dataset_name="solar")
-```
-
-生成 7 张图表：
-
-| 图 | 内容 |
-|---|---|
-| `convergence.png` | Val CRPS 收敛曲线 + 最佳 epoch 标注 |
-| `loss_components.png` | Train Loss / CFM / MI / Rank 分解曲线 |
-| `metrics_curve.png` | Val MAE + Val RMSE 双轴曲线 |
-| `prediction_intervals.png` | 4 个高不确定性节点的 95% 预测区间 |
-| `reliability_diagram.png` | PICP 校准图（实际覆盖率 vs 名义置信度） |
-| `error_distribution.png` | 误差分布直方图 + 误差-不确定性相关图 |
-
----
-
-## 基线
-
-所有对比算法统一放在 `baselines/` 目录，通过 `run_baselines.py` 的 `--model` 参数选择。
-
-| 类别 | 算法 | 文件 |
-|---|---|---|
-| 统计基线 | Historical Average | `ha.py` |
-| 统计基线 | Vector AutoRegression | `var_model.py` |
-| 图神经网络 | DCRNN | `dcrnn.py` |
-| 图神经网络 | STGCN | `stgcn.py` |
-| 图神经网络 | MTGNN | `mtgnn.py` |
-| 图神经网络 | AGCRN | `agcrn.py` |
-| Transformer | STID | `stid.py` |
-| Transformer | PatchTST | `patchtst.py` |
-| 概率生成 | CSDI | `csdi.py` |
-| 概率生成 | TSDiff | `tsdiff.py` |
-| 概率生成 | TSFlow (ICLR 2025) | `tsflow.py` |
-| 概率生成 | K2VAE (ICML 2025 Spotlight) | `k2vae.py` |
+Run a baseline with the unified runner:
 
 ```bash
-# 运行任意基线，--model 指定算法名，--dataset 指定数据集
-uv run baselines/run_baselines.py --model ha --dataset solar
-uv run baselines/run_baselines.py --model mtgnn --dataset electricity
-uv run baselines/run_baselines.py --model tsflow --dataset solar
-uv run baselines/run_baselines.py --model k2vae --dataset sdwpf
+python baselines/run_baselines.py --help
+python baselines/run_baselines.py --preset electricity --models mtgnn
 ```
 
----
+Run a quick ablation smoke test:
 
-## 主要改进
+```bash
+python ablation/run_ablation.py --preset solar --only full noclub --quick
+```
 
-| 模块 | 改进 | 说明 |
-|---|---|---|
-| 输入层 | FrequencyDecomposer | 可学习多尺度移动平均，自适应分解趋势与残差 |
-| 图卷积（环境支路） | LowRankGCN | A = softmax(U·Uᵀ/√r)，rank-r 参数化，只学习全局同步集群 |
-| 图卷积（因果支路） | SparseGCN | 可微稀疏化（软阈值 sigmoid）替代硬 Top-K，梯度稳定 |
-| 解耦架构 | DualTrackBackbone | 解耦职责从后端 Disentangler 前移至输入分流，语义更清晰 |
-| CLUB 约束 | 双实例 | club_e + club_s 分别约束两路表征，解耦目标更明确 |
-| 秩正则 | L_rank | −log det(UᵀU + εI)，防止 LowRankGCN 退化为秩-1 |
-| CFM 采样 | Heun 二阶求解器 | 替换 Euler，相同步数误差更低 |
-| CFM 训练 | 分层 t 采样 | [0,1] 均分区间各取一点，覆盖更均匀 |
-| 训练稳定性 | MI 升温 + 截断 | MI 权重线性升温，负 MI 不奖励 |
+The available ablations include heterogeneous encoding, the CLUB constraint, long-term context aggregation, evolution-guided short-term enhancement, low-rank regularization, and deterministic/Gaussian prediction heads. Results are saved under `ablation_results/<dataset>/<timestamp>/`.
+
+## Visualisation
+
+Create a prediction comparison figure from saved arrays:
+
+```bash
+python plot_prediction.py --help
+python plot_prediction.py result/plot/electricity \
+  --models DCFM MTGNN TSFlow --horizon 11 --length 48
+```
+
+Generate paper-level aggregate figures after filling the result values in the script:
+
+```bash
+python plot_paper_result_figures.py
+```
+
+For calibration or fan-chart analysis from a checkpoint:
+
+```bash
+python analyze.py --checkpoint result/solar/<timestamp>/dcfm_solar_<timestamp>.pt \
+  --preset solar --output_dir result/analysis/solar
+```
+
+## Reproducibility notes
+
+- Training uses the random seed in `TrainConfig` (default: `42`).
+- All reported point and probabilistic metrics are computed after inverse normalization.
+- The validation set is used to select the checkpoint and calibrate the predictive sample spread; the test set is evaluated only after training is complete.
+- Data files, checkpoints, and generated result folders are intentionally not versioned with the source code.
+
+## Citation
+
+If you use this implementation, please cite the accompanying DCFM paper after bibliographic information is finalized.

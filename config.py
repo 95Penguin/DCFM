@@ -1,6 +1,6 @@
 """
 config.py
-GridCFN 时空网络参数配置文件
+DCFM 时空网络参数配置文件
 """
 
 from dataclasses import dataclass, field, asdict
@@ -75,7 +75,7 @@ class Config:
     train: TrainConfig = field(default_factory=TrainConfig)
 
     def summary(self) -> str:
-        lines = ["=" * 52, "GridCFN Configuration (Multi-Step)", "=" * 52]
+        lines = ["=" * 52, "DCFM Configuration (Multi-Step)", "=" * 52]
         for section_name, section in [("Data",  self.data),
                                        ("Model", self.model),
                                        ("Train", self.train)]:

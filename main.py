@@ -1,5 +1,5 @@
 """
-GridCFN – 主入口（多步预测版）
+DCFM – 主入口（多步预测版）
 
 相对单步版的改动：
   - build_model 传入 T_out（来自 cfg.data.T_out）
@@ -18,13 +18,13 @@ import numpy as np
 import torch
 
 from config import Config, get_config
-from model import GridCFN
+from model import DCFM
 from dataset import load_solar_energy, load_electricity, load_weather, load_sdwpf, load_pjm
 from train import train
 
 
 def setup_logger(cfg_train, dataset_name="", timestamp="", result_dir=""):
-    logger = logging.getLogger("gridcfn")
+    logger = logging.getLogger("dcfm")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
     fmt = logging.Formatter(fmt="%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -44,7 +44,7 @@ def setup_logger(cfg_train, dataset_name="", timestamp="", result_dir=""):
     ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
     for d in log_dirs:
         os.makedirs(d, exist_ok=True)
-        log_file = os.path.join(d, f"gridcfn_{dataset_name}_{ts}.log")
+        log_file = os.path.join(d, f"dcfm_{dataset_name}_{ts}.log")
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(fmt)
@@ -102,7 +102,7 @@ def load_data(cfg):
 
 def build_model(cfg, in_dim=None, n_nodes=None, wind_mask=None):
     m = cfg.model
-    return GridCFN(
+    return DCFM(
         n_nodes=n_nodes,
         in_dim=in_dim if in_dim is not None else m.in_dim,
         gcn_hidden=m.gcn_hidden, gcn_layers=m.gcn_layers,
@@ -115,7 +115,7 @@ def build_model(cfg, in_dim=None, n_nodes=None, wind_mask=None):
         ms_dilations=getattr(m, "ms_dilations", (1, 7, 30)),
         T_out=cfg.data.T_out,
         T_in=cfg.data.T_in,
-        # adap_dim 已移除：GridCFN 从未实际使用该参数
+        # adap_dim 已移除：DCFM 从未实际使用该参数
         rank_r=getattr(m, "rank_r", 8),
         lambda_rank=getattr(m, "lambda_rank", 0.01),
         freq_candidates=getattr(m, "freq_candidates", (12, 24, 48, 96)),
@@ -129,7 +129,7 @@ def main(cfg):
     result_dir = os.path.join("result", dataset, timestamp)
     os.makedirs(result_dir, exist_ok=True)
 
-    cfg.train.save_path = os.path.join(result_dir, f"gridcfn_{dataset}_{timestamp}.pt")
+    cfg.train.save_path = os.path.join(result_dir, f"dcfm_{dataset}_{timestamp}.pt")
 
     logger = setup_logger(cfg.train, dataset, timestamp, result_dir)
     set_seed(cfg.train.seed)
@@ -142,8 +142,8 @@ def main(cfg):
     train_loader, val_loader, test_loader, adj, scaler, in_dim = load_data(cfg)
     logger.info(f"in_dim     : {in_dim},  T_out={cfg.data.T_out}")
 
-    adj_norm   = GridCFN.normalize_adj(adj)
-    edge_index = GridCFN.adj_to_edge_index(adj)
+    adj_norm   = DCFM.normalize_adj(adj)
+    edge_index = DCFM.adj_to_edge_index(adj)
     n_nodes    = adj.shape[0]
     logger.info(f"Graph      : {n_nodes} nodes, {edge_index.shape[1]} edges")
 
@@ -191,7 +191,7 @@ def main(cfg):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="GridCFN Multi-Step Training")
+    parser = argparse.ArgumentParser(description="DCFM Multi-Step Training")
     parser.add_argument("--preset", type=str, default="solar",
                         choices=["solar", "electricity", "weather", "sdwpf", "pjm"])
     # 可选：命令行覆盖 T_out

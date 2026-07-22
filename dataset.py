@@ -1,5 +1,5 @@
 """
-GridCFN – 数据集工具（多特征支持版，已集成 PJM 负荷时空数据集）
+DCFM – 数据集工具（多特征支持版，已集成 PJM 负荷时空数据集）
 """
 
 import os
@@ -129,11 +129,11 @@ class Scaler:
             if ndims == 3:  # [T, N, F]
                 m_aligned, s_aligned = m, s
             elif ndims == 4:  
-                # ─── [自适应对齐核心] 动态检测 N 在第 1 维 (GridCFN) 还是第 2 维 (Baselines) ───
+                # ─── [自适应对齐核心] 动态检测 N 在第 1 维 (DCFM) 还是第 2 维 (Baselines) ───
                 N_size = m.shape[1]
                 F_size = m.shape[2]
                 if data.shape[1] == N_size:
-                    # [B, N, T_out, F] (GridCFN 格式)
+                    # [B, N, T_out, F] (DCFM 格式)
                     if is_torch:
                         m_aligned = m.view(1, N_size, 1, F_size)
                         s_aligned = s.view(1, N_size, 1, F_size)

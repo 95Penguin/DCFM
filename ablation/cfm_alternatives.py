@@ -1,5 +1,5 @@
 # cfm_alternatives.py
-# 本文件位于 GridCFN/ablation/ 目录下，与 ablation_model.py 并列。
+# 本文件位于项目根目录的 ablation/ 目录下，与 ablation_model.py 并列。
 """
 CFM 替代输出头，用于 noCFM 消融实验。
 
@@ -18,9 +18,9 @@ CFM 替代输出头，用于 noCFM 消融实验。
 接口设计原则：
   - 两个头都暴露 loss(He_prime, Hs_prime, y_target) 和
     sample(He_prime, Hs_prime, n_samples, ...) 方法，
-    与 GridCFN.cfm_loss / GridCFN.sample 签名对齐，
+    与 DCFM.cfm_loss / DCFM.sample 签名对齐，
     使 ablation_train.py 不需要为它们写专门的训练循环。
-  - sample() 的返回值 shape 与 GridCFN.sample() 完全一致：
+  - sample() 的返回值 shape 与 DCFM.sample() 完全一致：
     [S, B, N, T_out, feat_dim]，evaluate() 可以直接复用。
 """
 
@@ -92,7 +92,7 @@ class DeterministicHead(_BaseAlternativeHead):
     def sample(self, He_prime: torch.Tensor, Hs_prime: torch.Tensor,
                n_samples: int = 50, **_) -> torch.Tensor:
         """
-        返回 [S, B, N, T_out, feat_dim]，与 GridCFN.sample() 格式一致。
+        返回 [S, B, N, T_out, feat_dim]，与 DCFM.sample() 格式一致。
         确定性头没有随机性，S 份完全相同，CRPS = MAE。
         """
         training = self.training
@@ -166,7 +166,7 @@ class GaussianHead(_BaseAlternativeHead):
                n_samples: int = 50, **_) -> torch.Tensor:
         """
         从 N(mu, sigma²) 独立采 S 个样本。
-        返回 [S, B, N, T_out, feat_dim]，与 GridCFN.sample() 格式一致。
+        返回 [S, B, N, T_out, feat_dim]，与 DCFM.sample() 格式一致。
         """
         training = self.training
         self.eval()

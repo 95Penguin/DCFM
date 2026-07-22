@@ -1,12 +1,12 @@
 # ablation_model.py
 """
-GridCFN 消融实验模型包装层
+DCFM 消融实验模型包装层
 ────────────────────────────────────────────────────────────────────────
-设计原则：不修改 model.py 任何一行，而是在外层包一层 AblationGridCFN，
+设计原则：不修改 model.py 的核心计算逻辑，而是在外层包一层 AblationDCFM，
 通过开关决定每个待消融模块是"正常工作"还是"被替换成恒等/直通操作"。
 
 这样做的好处：
-  1. 原始 GridCFN 代码保持不变，不会因为消融实验引入 bug 污染主线代码；
+  1. 原始 DCFM 代码保持不变，不会因为消融实验引入 bug 污染主线代码；
   2. 每个开关关闭后，模型的输入输出张量形状完全不变，可以直接复用
      train.py 里现成的 train_one_epoch / evaluate 函数，无需改动训练循环；
   3. 关闭某个模块时，该模块的参数仍然会被创建（forward 不调用而已），
@@ -33,7 +33,7 @@ import os
 import sys
 
 # ── 路径处理：把项目根目录插入 sys.path ──────────────────────────────────────
-# 本文件位于 GridCFN/ablation/ablation_model.py
+# 本文件位于项目根目录的 ablation/ablation_model.py
 # 上一级目录即项目根目录，包含 model.py / train.py / config.py 等
 _HERE        = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_HERE)
@@ -46,7 +46,7 @@ if _HERE not in sys.path:
 from dataclasses import dataclass
 import torch
 
-from model import GridCFN
+from model import DCFM
 from cfm_alternatives import DeterministicHead, GaussianHead
 
 
@@ -77,9 +77,9 @@ class AblationConfig:
         return f"{self.name}__" + "_".join(flags)
 
 
-class AblationGridCFN(GridCFN):
+class AblationDCFM(DCFM):
     """
-    继承 GridCFN，仅重写 forward / cfm相关入口处的"路由逻辑"。
+    继承 DCFM，仅重写 forward / cfm 相关入口处的路由逻辑。
     所有子模块（backbone, club_e, club_s, ms_context, scgmp, vector_field）
     与父类完全一致，参数量、初始化方式都不变 —— 消融只发生在 forward 计算图里，
     确保"对比的是模块的功能贡献"，而不是"对比模型容量的变化"。
@@ -194,7 +194,7 @@ class AblationGridCFN(GridCFN):
         env_dim    = He.shape[-1]
         ms_out_dim = self.ms_context.proj.out_features
         assert env_dim == ms_out_dim, (
-            f"AblationGridCFN._passthrough_env 要求 env_dim({env_dim}) == "
+            f"AblationDCFM._passthrough_env 要求 env_dim({env_dim}) == "
             f"ms_out_dim({ms_out_dim})，否则 use_ms_context=False 时无法做到"
             f"真正意义上的直通（无额外可学习/随机变换）。请调整模型配置使两者相等。"
         )
@@ -222,11 +222,11 @@ class AblationGridCFN(GridCFN):
 
 def build_ablation_model(cfg, in_dim, n_nodes, wind_mask, ablation: AblationConfig):
     """
-    与 main.py::build_model 等价，但构造的是 AblationGridCFN，
+    与 main.py::build_model 等价，但构造的是 AblationDCFM，
     并把 ablation 配置传进去。模型超参（层数/维度等）与原模型完全一致。
     """
     m = cfg.model
-    return AblationGridCFN(
+    return AblationDCFM(
         n_nodes=n_nodes,
         in_dim=in_dim,
         gcn_hidden=m.gcn_hidden, gcn_layers=m.gcn_layers,

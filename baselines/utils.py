@@ -8,7 +8,7 @@ baselines/utils.py
   - 支持 prob 模式（输出 mu/sigma 双通道）
 
 评估策略（2025-05 修订）：
-  统一无 mask 全量评估，与 GridCFN 主模型对齐，方便与文献直接比较。
+  统一无 mask 全量评估，与 DCFM 主模型对齐，方便与文献直接比较。
   所有函数保留 null_val 参数接口，但传入任何值均不做 mask。
 
 修复:

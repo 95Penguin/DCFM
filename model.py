@@ -541,10 +541,10 @@ class CFMVectorField(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 11. GridCFN — DMSD 主模型集成
+# 11. DCFM — 主模型集成
 # ---------------------------------------------------------------------------
 
-class GridCFN(nn.Module):
+class DCFM(nn.Module):
     def __init__(
         self,
         n_nodes: int,
@@ -676,3 +676,8 @@ class GridCFN(nn.Module):
         x = x.reshape(B, S, N, self.T_out, self.feat_dim)
         x = x.permute(1, 0, 2, 3, 4).contiguous()
         return x
+
+
+# Backward compatibility for checkpoints and scripts created before the rename.
+# New code should import and instantiate ``DCFM`` directly.
+GridCFN = DCFM
