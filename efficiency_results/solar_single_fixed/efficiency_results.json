@@ -1,0 +1,76 @@
+{
+  "metadata": {
+    "preset": "solar",
+    "device": "cuda:0",
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "batch_size": 8,
+    "n_samples": 1,
+    "n_steps_dcfm_tsflow": 15,
+    "warmup_batches": 3,
+    "measured_batches": 20,
+    "repeats": 5,
+    "seed": 42
+  },
+  "results": [
+    {
+      "model": "DCFM",
+      "parameters": 1302725,
+      "parameters_m": 1.302725,
+      "samples": 1,
+      "sampling_nfe": 30,
+      "batches": 20,
+      "windows": 160,
+      "median_seconds": 0.7656296184286475,
+      "latency_ms_per_batch": 38.281480921432376,
+      "throughput_windows_per_s": 208.97833123067863,
+      "peak_gpu_memory_gb": 0.3054838180541992,
+      "repeat_seconds": [
+        0.7636002199724317,
+        0.7676535015925765,
+        0.7624211618676782,
+        0.7678203694522381,
+        0.7656296184286475
+      ]
+    },
+    {
+      "model": "TSFlow",
+      "parameters": 1274380,
+      "parameters_m": 1.27438,
+      "samples": 1,
+      "sampling_nfe": 15,
+      "batches": 20,
+      "windows": 160,
+      "median_seconds": 0.546490472741425,
+      "latency_ms_per_batch": 27.324523637071252,
+      "throughput_windows_per_s": 292.77729069524855,
+      "peak_gpu_memory_gb": 0.7172274589538574,
+      "repeat_seconds": [
+        0.544892848469317,
+        0.5483646746724844,
+        0.5432241335511208,
+        0.5475526973605156,
+        0.546490472741425
+      ]
+    },
+    {
+      "model": "TSDiff",
+      "parameters": 746529,
+      "parameters_m": 0.746529,
+      "samples": 1,
+      "sampling_nfe": 100,
+      "batches": 20,
+      "windows": 160,
+      "median_seconds": 60.96308083459735,
+      "latency_ms_per_batch": 3048.1540417298675,
+      "throughput_windows_per_s": 2.624539275403514,
+      "peak_gpu_memory_gb": 0.88763427734375,
+      "repeat_seconds": [
+        60.512171706184745,
+        61.10404898133129,
+        61.15496535692364,
+        60.792547861114144,
+        60.96308083459735
+      ]
+    }
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "arguments": {
+    "preset": "solar",
+    "checkpoint": "result/solar/20260722_081956/dcfm_solar_20260722_081956.pt",
+    "steps": [
+      3,
+      5,
+      10,
+      15,
+      20
+    ],
+    "n_samples": 100,
+    "batch_size": 8,
+    "max_batches": 0,
+    "warmup_batches": 2,
+    "seed": 42,
+    "device": "cuda:0",
+    "save_samples": true,
+    "output_dir": "paper_extra_results/nfe"
+  },
+  "results": [
+    {
+      "steps": 3,
+      "nfe": 6,
+      "n_samples": 100,
+      "windows": 10333,
+      "measured_windows": 10317,
+      "seconds": 226.83852588571608,
+      "milliseconds_per_window": 21.986868846148695,
+      "peak_gpu_memory_gb": 1.8534579277038574,
+      "MAE": 0.13595779240131378,
+      "RMSE": 0.22821301221847534,
+      "CRPS": 0.09633772820234299,
+      "PICP": 0.8729556202888489,
+      "PINAW": 0.08413255214691162
+    },
+    {
+      "steps": 5,
+      "nfe": 10,
+      "n_samples": 100,
+      "windows": 10333,
+      "measured_windows": 10317,
+      "seconds": 359.25119825080037,
+      "milliseconds_per_window": 34.82128508779687,
+      "peak_gpu_memory_gb": 1.8534579277038574,
+      "MAE": 0.1053750142455101,
+      "RMSE": 0.2155293971300125,
+      "CRPS": 0.07262682169675827,
+      "PICP": 0.9773404002189636,
+      "PINAW": 0.07294533401727676
+    },
+    {
+      "steps": 10,
+      "nfe": 20,
+      "n_samples": 100,
+      "windows": 10333,
+      "measured_windows": 10317,
+      "seconds": 689.2643676232547,
+      "milliseconds_per_window": 66.80860401504843,
+      "peak_gpu_memory_gb": 1.8542842864990234,
+      "MAE": 0.09011946618556976,
+      "RMSE": 0.213496595621109,
+      "CRPS": 0.06184730678796768,
+      "PICP": 0.9827362298965454,
+      "PINAW": 0.06393274664878845
+    },
+    {
+      "steps": 15,
+      "nfe": 30,
+      "n_samples": 100,
+      "windows": 10333,
+      "measured_windows": 10317,
+      "seconds": 1021.9529863605276,
+      "milliseconds_per_window": 99.05524729674592,
+      "peak_gpu_memory_gb": 1.8534579277038574,
+      "MAE": 0.0881408229470253,
+      "RMSE": 0.2135613113641739,
+      "CRPS": 0.060785457491874695,
+      "PICP": 0.9819385409355164,
+      "PINAW": 0.06276993453502655
+    },
+    {
+      "steps": 20,
+      "nfe": 40,
+      "n_samples": 100,
+      "windows": 10333,
+      "measured_windows": 10317,
+      "seconds": 1358.9462180547416,
+      "milliseconds_per_window": 131.71912552629075,
+      "peak_gpu_memory_gb": 1.8542842864990234,
+      "MAE": 0.08852287381887436,
+      "RMSE": 0.21362024545669556,
+      "CRPS": 0.060488637536764145,
+      "PICP": 0.9813697338104248,
+      "PINAW": 0.06179749593138695
+    }
+  ]
+}

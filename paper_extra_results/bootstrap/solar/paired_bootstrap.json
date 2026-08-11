@@ -1,0 +1,59 @@
+{
+  "bootstrap_repetitions": 10000,
+  "seed": 42,
+  "interpretation": "positive improvement favors DCFM",
+  "comparisons": {
+    "TSFlow": {
+      "MAE": {
+        "baseline": "TSFlow",
+        "metric": "MAE",
+        "dcfm": 0.9106154441833496,
+        "baseline_value": 0.929732084274292,
+        "improvement": 0.01911660097539425,
+        "relative_improvement_percent": 2.056140899658203,
+        "ci95_low": 0.012709506624378263,
+        "ci95_high": 0.02560449782758951,
+        "p_value_two_sided": 0.0,
+        "n_windows": 10333
+      },
+      "RMSE": {
+        "baseline": "TSFlow",
+        "metric": "RMSE",
+        "dcfm": 1.3610237836837769,
+        "baseline_value": 1.521890640258789,
+        "improvement": 0.16086679697036743,
+        "relative_improvement_percent": 10.570194244384766,
+        "ci95_low": 0.15175521969795228,
+        "ci95_high": 0.16994259990751742,
+        "p_value_two_sided": 0.0,
+        "n_windows": 10333
+      }
+    },
+    "MTGNN": {
+      "MAE": {
+        "baseline": "MTGNN",
+        "metric": "MAE",
+        "dcfm": 0.9106154441833496,
+        "baseline_value": 0.9058003425598145,
+        "improvement": -0.004815178923308849,
+        "relative_improvement_percent": -0.5315938591957092,
+        "ci95_low": -0.0117747881449759,
+        "ci95_high": 0.0020095478801522384,
+        "p_value_two_sided": 0.172,
+        "n_windows": 10333
+      },
+      "RMSE": {
+        "baseline": "MTGNN",
+        "metric": "RMSE",
+        "dcfm": 1.3610237836837769,
+        "baseline_value": 1.3859891891479492,
+        "improvement": 0.024965306743979454,
+        "relative_improvement_percent": 1.8012628555297852,
+        "ci95_low": 0.01653555314987898,
+        "ci95_high": 0.03344077728688717,
+        "p_value_two_sided": 0.0,
+        "n_windows": 10333
+      }
+    }
+  }
+}

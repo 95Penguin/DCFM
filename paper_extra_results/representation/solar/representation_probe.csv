@@ -1,0 +1,2 @@
+preset,batches,branch_cosine_abs,environment_to_low_norm_correlation,environment_to_high_norm_correlation,short_term_to_high_norm_correlation,short_term_to_low_norm_correlation,cross_club_environment_high,cross_club_short_term_low
+solar,20,0.26186496019363403,-0.14788502552442964,-0.16244052766964112,0.5179402365835973,0.37350138573716385,0.0014569759368896484,0.00041577816009521487

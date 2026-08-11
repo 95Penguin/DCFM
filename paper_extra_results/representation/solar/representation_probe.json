@@ -1,0 +1,11 @@
+{
+  "preset": "solar",
+  "batches": 20,
+  "branch_cosine_abs": 0.26186496019363403,
+  "environment_to_low_norm_correlation": -0.14788502552442964,
+  "environment_to_high_norm_correlation": -0.16244052766964112,
+  "short_term_to_high_norm_correlation": 0.5179402365835973,
+  "short_term_to_low_norm_correlation": 0.37350138573716385,
+  "cross_club_environment_high": 0.0014569759368896484,
+  "cross_club_short_term_low": 0.00041577816009521487
+}
